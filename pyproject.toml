@@ -28,9 +28,18 @@ distributed = ["dask[distributed]>=2024.1"]
 query = ["duckdb>=1.0"]
 dev = ["pytest>=8.0", "pyinstrument>=4.6"]
 bench = ["pandas>=2.0", "matplotlib>=3.7", "pyinstrument>=4.6"]
+gui = [
+    "napari[all]>=0.5",
+    "magicgui>=0.8",
+    "superqt>=0.6",
+    "qtpy>=2.4",
+]
 
 [project.scripts]
 momia3 = "momia3.pipeline.cli:main"
+
+[project.entry-points."napari.manifest"]
+momia3 = "momia3.gui:napari.yaml"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/momia3"]

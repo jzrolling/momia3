@@ -1,0 +1,20 @@
+name: momia3
+display_name: momia3
+contributions:
+  commands:
+    - id: momia3.make_dataset_widget
+      python_name: momia3.gui.widgets:DatasetWidget
+      title: Create the momia3 Dataset dock widget
+    - id: momia3.make_pipeline_widget
+      python_name: momia3.gui.widgets:PipelineWidget
+      title: Create the momia3 Pipeline dock widget
+    - id: momia3.make_results_widget
+      python_name: momia3.gui.widgets:ResultsWidget
+      title: Create the momia3 Results dock widget
+  widgets:
+    - command: momia3.make_dataset_widget
+      display_name: "momia3: Dataset"
+    - command: momia3.make_pipeline_widget
+      display_name: "momia3: Pipeline"
+    - command: momia3.make_results_widget
+      display_name: "momia3: Results"
