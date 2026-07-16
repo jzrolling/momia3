@@ -1,0 +1,75 @@
+{
+  "name": "momia3_demo",
+  "workspace": "demo_workspace",
+  "steps": [
+    {
+      "id": "import",
+      "op": "io.import_synth",
+      "params": {
+        "n_frames": 12,
+        "shape": [256, 256],
+        "n_initial": 3,
+        "pixel_microns": 0.065,
+        "growth_rate_um_per_frame": 0.15,
+        "division_length_um": 2.2,
+        "drift_px_per_frame": 0.6,
+        "noise_sigma": 0.02,
+        "seed": 7
+      },
+      "inputs": {},
+      "outputs": {
+        "experiment": "experiment.zarr",
+        "truth": "ground_truth.json",
+        "truth_labels": "ground_truth_labels.npy"
+      }
+    },
+    {
+      "id": "drift",
+      "op": "preprocess.drift",
+      "params": {"upsample_factor": 10},
+      "inputs": {"experiment": "import.experiment"},
+      "outputs": {
+        "experiment": "experiment_drift.zarr",
+        "shifts": "drift_shifts.json"
+      }
+    },
+    {
+      "id": "segment",
+      "op": "segment.threshold",
+      "params": {"method": "composite", "dark_foreground": true, "min_size": 20},
+      "inputs": {"experiment": "drift.experiment"},
+      "outputs": {"experiment": "experiment_drift.zarr"}
+    },
+    {
+      "id": "cells",
+      "op": "measure.cells",
+      "params": {"channel": "phase", "include_intensity": true},
+      "inputs": {"experiment": "segment.experiment"},
+      "outputs": {"cells": "tables/cells_raw.parquet"}
+    },
+    {
+      "id": "outlines",
+      "op": "outline.extract",
+      "params": {"n_points": 100, "sigma": 1.0},
+      "inputs": {"experiment": "segment.experiment", "cells": "cells.cells"},
+      "outputs": {"cells": "tables/cells_outlines.parquet"}
+    },
+    {
+      "id": "midlines",
+      "op": "midline.extract",
+      "params": {"n_points": 32, "method": "zhang"},
+      "inputs": {"experiment": "segment.experiment", "cells": "outlines.cells"},
+      "outputs": {"cells": "tables/cells.parquet"}
+    },
+    {
+      "id": "track",
+      "op": "track.link",
+      "params": {"gap_close": 2, "gate_distance": 20.0},
+      "inputs": {"experiment": "segment.experiment", "cells": "midlines.cells"},
+      "outputs": {
+        "edges": "tables/edges.parquet",
+        "tracks": "tables/tracks.parquet"
+      }
+    }
+  ]
+}

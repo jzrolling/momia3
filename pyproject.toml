@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "momia3"
+version = "0.1.0"
+description = "Single-bacterium microscopy image characterization and lineage tracking platform (ground-up refactor of momia2)."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "scikit-image>=0.22",
+    "polars>=1.0",
+    "pyarrow>=15",
+    "zarr>=3.0",
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "tifffile>=2024.2",
+    "numba>=0.59",
+    "networkx>=3.2",
+]
+
+[project.optional-dependencies]
+gpu = ["torch>=2.2"]
+io = ["nd2>=0.10"]
+distributed = ["dask[distributed]>=2024.1"]
+query = ["duckdb>=1.0"]
+dev = ["pytest>=8.0", "pyinstrument>=4.6"]
+bench = ["pandas>=2.0", "matplotlib>=3.7", "pyinstrument>=4.6"]
+
+[project.scripts]
+momia3 = "momia3.pipeline.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/momia3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

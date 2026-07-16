@@ -1,0 +1,196 @@
+{
+ "repeats": 3,
+ "groups": {
+  "rolling_ball": {
+   "repeats": 3,
+   "fidelity_vs_momia2_fft_reference": {
+    "parabola": {
+     "pearson": 0.999999999999065,
+     "max_abs_diff": 0.05078125,
+     "max_rel_diff": 7.748722055112012e-07
+    },
+    "ball": {
+     "pearson": 0.9999999999991452,
+     "max_abs_diff": 0.0546875,
+     "max_rel_diff": 8.344777597812936e-07
+    }
+   },
+   "cross_estimator_vs_momia2_production": {
+    "0.05": {
+     "pearson_full": 0.8725992318383029,
+     "pearson_interior": 0.9987717983176764,
+     "pearson_interior_shrink": 0.9988512275983413,
+     "momia2_vs_true_shading": 0.9988201338559533,
+     "momia3_vs_true_shading_interior": 0.999744855979807
+    },
+    "0.002": {
+     "pearson_full": 0.8707422871159938,
+     "pearson_interior": 0.9997913615726093,
+     "pearson_interior_shrink": 0.9999813880814425,
+     "momia2_vs_true_shading": 0.9999610559359471,
+     "momia3_vs_true_shading_interior": 0.9998030987022002
+    }
+   },
+   "production_timing": [
+    {
+     "size": 512,
+     "radius": 25,
+     "momia2_ms": 15.882625006876575,
+     "momia3_ms": 2.9417780024232343,
+     "momia3_exact_ms": 2.8148056589998305,
+     "shrink_factor": 4,
+     "speedup": 5.398988296803348
+    },
+    {
+     "size": 512,
+     "radius": 50,
+     "momia2_ms": 25.38765233475715,
+     "momia3_ms": 0.7539999981721243,
+     "momia3_exact_ms": 2.7400976638697707,
+     "shrink_factor": 4,
+     "speedup": 33.670626520295585
+    },
+    {
+     "size": 512,
+     "radius": 100,
+     "momia2_ms": 69.22251399858699,
+     "momia3_ms": 0.9727223368827254,
+     "momia3_exact_ms": 3.8106526723519587,
+     "shrink_factor": 4,
+     "speedup": 71.16369324922029
+    },
+    {
+     "size": 1024,
+     "radius": 25,
+     "momia2_ms": 63.718916668828264,
+     "momia3_ms": 2.325971998895208,
+     "momia3_exact_ms": 11.682485666824505,
+     "shrink_factor": 4,
+     "speedup": 27.3945329948484
+    },
+    {
+     "size": 1024,
+     "radius": 50,
+     "momia2_ms": 104.59473633090965,
+     "momia3_ms": 2.395027996196101,
+     "momia3_exact_ms": 10.996694337033356,
+     "shrink_factor": 4,
+     "speedup": 43.67161323251004
+    },
+    {
+     "size": 1024,
+     "radius": 100,
+     "momia2_ms": 295.53095833883464,
+     "momia3_ms": 2.279332999023609,
+     "momia3_exact_ms": 16.499833000125363,
+     "shrink_factor": 4,
+     "speedup": 129.65677172463626
+    },
+    {
+     "size": 2048,
+     "radius": 25,
+     "momia2_ms": 267.0733743337526,
+     "momia3_ms": 8.262124999115864,
+     "momia3_exact_ms": 48.12502799419841,
+     "shrink_factor": 4,
+     "speedup": 32.32502223850793
+    },
+    {
+     "size": 2048,
+     "radius": 50,
+     "momia2_ms": 440.0992083295326,
+     "momia3_ms": 8.518819333403371,
+     "momia3_exact_ms": 48.98540266731288,
+     "shrink_factor": 4,
+     "speedup": 51.66199576552208
+    },
+    {
+     "size": 2048,
+     "radius": 100,
+     "momia2_ms": 1228.8285416628544,
+     "momia3_ms": 9.024583341670223,
+     "momia3_exact_ms": 56.59269466317104,
+     "shrink_factor": 4,
+     "speedup": 136.1645734921463
+    }
+   ],
+   "production_breakdown_s": {
+    "gaussian_x65535": 0.012876416993094608,
+    "shrink_local_min": 0.001860541000496596,
+    "numba_kernel_on_shrunk": 0.07201379199977964,
+    "upsample_resize": 0.012306332995649427
+   },
+   "momia3_production_breakdown_ms": {
+    "shrink_local_min": 0.48645866627339274,
+    "fftconvolve_shrunk": 1.0203466711876292,
+    "upsample_subtract": 0.5359583349976068
+   },
+   "raw_kernel_timing": [
+    {
+     "size": 1024,
+     "radius": 25,
+     "repeats": 1,
+     "momia2_ms": 4425.460917002056,
+     "momia3_ms": 10.352249669570787,
+     "speedup": 427.48784643498067
+    },
+    {
+     "size": 1024,
+     "radius": 50,
+     "repeats": 1,
+     "momia2_ms": 16782.080709002912,
+     "momia3_ms": 11.604709002616195,
+     "speedup": 1446.1440355996447
+    },
+    {
+     "size": 1024,
+     "radius": 100,
+     "repeats": 1,
+     "momia2_ms": 76737.1617089957,
+     "momia3_ms": 15.105805330676958,
+     "speedup": 5079.9781957442165
+    }
+   ],
+   "shrink_path_correctness": {
+    "shrink_factor": 4,
+    "pearson_full_vs_exact": 0.9971534166104025,
+    "pearson_interior_vs_exact": 0.9998034827127682,
+    "max_abs_diff": 6388.1875,
+    "exact_vs_true_shading_interior": 0.99984287577333,
+    "shrink_vs_true_shading_interior": 0.9998420290389941
+   }
+  },
+  "midline": {
+   "n_masks": 50,
+   "momia2_failures": 4,
+   "compared_masks": 46,
+   "repeats": 3,
+   "correctness": {
+    "length_pearson": 0.9892662394687921,
+    "length_median_rel_diff": 0.017133388352299023,
+    "length_max_rel_diff": 0.08216291991407272
+   },
+   "momia2_ms_per_pass": 113.46566699891507,
+   "momia3_ms_per_pass": 100.7103469989185,
+   "speedup": 1.126653520517942,
+   "momia3_tile_ms_per_pass": 105.39434767269995,
+   "speedup_per_tile": 1.0765820891200013,
+   "batch_vs_tile_agreement": 1.0,
+   "momia2_ms_per_mask": 2.2693133399783014,
+   "momia3_ms_per_mask": 2.01420693997837
+  },
+  "overlap": {
+   "size": 2048,
+   "n_labels": 400,
+   "repeats": 3,
+   "correctness": {
+    "n_pairs_momia2": 400,
+    "n_pairs_momia3": 400,
+    "pairs_exact_match": true
+   },
+   "momia2_ms": 66.75029132748023,
+   "momia3_ms": 5.924458329294187,
+   "speedup": 11.266901987887314
+  }
+ }
+}
