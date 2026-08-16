@@ -398,3 +398,182 @@ def test_synth_frame_acceptance():
         assert d1 < 2.0 and d2 < 2.0
         assert _inside_fraction(res["midline"][0], labels == rec["label"],
                                 tol_px=1.0) >= 0.99
+
+
+# ---------------------------------------------------------------------------
+# pole-first / low-DOF spline algorithm (chain-forming near-ovoid cells)
+# ---------------------------------------------------------------------------
+
+
+def tapered_bent_mask(
+    shape: tuple[int, int],
+    cy: float,
+    cx: float,
+    radius: float,
+    theta_deg: float,
+    r0: float,
+    r1: float,
+    n_disk: int = 250,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Asymmetric bent rod: union of disks whose radius tapers linearly
+    from ``r0`` to ``r1`` along a circular arc. Returns
+    (mask, tip1_xy, tip2_xy, true_midline_length_px)."""
+    theta = np.deg2rad(theta_deg)
+    mask = np.zeros(shape, dtype=bool)
+    angles = np.linspace(-theta / 2.0, theta / 2.0, n_disk)
+    radii = np.linspace(r0, r1, n_disk)
+    for a, r in zip(angles, radii):
+        rr, cc = disk((cy + radius * np.sin(a), cx + radius * np.cos(a)),
+                      r, shape=shape)
+        mask[rr, cc] = True
+    tips = []
+    for a, sign, r in ((-theta / 2.0, -1.0, r0), (theta / 2.0, 1.0, r1)):
+        ty, tx = sign * np.cos(a), -sign * np.sin(a)
+        cap_y, cap_x = cy + radius * np.sin(a), cx + radius * np.cos(a)
+        tips.append(np.array([cap_x + tx * r, cap_y + ty * r]))
+    true_length = radius * theta + r0 + r1
+    return mask, tips[0], tips[1], true_length
+
+
+def _total_curvature(points: np.ndarray) -> float:
+    """Sum of absolute turning angles (radians) along an open polyline."""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 3:
+        return 0.0
+    v = np.diff(pts, axis=0)
+    keep = np.hypot(v[:, 0], v[:, 1]) > 1e-9
+    if keep.sum() < 2:
+        return 0.0
+    ang = np.arctan2(v[keep, 1], v[keep, 0])
+    d = np.diff(ang)
+    d = (d + np.pi) % (2.0 * np.pi) - np.pi
+    return float(np.sum(np.abs(d)))
+
+
+def test_near_round_ovoid_is_degenerate():
+    """AR ~ 1.3 ellipse: quality 'degenerate', no crash, midline inside."""
+    from skimage.draw import ellipse
+
+    rr, cc = ellipse(64, 64, 15, 11.5, shape=(128, 128))
+    mask = np.zeros((128, 128), dtype=bool)
+    mask[rr, cc] = True
+    labels = mask.astype(np.uint32)
+    res = extract_midlines(labels, extract_outlines(labels),
+                           pixel_microns=PIXEL_MICRONS)[1]
+    assert res["midline_quality"] == "degenerate"
+    assert res["branched"] == 0.0
+    assert _inside_fraction(res["midline"][0], mask, tol_px=1.0) >= 0.99
+
+
+@pytest.fixture()
+def tapered():
+    shape = (200, 200)
+    mask, tip1, tip2, length_px = tapered_bent_mask(
+        shape, 55.0, 45.0, 55.0, 70.0, 7.0, 6.0
+    )
+    labels = mask.astype(np.uint32)
+    outlines = extract_outlines(labels)
+    results = extract_midlines(labels, outlines, pixel_microns=PIXEL_MICRONS)
+    return {"mask": mask, "labels": labels, "tip1": tip1, "tip2": tip2,
+            "length_px": length_px, "res": results[1]}
+
+
+def test_tapered_bent_rod_accuracy_and_smoothness(tapered):
+    """Asymmetric tapered bent rod: accurate, inside, and NO zigzag."""
+    res = tapered["res"]
+    mid = res["midline"][0]
+    assert res["midline_quality"] in ("refined", "geodesic")
+    assert _inside_fraction(mid, tapered["mask"], tol_px=1.0) >= 0.99
+    assert res["length_um"] / PIXEL_MICRONS == pytest.approx(
+        tapered["length_px"], rel=0.03
+    )
+    # No high-frequency oscillation: bounded discrete second difference.
+    second_diff = np.abs(mid[2:] - 2.0 * mid[1:-1] + mid[:-2])
+    assert float(second_diff.max()) < 1.0
+    # Width variability stays moderate despite the taper.
+    assert res["width_cv"] < 0.25
+
+
+def test_zigzag_regression_vs_skeleton_baseline(tapered):
+    """The new midline's total curvature is at most 60 % of a smoothed
+    skeleton-path baseline computed inline via skimage skeletonize."""
+    from skimage import morphology
+
+    import momia3.ops.midline as midline_ops
+
+    skel = morphology.skeletonize(tapered["mask"])
+    branches, node_centers = midline_ops._trace_branches(skel)
+    branches = midline_ops._prune_branches(branches, 3.0)
+    main_rc, _ = midline_ops._main_branch_path(branches, node_centers)
+    main_xy = np.column_stack([main_rc[:, 1], main_rc[:, 0]])
+    baseline = midline_ops._smooth_open(
+        main_xy, 1.0, n=len(tapered["res"]["midline"][0])
+    )
+    base_curv = _total_curvature(baseline)
+    new_curv = _total_curvature(tapered["res"]["midline"][0])
+    assert base_curv > 0.0
+    assert new_curv <= 0.60 * base_curv
+
+
+def test_chain_of_two_touching_capsules():
+    """Two declumped capsules sharing a crevice junction: poles within 2 px
+    of the outer tip and the neck midpoint, no spurious side branches."""
+    shape = (160, 160)
+    m1, tip1, _ = capsule_mask(shape, 60.0, 48.0, 0.0, 46.0, 12.0)  # x 25..71
+    m2, _, tip2 = capsule_mask(shape, 60.0, 102.0, 0.0, 46.0, 12.0)  # x 79..129
+    neck = np.zeros(shape, dtype=bool)
+    neck[58:63, 69:80] = True  # narrow bridge -> crevice at the junction
+    union = m1 | m2 | neck
+
+    # Declump mimicry: assign each union pixel to the nearest spine segment.
+    yy, xx = np.mgrid[0 : shape[0], 0 : shape[1]]
+
+    def segdist(x0, x1, y0):
+        t = np.clip(xx, x0, x1)
+        return np.hypot(yy - y0, xx - t)
+
+    d1 = segdist(31.0, 65.0, 60.0)
+    d2 = segdist(85.0, 119.0, 60.0)
+    labels = np.zeros(shape, dtype=np.uint32)
+    labels[union & (d1 <= d2)] = 1
+    labels[union & (d2 < d1)] = 2
+
+    results = extract_midlines(labels, extract_outlines(labels),
+                               pixel_microns=PIXEL_MICRONS)
+    junction = np.array([75.0, 60.0])  # neck midpoint = partition plane
+    for lab, outer_tip in ((1, tip1), (2, tip2)):
+        res = results[lab]
+        assert res["midline_quality"] != "failed"
+        assert res["branched"] == 0.0
+        assert len(res["midline"]) == 1
+        d_outer, d_junction = _pole_error(
+            res["pole1"], res["pole2"], outer_tip, junction
+        )
+        assert d_outer < 2.0 and d_junction < 2.0
+
+
+def test_quality_columns_and_failed_torus():
+    """fill_cells_midline writes the quality/diagnostic columns; a torus
+    returns an empty midline with quality 'failed' and never raises."""
+    from skimage.draw import disk
+
+    shape = (128, 128)
+    torus = np.zeros(shape, dtype=bool)
+    rr, cc = disk((64, 64), 25, shape=shape)
+    torus[rr, cc] = True
+    rr, cc = disk((64, 64), 15, shape=shape)
+    torus[rr, cc] = False
+    labels = torus.astype(np.uint32)
+    results = extract_midlines(labels, extract_outlines(labels),
+                               pixel_microns=PIXEL_MICRONS)
+    res = results[1]
+    assert res["midline_quality"] == "failed"
+    assert len(res["midline"][0]) == 0
+
+    table = fill_cells_midline(_base_cells_table(labels), results)
+    validated = schema.validate_cells(table)
+    for column in ("midline_quality", "midline_n_iter", "midline_residual",
+                   "midline_max_curv", "width_cv"):
+        assert column in validated.column_names
+    assert validated.column("midline_quality").to_pylist() == ["failed"]
+    assert validated.column("midline_n_iter").to_pylist() == [0]

@@ -1,21 +1,42 @@
 """Midline / pole / width-profile extraction (ARCHITECTURE.md §4.5 / §5.2).
 
-Performance and accuracy upgrades over momia2:
+**Pole-first, low-DOF spline algorithm** (replaces the earlier
+skeleton-first pipeline, which zigzagged on near-ovoid, chain-forming
+cells and grew spur branches at chain-junction crevices):
 
-- skeleton neighbour classification uses **one**
-  :func:`scipy.ndimage.convolve` with a 3x3 ones kernel (endpoints = 1
-  neighbour, branchpoints > 2) instead of per-pixel numba calls;
-- **all** outline↔midline nearest-point / perpendicular-intersection
-  queries go through a :class:`scipy.spatial.cKDTree` built on outline
-  segment midpoints — no O(n_outline x n_midline) dense matrices anywhere;
-- branches are traced as graph paths, short spurs are pruned, and the
-  main branch is the longest geodesic path (exact tree-diameter search
-  over leaf nodes);
-- iterative perpendicular refinement keeps the momia2 core idea
-  (``midline_approximation``) but vectorized against the KDTree;
-- poles are found by extending the end tangents of the refined midline
-  until intersection with the outline (MicrobeJ/Oufti-style pole
-  extension).
+1. **Pole-first initialization** (biological prior: exactly two poles) —
+   the two outline points with maximal geodesic separation, constrained to
+   rough alignment with the second-moments major axis of the mask.
+2. **Distance-transform geodesic centerline** (replaces the skeleton
+   initialization) — pixel-grid Dijkstra (:func:`skimage.graph.
+   route_through_array`, 8-connectivity) between the poles with cost
+   ``1/(EDT + eps)``: guaranteed inside the mask, naturally centered, no
+   staircase topology, no spur branches.
+3. **Low-DOF regularized spline fitting** (replaces per-point iterative
+   refinement) — a cubic B-spline with few control points
+   (``clamp(round(length_px / ctrl_spacing_px), ctrl_min, ctrl_max)``)
+   minimizing a perpendicular-midpoint data term (KDTree ray machinery),
+   a bending-energy regularizer on second finite differences of the
+   control points (``lambda_smooth``) and a centrality pull toward the
+   geodesic centerline (``mu_central``). Solved as a small linear
+   least-squares problem with 3–5 re-parameterization passes.
+4. **Convergence cascade + quality flag** — ``midline_quality`` per cell:
+   ``"refined"`` (spline improved on the geodesic residual),
+   ``"geodesic"`` (fallback to the smoothed geodesic centerline),
+   ``"degenerate"`` (aspect ratio < ``degenerate_ar``: major-axis segment,
+   no refinement), ``"failed"`` (any exception or pathological topology:
+   empty midline, never garbage).
+5. **Septum-aware pole handling** — end tangents are fit on the distal
+   ``end_window_frac`` of arc length only; where the width profile dips
+   significantly in an end third (septum/chain-junction crevice), the
+   geodesic centerline's end direction is trusted over the data-term
+   tangent. Poles are extended along the end tangent to the outline.
+6. **Width profile & scalars** — unchanged KDTree normal-intersection
+   logic, computed on the final curve.
+
+Skeletonization (:func:`skimage.morphology.skeletonize`) is still used,
+but ONLY for side-branch *reporting* of branched cells — the main midline
+never comes from the skeleton.
 
 Coordinate convention: all output geometry is ``(x, y)`` in *global*
 image coordinates. ``width_profile`` and ``length``/``width`` scalars are
@@ -35,6 +56,7 @@ from numba import njit
 from scipy import interpolate, ndimage
 from scipy.spatial import cKDTree
 from skimage import morphology
+from skimage.graph import route_through_array
 
 from momia3 import keys as _keys
 from momia3 import schema as _schema
@@ -59,18 +81,54 @@ MIDLINE_SCALAR_COLUMNS: tuple[str, ...] = (
 )
 """Scalar columns written by :func:`fill_cells_midline`."""
 
+MIDLINE_QUALITY_COLUMN = "midline_quality"
+"""Per-cell convergence-cascade flag written by :func:`fill_cells_midline`."""
+
+MIDLINE_DIAG_COLUMNS: dict[str, str] = {
+    "midline_n_iter": "n_iter",
+    "midline_residual": "final_residual",
+    "midline_max_curv": "max_curvature",
+    "width_cv": "width_cv",
+}
+"""Diagnostic columns written by :func:`fill_cells_midline`
+(arrow column name -> per-label result key)."""
+
 _DEFAULT_PARAMS: dict[str, Any] = {
+    # skeleton side-branch detection (branch reporting only)
     "method": "zhang",
     "min_branch_length_um": 0.2,
+    # shared
     "n_points": 32,
     "smooth": 1.0,
+    "knn": 24,
+    "pad": 2,
+    # legacy refinement parameters, kept for API compatibility (unused)
     "refine_iterations": 10,
     "refine_tolerance": 0.1,
     "refine_anchor": 3,
     "refine_max_step": 1.5,
     "pole_fit_points": 5,
-    "knn": 24,
-    "pad": 2,
+    # pole-first initialization
+    "pole_max_candidates": 400,
+    "pole_axis_tol_deg": 45.0,
+    # geodesic centerline
+    "edt_eps": 0.25,
+    "hole_area_frac": 0.02,
+    # low-DOF spline fit
+    "ctrl_spacing_px": 8.0,
+    "ctrl_min": 5,
+    "ctrl_max": 9,
+    "lambda_smooth": 1.0,
+    "mu_central": 0.5,
+    "anchor_weight": 10.0,
+    "spline_iterations": 5,
+    "spline_tolerance": 0.1,
+    "spline_max_step": 1.5,
+    # septum-aware poles
+    "end_window_frac": 0.2,
+    "septum_dip_frac": 0.25,
+    # degenerate (near-round) cells
+    "degenerate_ar": 1.4,
 }
 
 
@@ -138,6 +196,30 @@ def _normals(points: np.ndarray) -> np.ndarray:
     norm[norm == 0] = 1.0
     tangents = tangents / norm[:, None]
     return np.column_stack([-tangents[:, 1], tangents[:, 0]])
+
+
+def _curvature_stats(points: np.ndarray) -> tuple[float, float]:
+    """``(total_curvature, max_curvature)`` of an open polyline.
+
+    Total curvature is the sum of absolute turning angles (radians); max
+    curvature is the largest per-step turning angle divided by the mean
+    adjacent segment length (rad/px).
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 3:
+        return 0.0, 0.0
+    v = np.diff(pts, axis=0)
+    seg = np.hypot(v[:, 0], v[:, 1])
+    ok = seg > 1e-9
+    if ok.sum() < 2:
+        return 0.0, 0.0
+    ang = np.arctan2(v[ok, 1], v[ok, 0])
+    d = np.diff(ang)
+    d = (d + np.pi) % (2.0 * np.pi) - np.pi
+    seg_ok = seg[ok]
+    mean_seg = 0.5 * (seg_ok[:-1] + seg_ok[1:])
+    kappa = np.abs(d) / np.maximum(mean_seg, 1e-9)
+    return float(np.sum(np.abs(d))), float(np.max(kappa))
 
 
 # ---------------------------------------------------------------------------
@@ -305,14 +387,15 @@ class _OutlineIndex:
 
 
 # ---------------------------------------------------------------------------
-# skeleton graph tracing
+# skeleton graph tracing (side-branch REPORTING only — never the main midline)
 # ---------------------------------------------------------------------------
 
 
 _NEIGHBORS8: tuple[tuple[int, int], ...] = (
     (-1, -1), (-1, 0), (-1, 1),
     (0, -1), (0, 1),
-    (1, -1), (1, 0), (1, 1),
+    (1, -1), (1, 0),
+    (1, 1),
 )
 
 
@@ -580,117 +663,8 @@ def _main_branch_path(
 
 
 # ---------------------------------------------------------------------------
-# refinement / poles / width
+# width profile (unchanged KDTree normal-intersection logic)
 # ---------------------------------------------------------------------------
-
-
-def _refine_midline(
-    midline: np.ndarray,
-    index: _OutlineIndex,
-    knn: int,
-    smooth: float,
-    max_iter: int,
-    tolerance: float,
-    anchor: int = 3,
-    max_step: float = 1.5,
-    contains=None,
-) -> tuple[np.ndarray, bool]:
-    """Iterative perpendicular refinement (momia2 ``midline_approximation``
-    idea, vectorized through the outline KDTree).
-
-    Each point is moved to the midpoint of its two normal-ray outline
-    intersections; the polyline is re-smoothed each iteration until the
-    mean absolute movement drops below ``tolerance``. Safeguards:
-
-    - the first and last ``anchor`` points are kept fixed (momia2
-      ``anchor_length``): near the pole caps the midpoint rule can
-      overshoot and reorder the trailing samples, folding the curve end
-      back on itself and flipping the end-tangent used for pole
-      extension;
-    - per-point moves larger than ``max_step`` px are rejected (momia2's
-      1 px outlier rejection), so a bad intersection cannot drag a
-      point across the cell;
-    - when ``contains`` is given (callable ``(M, 2) xy -> (M,) bool``,
-      typically a mask lookup), moves landing outside the mask are
-      reverted: near sharp skeleton junctions the normal can intersect
-      outlines of two different arms and the midpoint rule would
-      otherwise push points into the empty wedge between them.
-    """
-    mid = np.asarray(midline, dtype=np.float64)
-    a = max(0, min(int(anchor), (len(mid) - 1) // 2))
-    converged = False
-    for _ in range(max_iter):
-        normals = _normals(mid)
-        # ONE batched query for both normal directions: every ray is solved
-        # independently, so the stacked call is bit-identical to two
-        # separate calls at half the per-call numpy overhead.
-        n = len(mid)
-        both_origins = np.vstack([mid, mid])
-        both_dirs = np.vstack([normals, -normals])
-        d_all, p_all = index.ray_intersections(both_origins, both_dirs, knn)
-        d_pos, p_pos = d_all[:n], p_all[:n]
-        d_neg, p_neg = d_all[n:], p_all[n:]
-        both = np.isfinite(d_pos) & np.isfinite(d_neg)
-        updated = mid.copy()
-        updated[both] = 0.5 * (p_pos[both] + p_neg[both])
-        step = np.hypot(*(updated - mid).T)
-        updated[step > float(max_step)] = mid[step > float(max_step)]
-        if contains is not None:
-            inside = contains(updated)
-            updated[~inside] = mid[~inside]
-        if a > 0:
-            updated[:a] = mid[:a]
-            updated[-a:] = mid[-a:]
-        movement = float(np.mean(np.abs(updated - mid)))
-        mid = _smooth_open(updated, smooth, n=len(mid))
-        if contains is not None:
-            # The smoothing spline may cut sharp corners out of the mask;
-            # snap any escaped samples back onto the pre-smoothing curve.
-            escaped = ~contains(mid)
-            if np.any(escaped):
-                mid[escaped] = updated[escaped]
-        if movement <= tolerance:
-            converged = True
-            break
-    return mid, converged
-
-
-def _extend_poles(
-    midline: np.ndarray, index: _OutlineIndex, knn: int, fit_points: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Extend both midline ends along the end tangent to the outline.
-
-    Returns
-    -------
-    tuple of numpy.ndarray
-        ``(pole1, pole2)`` as ``(x, y)`` global coordinates; falls back
-        to the midline endpoints when no local intersection is found.
-    """
-    mid = np.asarray(midline, dtype=np.float64)
-    g = max(2, min(int(fit_points), len(mid) - 1))
-    # Batched ray query for both end-tangent extensions (bit-identical to
-    # two separate single-ray calls).
-    ends = ((mid[0], mid[g]), (mid[-1], mid[-1 - g]))
-    origins: list[np.ndarray] = []
-    directions: list[np.ndarray] = []
-    slots: list[int] = []
-    for slot, (end, inward) in enumerate(ends):
-        direction = end - inward
-        norm = float(np.hypot(direction[0], direction[1]))
-        if norm <= 0:
-            continue
-        origins.append(end)
-        directions.append(direction / norm)
-        slots.append(slot)
-    poles = [end.copy() for end, _ in ends]
-    if origins:
-        _, hits = index.ray_intersections(
-            np.asarray(origins), np.asarray(directions), knn
-        )
-        for slot, hit in zip(slots, hits):
-            if np.isfinite(hit).all():
-                poles[slot] = hit
-    return poles[0], poles[1]
 
 
 def _width_profile(
@@ -726,42 +700,601 @@ def _width_profile(
 
 
 # ---------------------------------------------------------------------------
-# fallback (skeleton failed)
+# Step 1 — pole-first initialization
 # ---------------------------------------------------------------------------
 
 
-def _pca_fallback(
-    mask_coords_rc: np.ndarray,
+def _mask_major_axis(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """Second-moments major axis of a binary mask.
+
+    Returns
+    -------
+    centroid_xy : numpy.ndarray
+        ``(x, y)`` centroid in crop coordinates.
+    axis_xy : numpy.ndarray
+        Unit vector along the major axis (sign ambiguous).
+    aspect_ratio : float
+        ``sqrt(lambda_max / lambda_min)`` of the pixel covariance.
+    """
+    ys, xs = np.nonzero(mask)
+    pts = np.column_stack([ys.astype(np.float64), xs.astype(np.float64)])
+    centroid_rc = pts.mean(axis=0)
+    cov = np.cov((pts - centroid_rc).T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    major_rc = eigvecs[:, int(np.argmax(eigvals))]
+    lam_min = float(np.min(eigvals))
+    ar = float(np.sqrt(np.max(eigvals) / lam_min)) if lam_min > 1e-12 else np.inf
+    centroid_xy = np.array([centroid_rc[1], centroid_rc[0]])
+    axis_xy = np.array([major_rc[1], major_rc[0]])
+    norm = float(np.hypot(axis_xy[0], axis_xy[1]))
+    if norm > 0:
+        axis_xy = axis_xy / norm
+    return centroid_xy, axis_xy, ar
+
+
+def _find_pole_pair(
+    ring_xy: np.ndarray,
+    axis_xy: np.ndarray,
+    max_candidates: int,
+    axis_tol_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Outline pair with maximal separation, aligned with the major axis.
+
+    All-pairs euclidean distance of (at most ``max_candidates``) outline
+    points; if the farthest pair's direction deviates from the mask major
+    axis by more than ``axis_tol_deg`` (modulo pi), the farthest pair
+    among those within the tolerance is preferred.
+    """
+    pts = np.asarray(ring_xy, dtype=np.float64)
+    if len(pts) > int(max_candidates):
+        step = int(np.ceil(len(pts) / float(max_candidates)))
+        pts = pts[::step]
+    n = len(pts)
+    diff = pts[:, None, :] - pts[None, :, :]
+    dist2 = np.einsum("ijk,ijk->ij", diff, diff)
+    iu = np.triu_indices(n, k=1)
+    d2 = dist2[iu]
+    vecs = pts[iu[1]] - pts[iu[0]]
+
+    cos_tol = float(np.cos(np.deg2rad(axis_tol_deg)))
+
+    def pick(order_ok: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        cand = np.where(order_ok, d2, -1.0)
+        k = int(np.argmax(cand))
+        return pts[iu[0][k]].copy(), pts[iu[1][k]].copy()
+
+    k_max = int(np.argmax(d2))
+    v = vecs[k_max]
+    norm = float(np.hypot(v[0], v[1]))
+    if norm > 0 and abs(float(np.dot(v / norm, axis_xy))) >= cos_tol:
+        return pts[iu[0][k_max]].copy(), pts[iu[1][k_max]].copy()
+    # Farthest pair misaligned with the major axis: restrict to aligned pairs.
+    norms = np.hypot(vecs[:, 0], vecs[:, 1])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cos_dev = np.abs(vecs @ axis_xy) / norms
+    ok = (norms > 0) & (cos_dev >= cos_tol)
+    if ok.any():
+        return pick(ok)
+    return pts[iu[0][k_max]].copy(), pts[iu[1][k_max]].copy()
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — distance-transform geodesic centerline
+# ---------------------------------------------------------------------------
+
+
+def _geodesic_centerline(
+    crop: np.ndarray, pole1_xy: np.ndarray, pole2_xy: np.ndarray, eps: float
+) -> np.ndarray:
+    """Shortest path between the poles over the mask pixel grid with cost
+    ``1/(EDT + eps)`` (8-connected, geometric weights).
+
+    The path is guaranteed to stay inside the mask (outside pixels carry
+    a near-infinite cost) and is naturally centered on the local EDT
+    ridge. Outline pole candidates are snapped to the nearest mask pixel
+    and then walked uphill on the EDT to the local ridge (greedy
+    8-neighbour ascent): on bent cells the max-separation outline pair
+    sits around the pole-cap corner, and without the uphill snap the
+    geodesic — and every downstream end tangent — would be anchored off
+    the tip.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(P, 2)`` path in ``(x, y)`` crop coordinates.
+    """
+    dt = ndimage.distance_transform_edt(crop)
+    cost = np.where(crop, 1.0 / (dt + float(eps)), 1e6)
+    ys, xs = np.nonzero(crop)
+    tree = cKDTree(np.column_stack([ys, xs]).astype(np.float64))
+
+    def snap(p_xy: np.ndarray) -> tuple[int, int]:
+        _, idx = tree.query([float(p_xy[1]), float(p_xy[0])])
+        r, c = int(ys[idx]), int(xs[idx])
+        # Greedy EDT uphill walk to the local ridge / plateau.
+        for _ in range(64):
+            best = (r, c)
+            best_dt = dt[r, c]
+            for dr, dc in _NEIGHBORS8:
+                rr, cc = r + dr, c + dc
+                if (
+                    0 <= rr < crop.shape[0]
+                    and 0 <= cc < crop.shape[1]
+                    and crop[rr, cc]
+                    and dt[rr, cc] > best_dt + 1e-9
+                ):
+                    best, best_dt = (rr, cc), dt[rr, cc]
+            if best == (r, c):
+                break
+            r, c = best
+        return r, c
+
+    start, end = snap(pole1_xy), snap(pole2_xy)
+    if start == end:
+        return np.array([[start[1], start[0]], [end[1], end[0]]], dtype=np.float64)
+    path, _ = route_through_array(
+        cost, start, end, fully_connected=True, geometric=True
+    )
+    rc = np.asarray(path, dtype=np.float64)
+    return np.column_stack([rc[:, 1], rc[:, 0]])
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — low-DOF regularized spline fit
+# ---------------------------------------------------------------------------
+
+
+def _spline_design(u: np.ndarray, n_ctrl: int, degree: int = 3) -> np.ndarray:
+    """Dense design matrix of a clamped uniform-knot cubic B-spline.
+
+    ``(M, n_ctrl)`` basis evaluation at parameters ``u`` in ``[0, 1]``;
+    clamped knots make the curve pass through the first/last control
+    points.
+    """
+    n_ctrl = int(n_ctrl)
+    interior = np.linspace(0.0, 1.0, n_ctrl - degree + 1)[1:-1]
+    t = np.concatenate([np.zeros(degree + 1), interior, np.ones(degree + 1)])
+    uu = np.clip(np.asarray(u, dtype=np.float64), 0.0, 1.0 - 1e-9)
+    mat = interpolate.BSpline.design_matrix(uu, t, degree, extrapolate=False)
+    return np.asarray(mat.todense())
+
+
+def _second_difference(n_ctrl: int) -> np.ndarray:
+    """``(n_ctrl - 2, n_ctrl)`` second finite-difference matrix."""
+    d = np.zeros((n_ctrl - 2, n_ctrl), dtype=np.float64)
+    for i in range(n_ctrl - 2):
+        d[i, i] = 1.0
+        d[i, i + 1] = -2.0
+        d[i, i + 2] = 1.0
+    return d
+
+
+def _normal_midpoints(
+    pts: np.ndarray, index: _OutlineIndex, knn: int, end_anchor: int = 2
+) -> tuple[np.ndarray, np.ndarray]:
+    """Perpendicular midpoint targets and validity mask for a polyline.
+
+    For every sample the two normal-ray outline intersections are
+    computed (batched KDTree query); the target is their midpoint.
+    Samples missing either side, and the first/last ``end_anchor``
+    samples (pole-cap region, handled by pole extension), are invalid.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    normals = _normals(pts)
+    n = len(pts)
+    d_all, p_all = index.ray_intersections(
+        np.vstack([pts, pts]), np.vstack([normals, -normals]), knn
+    )
+    d_pos, p_pos = d_all[:n], p_all[:n]
+    d_neg, p_neg = d_all[n:], p_all[n:]
+    valid = np.isfinite(d_pos) & np.isfinite(d_neg)
+    a = max(0, min(int(end_anchor), (n - 1) // 2))
+    if a > 0:
+        valid[:a] = False
+        valid[-a:] = False
+    targets = np.where(valid[:, None], 0.5 * (p_pos + p_neg), pts)
+    return targets, valid
+
+
+def _residual_against_targets(
+    pts: np.ndarray, targets: np.ndarray, valid: np.ndarray
+) -> float:
+    """Mean absolute normal-direction deviation from midpoint targets."""
+    if not np.any(valid):
+        return float("nan")
+    normals = _normals(pts)
+    dev = np.abs(np.einsum("ij,ij->i", pts - targets, normals))
+    return float(np.mean(dev[valid]))
+
+
+def _fit_lowdof_spline(
+    geo_xy: np.ndarray,
+    index: _OutlineIndex,
+    knn: int,
+    params: Mapping[str, Any],
+    contains,
+) -> dict[str, Any]:
+    """Regularized low-DOF cubic B-spline fit to the outline midpoints.
+
+    Unknowns are the ``(n_ctrl, 2)`` control points; the objective is
+
+    - **data term**: at arc-length-uniform samples, the normal-direction
+      deviation from the perpendicular outline-midpoint target (linear in
+      the control points given a fixed parameterization);
+    - **bending energy**: ``lambda_smooth * ||D2 C||^2`` on second finite
+      differences of the control points — zigzag is structurally
+      impossible with 5–9 control points plus this penalty;
+    - **centrality**: ``mu_central``-weighted euclidean pull toward the
+      geodesic centerline of Step 2;
+    - **end anchors**: the first/last control points are pinned (weight
+      ``anchor_weight``) to the geodesic endpoints — the bending energy
+      alone under-determines the ends and they would otherwise slide
+      outward past the pole caps. Reaching the outline is the job of the
+      pole-extension step, not of the spline.
+
+    Solved by :func:`numpy.linalg.lstsq` on a ``(2*n_ctrl,)`` vector;
+    the parameterization is refreshed (arc-length resample, normal
+    recompute, re-solve) at most ``spline_iterations`` times, stopping
+    early when mean control-point movement < ``spline_tolerance`` px.
+    Moves that push samples out of the mask are damped by repeated
+    halving.
+    """
+    geo = np.asarray(geo_xy, dtype=np.float64)
+    n_sample = len(geo)
+    length_px = _arc_length(geo)
+    n_ctrl = int(round(length_px / float(params["ctrl_spacing_px"])))
+    n_ctrl = max(int(params["ctrl_min"]), min(int(params["ctrl_max"]), n_ctrl))
+    n_ctrl = min(n_ctrl, n_sample)
+
+    lam = float(params["lambda_smooth"])
+    mu = float(params["mu_central"])
+    max_iter = int(params["spline_iterations"])
+    tol = float(params["spline_tolerance"])
+    max_step = float(params["spline_max_step"])
+    anchor_w = float(params.get("anchor_weight", 10.0))
+
+    u = np.linspace(0.0, 1.0, n_sample)
+    basis = _spline_design(u, n_ctrl)
+    d2 = _second_difference(n_ctrl)
+
+    # Block helper for the stacked [Cx; Cy] unknown vector.
+    def block_diag2(m: np.ndarray) -> np.ndarray:
+        out = np.zeros((2 * m.shape[0], 2 * m.shape[1]), dtype=np.float64)
+        out[: m.shape[0], : m.shape[1]] = m
+        out[m.shape[0] :, m.shape[1] :] = m
+        return out
+
+    bend_rows = np.sqrt(lam) * block_diag2(d2)
+    cent_rows = np.sqrt(mu) * block_diag2(basis)
+    cent_rhs = np.concatenate([np.sqrt(mu) * geo[:, 0], np.sqrt(mu) * geo[:, 1]])
+    anchor_rows = np.zeros((4, 2 * n_ctrl), dtype=np.float64)
+    anchor_rows[0, 0] = anchor_w
+    anchor_rows[1, n_ctrl] = anchor_w
+    anchor_rows[2, n_ctrl - 1] = anchor_w
+    anchor_rows[3, 2 * n_ctrl - 1] = anchor_w
+    anchor_rhs = anchor_w * np.array(
+        [geo[0, 0], geo[0, 1], geo[-1, 0], geo[-1, 1]]
+    )
+
+    # Initialization: plain least-squares fit of the geodesic centerline.
+    ctrl, *_ = np.linalg.lstsq(
+        np.vstack([block_diag2(basis), bend_rows, anchor_rows]),
+        np.concatenate(
+            [geo[:, 0], geo[:, 1], np.zeros(2 * d2.shape[0]), anchor_rhs]
+        ),
+        rcond=None,
+    )
+    ctrl = ctrl.reshape(2, n_ctrl).T  # (n_ctrl, 2)
+
+    converged = False
+    n_iter = 0
+    for _ in range(max_iter):
+        n_iter += 1
+        pts = basis @ ctrl
+        targets, valid = _normal_midpoints(pts, index, knn)
+        rows = [bend_rows, cent_rows, anchor_rows]
+        rhs = [np.zeros(2 * d2.shape[0]), cent_rhs, anchor_rhs]
+        if np.any(valid):
+            normals = _normals(pts)
+            nv = normals[valid]
+            av = basis[valid]
+            m_data = np.hstack([nv[:, 0:1] * av, nv[:, 1:2] * av])
+            b_data = np.einsum("ij,ij->i", nv, targets[valid])
+            rows.append(m_data)
+            rhs.append(b_data)
+        mat = np.vstack(rows)
+        vec = np.concatenate(rhs)
+        sol, *_ = np.linalg.lstsq(mat, vec, rcond=None)
+        new_ctrl = sol.reshape(2, n_ctrl).T
+
+        delta = new_ctrl - ctrl
+        step = np.hypot(delta[:, 0], delta[:, 1])
+        over = step > max_step
+        if np.any(over):
+            delta[over] *= (max_step / step[over])[:, None]
+        # Damp the move if it pushes samples out of the mask.
+        for _halve in range(4):
+            cand = ctrl + delta
+            cand_pts = basis @ cand
+            if contains is None or np.all(contains(cand_pts)):
+                ctrl = cand
+                break
+            delta = 0.5 * delta
+        else:
+            ctrl = ctrl + delta
+        movement = float(np.mean(np.hypot(delta[:, 0], delta[:, 1])))
+
+        # Re-parameterize: arc-length-uniform sample positions.
+        dense_u = np.linspace(0.0, 1.0, 4 * n_sample)
+        dense = _spline_design(dense_u, n_ctrl) @ ctrl
+        seg = np.hypot(np.diff(dense[:, 0]), np.diff(dense[:, 1]))
+        s = np.concatenate([[0.0], np.cumsum(seg)])
+        if s[-1] > 0:
+            u = np.interp(np.linspace(0.0, s[-1], n_sample), s, dense_u)
+            basis = _spline_design(u, n_ctrl)
+            cent_rows = np.sqrt(mu) * block_diag2(basis)
+        if movement <= tol:
+            converged = True
+            break
+
+    pts = basis @ ctrl
+    targets, valid = _normal_midpoints(pts, index, knn)
+    residual = _residual_against_targets(pts, targets, valid)
+    return {
+        "points": pts,
+        "ctrl": ctrl,
+        "converged": converged,
+        "n_iter": n_iter,
+        "residual": residual,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — septum-aware pole handling
+# ---------------------------------------------------------------------------
+
+
+def _end_tangent(points: np.ndarray, end: int, window_frac: float) -> np.ndarray:
+    """Outward unit tangent at one end, fit on the distal ``window_frac``
+    of arc samples only (junction-proximal asymmetry is ignored)."""
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    w = max(3, int(round(float(window_frac) * n)))
+    w = min(w, n)
+    seg = pts[:w] if end == 0 else pts[-w:]
+    center = seg.mean(axis=0)
+    cov = np.cov((seg - center).T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    v = eigvecs[:, int(np.argmax(eigvals))]
+    outward = seg[0] - seg[-1] if end == 0 else seg[-1] - seg[0]
+    if float(np.dot(v, outward)) < 0:
+        v = -v
+    norm = float(np.hypot(v[0], v[1]))
+    return v / norm if norm > 0 else np.array([1.0, 0.0])
+
+
+def _end_width_dip(width: np.ndarray, end: int, dip_frac: float) -> bool:
+    """True when the width profile has a genuine constriction in an end
+    third (septum / chain-junction crevice; detect_septum-style logic).
+
+    The outermost two samples (the pole-cap taper, where width
+    monotonically narrows toward the tip) are excluded: a true septum dip
+    is an *interior* minimum of the end third, significantly below both
+    the middle-body median and the end-face width.
+    """
+    w = np.asarray(width, dtype=np.float64)
+    n = len(w)
+    if n < 8:
+        return False
+    third = max(1, n // 3)
+    middle = w[third:-third] if n > 2 * third else w
+    med = float(np.median(middle))
+    if med <= 0:
+        return False
+    region = w[2:third] if end == 0 else w[n - third : n - 2]
+    if region.size < 2:
+        return False
+    end_face = float(w[2] if end == 0 else w[n - 3])
+    dip = float(np.min(region))
+    return dip < (1.0 - float(dip_frac)) * med and dip < 0.9 * end_face
+
+
+def _extend_poles(
+    midline: np.ndarray,
+    tangents: tuple[np.ndarray, np.ndarray],
+    index: _OutlineIndex,
+    knn: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extend both midline ends along the given outward end tangents until
+    outline intersection (MicrobeJ/Oufti-style pole extension); falls back
+    to the midline endpoints when no local intersection is found."""
+    mid = np.asarray(midline, dtype=np.float64)
+    ends = (mid[0], mid[-1])
+    origins: list[np.ndarray] = []
+    directions: list[np.ndarray] = []
+    slots: list[int] = []
+    for slot, (end, direction) in enumerate(zip(ends, tangents)):
+        norm = float(np.hypot(direction[0], direction[1]))
+        if norm <= 0:
+            continue
+        origins.append(end)
+        directions.append(direction / norm)
+        slots.append(slot)
+    poles = [end.copy() for end in ends]
+    if origins:
+        _, hits = index.ray_intersections(
+            np.asarray(origins), np.asarray(directions), knn
+        )
+        for slot, hit in zip(slots, hits):
+            if np.isfinite(hit).all():
+                poles[slot] = hit
+    return poles[0], poles[1]
+
+
+# ---------------------------------------------------------------------------
+# per-label results assembly
+# ---------------------------------------------------------------------------
+
+
+def _width_cv(width_profile: np.ndarray) -> float:
+    """Coefficient of variation of the width profile over INTERIOR samples.
+
+    The first/last samples sit on the poles (outline points), where the
+    normal-ray width is near zero by construction; including them would
+    make the CV measure cap taper rather than body-width variability.
+    """
+    w = np.asarray(width_profile, dtype=np.float64)
+    if w.size > 2:
+        w = w[1:-1]
+    mean = float(np.mean(w)) if w.size else 0.0
+    return float(np.std(w) / mean) if mean > 0 else float("nan")
+
+
+def _empty_result(params: Mapping[str, Any], quality: str) -> dict[str, Any]:
+    """Empty-midline result for failed/pathological cells (never garbage)."""
+    nan2 = np.array([np.nan, np.nan])
+    return {
+        "midline": [np.zeros((0, 2), dtype=np.float64)],
+        "width_profile": np.zeros(int(params["n_points"]), dtype=np.float64),
+        "pole1": nan2,
+        "pole2": nan2,
+        "length_um": 0.0,
+        "sinuosity": 1.0,
+        "branched": 0.0,
+        "midline_quality": quality,
+        "n_iter": 0,
+        "final_residual": float("nan"),
+        "max_curvature": float("nan"),
+        "width_cv": float("nan"),
+    }
+
+
+def _assemble_result(
+    curve_xy: np.ndarray,
+    index: _OutlineIndex,
+    params: Mapping[str, Any],
+    pixel_microns: float,
+    quality: str,
+    n_iter: int,
+    final_residual: float,
+    side_branches: list[np.ndarray] | None = None,
+    geo_xy: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Septum-aware poles + final resample + width profile + diagnostics."""
+    knn = int(params["knn"])
+    n_points = int(params["n_points"])
+    curve = _resample_arclength(np.asarray(curve_xy, dtype=np.float64), n_points)
+
+    # Septum-aware tangent choice: width dip in an end third -> trust the
+    # geodesic centerline's end direction over the data-term tangent.
+    width_pre = _width_profile(curve, index, knn, pixel_microns)
+    tangents = []
+    for end in (0, 1):
+        src = curve
+        if geo_xy is not None and _end_width_dip(
+            width_pre, end, float(params["septum_dip_frac"])
+        ):
+            src = _resample_arclength(np.asarray(geo_xy, dtype=np.float64), n_points)
+        tangents.append(_end_tangent(src, end, float(params["end_window_frac"])))
+    pole1, pole2 = _extend_poles(curve, (tangents[0], tangents[1]), index, knn)
+
+    extended = np.vstack([pole1[None, :], curve, pole2[None, :]])
+    main_resampled = _resample_arclength(extended, n_points)
+    width_profile = _width_profile(main_resampled, index, knn, pixel_microns)
+    length_px = _arc_length(main_resampled)
+    pole_dist = float(np.hypot(*(pole2 - pole1)))
+    sinuosity = length_px / pole_dist if pole_dist > 0 else 1.0
+
+    _, max_curv = _curvature_stats(main_resampled)
+    width_cv = _width_cv(width_profile)
+
+    branches = [main_resampled, *(side_branches or [])]
+    return {
+        "midline": branches,
+        "width_profile": width_profile,
+        "pole1": pole1,
+        "pole2": pole2,
+        "length_um": length_px * float(pixel_microns),
+        "sinuosity": float(sinuosity),
+        "branched": 1.0 if side_branches else 0.0,
+        "midline_quality": quality,
+        "n_iter": int(n_iter),
+        "final_residual": float(final_residual),
+        "max_curvature": float(max_curv),
+        "width_cv": float(width_cv),
+    }
+
+
+def _axis_segment_result(
+    crop: np.ndarray,
     offset_xy: np.ndarray,
+    centroid_xy: np.ndarray,
+    axis_xy: np.ndarray,
     index: _OutlineIndex,
     params: Mapping[str, Any],
     pixel_microns: float,
 ) -> dict[str, Any]:
-    """Straight-axis midline from mask PCA (used when the skeleton graph
-    is degenerate, e.g. very small or pathological masks)."""
-    coords = np.asarray(mask_coords_rc, dtype=np.float64)
-    centroid_rc = coords.mean(axis=0)
-    cov = np.cov((coords - centroid_rc).T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    axis_rc = eigvecs[:, int(np.argmax(eigvals))]
-    centroid_xy = np.array([centroid_rc[1], centroid_rc[0]]) + offset_xy
-    axis_xy = np.array([axis_rc[1], axis_rc[0]])
+    """Degenerate (near-round) cell: major-axis segment clipped to the
+    outline, NO geodesic/spline refinement."""
     knn = int(params["knn"])
-    _, p1 = index.ray_intersections(centroid_xy[None, :], axis_xy[None, :], knn)
-    _, p2 = index.ray_intersections(centroid_xy[None, :], -axis_xy[None, :], knn)
-    pole1 = p1[0] if np.isfinite(p1[0]).all() else centroid_xy + axis_xy
-    pole2 = p2[0] if np.isfinite(p2[0]).all() else centroid_xy - axis_xy
+    centroid_global = centroid_xy + offset_xy
+    _, p1 = index.ray_intersections(centroid_global[None, :], axis_xy[None, :], knn)
+    _, p2 = index.ray_intersections(centroid_global[None, :], -axis_xy[None, :], knn)
+    pole1 = p1[0] if np.isfinite(p1[0]).all() else centroid_global + axis_xy
+    pole2 = p2[0] if np.isfinite(p2[0]).all() else centroid_global - axis_xy
     main = _resample_arclength(np.vstack([pole1, pole2]), int(params["n_points"]))
     width = _width_profile(main, index, knn, pixel_microns)
+    length_px = _arc_length(main)
     return {
         "midline": [main],
         "width_profile": width,
         "pole1": pole1,
         "pole2": pole2,
-        "length_um": _arc_length(main) * float(pixel_microns),
+        "length_um": length_px * float(pixel_microns),
         "sinuosity": 1.0,
         "branched": 0.0,
+        "midline_quality": "degenerate",
+        "n_iter": 0,
+        "final_residual": 0.0,
+        "max_curvature": 0.0,
+        "width_cv": _width_cv(width),
     }
+
+
+def _skeleton_side_branches(
+    crop: np.ndarray,
+    offset_xy: np.ndarray,
+    params: Mapping[str, Any],
+    pixel_microns: float,
+) -> list[np.ndarray]:
+    """Skeleton-based side-branch detection for branch REPORTING only.
+
+    The main midline never comes from the skeleton; the skeleton graph is
+    traced solely to enumerate residual arms of branched masks. Any
+    failure yields no side branches.
+    """
+    min_branch_px = max(
+        2.0, float(params["min_branch_length_um"]) / float(pixel_microns)
+    )
+    try:
+        skel = morphology.skeletonize(crop, method=str(params["method"]))
+        if int(skel.sum()) < 3:
+            return []
+        branches, node_centers = _trace_branches(skel)
+        if not branches:
+            return []
+        branches = _prune_branches(branches, min_branch_px)
+        _, used = _main_branch_path(branches, node_centers)
+        side: list[np.ndarray] = []
+        for i, b in enumerate(branches):
+            if i in used:
+                continue
+            path_xy = np.column_stack([b["path"][:, 1], b["path"][:, 0]]) + offset_xy
+            side.append(_smooth_open(path_xy, float(params["smooth"])))
+        return side
+    except Exception as exc:  # branch reporting must never fail the cell
+        logger.debug("skeleton side-branch detection failed (%s)", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -776,112 +1309,108 @@ def _midline_single(
     params: Mapping[str, Any],
     pixel_microns: float,
 ) -> dict[str, Any] | None:
-    """Full midline pipeline for one cropped instance mask (global coords out).
-
-    Parameters
-    ----------
-    crop : numpy.ndarray of bool
-        Padded bounding-box crop of the instance (same ``pad`` margin as
-        the historical full-frame implementation).
-    offset_xy : numpy.ndarray
-        ``(x0, y0)`` crop origin in global image coordinates.
-    outline : numpy.ndarray
-        ``(N, 2)`` closed outline in global ``(x, y)`` coordinates.
-    params : mapping
-        Resolved parameter dict (see :func:`extract_midlines`).
-    pixel_microns : float
-        Physical pixel size in microns.
-    """
+    """Full pole-first midline pipeline for one cropped instance mask
+    (global coords out). See the module docstring for the algorithm."""
     ys, xs = np.nonzero(crop)
     if ys.size < 4:
         return None
-    # Historical note: the PCA fallback below receives *full-frame* pixel
-    # coordinates (reconstructed from the crop) exactly as the pre-find_objects
-    # implementation did. That version added ``offset_xy`` to an already
-    # global centroid, so the fallback centroid is offset by the crop origin
-    # (a latent double-offset quirk, unreachable in the acceptance tests
-    # because those shapes always take the skeleton path). The behaviour is
-    # preserved verbatim to keep numerics identical; fix deliberately in a
-    # future phase if desired.
-    full_rc = np.column_stack([ys + offset_xy[1], xs + offset_xy[0]])
 
     index = _OutlineIndex(np.asarray(outline, dtype=np.float64))
     knn = int(params["knn"])
-    min_branch_px = max(
-        2.0, float(params["min_branch_length_um"]) / float(pixel_microns)
-    )
 
     try:
-        skel = morphology.skeletonize(crop, method=str(params["method"]))
-    except (ValueError, TypeError) as exc:
-        logger.debug("skeletonize failed (%s); PCA fallback", exc)
-        return _pca_fallback(full_rc, offset_xy, index, params, pixel_microns)
+        # Pathological topology (holes, e.g. rings/tori): cells never have
+        # holes — flag as failed rather than emitting garbage geometry.
+        filled = ndimage.binary_fill_holes(crop)
+        hole_px = int(filled.sum()) - int(crop.sum())
+        if hole_px > max(4.0, float(params["hole_area_frac"]) * float(crop.sum())):
+            return _empty_result(params, "failed")
 
-    if int(skel.sum()) < 3:
-        return _pca_fallback(full_rc, offset_xy, index, params, pixel_microns)
+        centroid_xy, axis_xy, aspect_ratio = _mask_major_axis(crop)
 
-    branches, node_centers = _trace_branches(skel)
-    if not branches:
-        return _pca_fallback(full_rc, offset_xy, index, params, pixel_microns)
-    branches = _prune_branches(branches, min_branch_px)
-    main_rc, used = _main_branch_path(branches, node_centers)
+        # Degenerate near-round cells: major-axis segment, no refinement.
+        if aspect_ratio < float(params["degenerate_ar"]):
+            return _axis_segment_result(
+                crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns
+            )
 
-    # (row, col) crop -> (x, y) global.
-    main_xy = np.column_stack([main_rc[:, 1], main_rc[:, 0]]) + offset_xy
-    n_refine = max(int(params["n_points"]), int(round(_arc_length(main_xy))))
-    main_xy = _smooth_open(main_xy, float(params["smooth"]), n=n_refine)
+        outline_crop = np.asarray(outline, dtype=np.float64) - offset_xy
 
-    def _in_mask(points: np.ndarray) -> np.ndarray:
-        """True for points whose rounded pixel lies inside the crop mask."""
-        cols = np.round(points[:, 0] - offset_xy[0]).astype(int)
-        rows = np.round(points[:, 1] - offset_xy[1]).astype(int)
-        ok = (
-            (rows >= 0)
-            & (rows < crop.shape[0])
-            & (cols >= 0)
-            & (cols < crop.shape[1])
+        # Step 1 — pole-first initialization.
+        pole1_xy, pole2_xy = _find_pole_pair(
+            outline_crop,
+            axis_xy,
+            int(params["pole_max_candidates"]),
+            float(params["pole_axis_tol_deg"]),
         )
-        out = np.zeros(len(points), dtype=bool)
-        out[ok] = crop[rows[ok], cols[ok]]
-        return out
 
-    main_xy, _ = _refine_midline(
-        main_xy,
-        index,
-        knn,
-        float(params["smooth"]),
-        int(params["refine_iterations"]),
-        float(params["refine_tolerance"]),
-        int(params["refine_anchor"]),
-        float(params["refine_max_step"]),
-        _in_mask,
-    )
+        # Step 2 — distance-transform geodesic centerline.
+        geo_crop = _geodesic_centerline(
+            crop, pole1_xy, pole2_xy, float(params["edt_eps"])
+        )
+        geo_xy = geo_crop + offset_xy
 
-    pole1, pole2 = _extend_poles(main_xy, index, knn, int(params["pole_fit_points"]))
-    extended = np.vstack([pole1[None, :], main_xy, pole2[None, :]])
-    main_resampled = _resample_arclength(extended, int(params["n_points"]))
+        def _in_mask(points: np.ndarray) -> np.ndarray:
+            """True for points whose rounded pixel lies inside the crop."""
+            cols = np.round(points[:, 0] - offset_xy[0]).astype(int)
+            rows = np.round(points[:, 1] - offset_xy[1]).astype(int)
+            ok = (
+                (rows >= 0)
+                & (rows < crop.shape[0])
+                & (cols >= 0)
+                & (cols < crop.shape[1])
+            )
+            out = np.zeros(len(points), dtype=bool)
+            out[ok] = crop[rows[ok], cols[ok]]
+            return out
 
-    width_profile = _width_profile(main_resampled, index, knn, pixel_microns)
-    length_px = _arc_length(main_resampled)
-    pole_dist = float(np.hypot(*(pole2 - pole1)))
-    sinuosity = length_px / pole_dist if pole_dist > 0 else 1.0
+        # Light smoothing of the geodesic path; escaped samples (smoothing
+        # may cut corners) are snapped back onto the raw path.
+        n_sample = max(int(params["n_points"]), int(round(_arc_length(geo_xy))), 8)
+        geo_raw = _resample_arclength(geo_xy, n_sample)
+        geo_smooth = _smooth_open(geo_xy, float(params["smooth"]), n=n_sample)
+        escaped = ~_in_mask(geo_smooth)
+        if np.any(escaped):
+            geo_smooth[escaped] = geo_raw[escaped]
 
-    side_branches: list[np.ndarray] = []
-    for i, b in enumerate(branches):
-        if i in used:
-            continue
-        path_xy = np.column_stack([b["path"][:, 1], b["path"][:, 0]]) + offset_xy
-        side_branches.append(_smooth_open(path_xy, float(params["smooth"])))
+        # Step 3 — low-DOF regularized spline fit.
+        fit = _fit_lowdof_spline(geo_smooth, index, knn, params, _in_mask)
 
-    return {
-        "midline": [main_resampled, *side_branches],
-        "width_profile": width_profile,
-        "pole1": pole1,
-        "pole2": pole2,
-        "length_um": length_px * float(pixel_microns),
-        "sinuosity": float(sinuosity),
-        "branched": 1.0 if side_branches else 0.0,
-    }
+        # Step 4 — convergence cascade. Keep the spline only when it
+        # improves on the geodesic centerline's midpoint residual.
+        geo_targets, geo_valid = _normal_midpoints(geo_smooth, index, knn)
+        geo_residual = _residual_against_targets(geo_smooth, geo_targets, geo_valid)
+        if np.isfinite(fit["residual"]) and (
+            not np.isfinite(geo_residual) or fit["residual"] <= geo_residual
+        ):
+            curve = fit["points"]
+            quality = "refined"
+            final_residual = fit["residual"]
+        else:
+            curve = geo_smooth
+            quality = "geodesic"
+            final_residual = geo_residual
+
+        # Branched masks: skeleton-based side-branch REPORTING only.
+        side_branches = _skeleton_side_branches(
+            crop, offset_xy, params, pixel_microns
+        )
+
+        # Steps 5+6 — septum-aware poles, width profile, diagnostics.
+        return _assemble_result(
+            curve,
+            index,
+            params,
+            pixel_microns,
+            quality,
+            fit["n_iter"] if quality == "refined" else 0,
+            final_residual,
+            side_branches,
+            geo_smooth,
+        )
+    except Exception as exc:
+        logger.debug("midline pipeline failed (%s); flagging cell as failed", exc)
+        return _empty_result(params, "failed")
 
 
 def extract_midlines(
@@ -901,15 +1430,18 @@ def extract_midlines(
         (e.g. from :func:`momia3.ops.outline.extract_outlines`). When
         None, outlines are computed internally with default parameters.
     params : mapping, optional
-        ``method`` (``'zhang'`` | ``'lee'``), ``min_branch_length_um``
-        (spur pruning threshold), ``n_points`` (resampled main-branch
-        size), ``smooth`` (spline smoothing), ``refine_iterations`` /
-        ``refine_tolerance`` (perpendicular refinement), ``refine_anchor``
-        (end samples kept fixed during refinement, momia2
-        ``anchor_length``), ``refine_max_step`` (per-iteration move cap,
-        px), ``knn`` (outline
-        segment candidates per query), ``pole_fit_points`` (end-tangent
-        fit window), ``pad`` (bbox padding).
+        ``method`` (``'zhang'`` | ``'lee'``) and ``min_branch_length_um``
+        steer the skeleton-based side-branch reporting only; ``n_points``
+        (resampled main-branch size), ``smooth`` (spline smoothing),
+        ``knn`` (outline segment candidates per query), ``pad`` (bbox
+        padding), ``pole_max_candidates``/``pole_axis_tol_deg`` (pole
+        search), ``edt_eps``/``hole_area_frac`` (geodesic centerline),
+        ``ctrl_spacing_px``/``ctrl_min``/``ctrl_max`` (spline DOF),
+        ``lambda_smooth`` (bending-energy weight), ``mu_central``
+        (geodesic centrality weight), ``spline_iterations``/
+        ``spline_tolerance``/``spline_max_step`` (fit loop),
+        ``end_window_frac``/``septum_dip_frac`` (pole handling),
+        ``degenerate_ar`` (near-round threshold).
     pixel_microns : float
         Physical pixel size in microns.
 
@@ -919,9 +1451,12 @@ def extract_midlines(
         Per label: ``midline`` (list of ``(M, 2)`` branches in global
         ``(x, y)``; branch 0 is the resampled main branch incl. poles),
         ``width_profile`` (``(n_points,)`` microns), ``pole1``/``pole2``
-        (``(x, y)``), and scalars ``length_um``, ``width_median_um``,
+        (``(x, y)``), scalars ``length_um``, ``width_median_um``,
         ``width_std_um``, ``width_max_um``, ``width_q1_um``,
-        ``width_q3_um``, ``sinuosity``, ``branched``.
+        ``width_q3_um``, ``sinuosity``, ``branched``, the quality flag
+        ``midline_quality`` (``"refined"`` | ``"geodesic"`` |
+        ``"degenerate"`` | ``"failed"``) and diagnostics ``n_iter``,
+        ``final_residual``, ``max_curvature``, ``width_cv``.
     """
     p: dict[str, Any] = {**_DEFAULT_PARAMS, **dict(params or {})}
     labels = np.asarray(labels_2d)
@@ -1005,7 +1540,7 @@ def fill_cells_midline(
     cells_table: pa.Table | pl.DataFrame,
     results: Mapping[int, Mapping[str, Any]],
 ) -> pa.Table | pl.DataFrame:
-    """Write midline geometry and scalars into a cells table.
+    """Write midline geometry, scalars and diagnostics into a cells table.
 
     Parameters
     ----------
@@ -1022,7 +1557,11 @@ def fill_cells_midline(
         Updated table in the same container type as the input, with
         ``midline``, ``width_profile``, ``pole1_x/y``, ``pole2_x/y``,
         ``length_um``, ``width_*_um``, ``sinuosity`` and ``branched``
-        columns written (rows without a result keep nulls).
+        columns written, plus the ``midline_quality`` (utf8) flag and
+        ``midline_n_iter`` (i32), ``midline_residual`` (f32),
+        ``midline_max_curv`` (f32) and ``width_cv`` (f32) diagnostics
+        (rows without a result keep nulls). Extra columns beyond the
+        canonical schema pass :func:`momia3.schema.validate_cells`.
     """
     table = _to_pa(cells_table)
     by_key = any(int(k) > _keys.LABEL_MAX for k in results)
@@ -1031,6 +1570,8 @@ def fill_cells_midline(
     midline_vals: list[list[dict[str, list[float]]] | None] = []
     width_vals: list[list[float] | None] = []
     scalar_vals: dict[str, list[float | None]] = {c: [] for c in MIDLINE_SCALAR_COLUMNS}
+    quality_vals: list[str | None] = []
+    diag_vals: dict[str, list[Any]] = {c: [] for c in MIDLINE_DIAG_COLUMNS}
     for rid in row_ids:
         res = results.get(rid)
         if res is None:
@@ -1038,6 +1579,9 @@ def fill_cells_midline(
             width_vals.append(None)
             for c in MIDLINE_SCALAR_COLUMNS:
                 scalar_vals[c].append(None)
+            quality_vals.append(None)
+            for c in MIDLINE_DIAG_COLUMNS:
+                diag_vals[c].append(None)
             continue
         branches = [
             {
@@ -1051,6 +1595,11 @@ def fill_cells_midline(
         for c in MIDLINE_SCALAR_COLUMNS:
             value = res.get(c)
             scalar_vals[c].append(None if value is None else float(value))
+        quality = res.get(MIDLINE_QUALITY_COLUMN)
+        quality_vals.append(None if quality is None else str(quality))
+        for column, key in MIDLINE_DIAG_COLUMNS.items():
+            value = res.get(key)
+            diag_vals[column].append(None if value is None else value)
 
     table = _upsert_column(table, "midline", pa.array(midline_vals, type=_schema.MIDLINE_T))
     table = _upsert_column(
@@ -1058,4 +1607,15 @@ def fill_cells_midline(
     )
     for c in MIDLINE_SCALAR_COLUMNS:
         table = _upsert_column(table, c, pa.array(scalar_vals[c], type=pa.float32()))
+    table = _upsert_column(
+        table, MIDLINE_QUALITY_COLUMN, pa.array(quality_vals, type=pa.string())
+    )
+    _diag_types = {"midline_n_iter": pa.int32()}
+    for c in MIDLINE_DIAG_COLUMNS:
+        arrow_type = _diag_types.get(c, pa.float32())
+        vals = [
+            None if v is None else (int(v) if arrow_type == pa.int32() else float(v))
+            for v in diag_vals[c]
+        ]
+        table = _upsert_column(table, c, pa.array(vals, type=arrow_type))
     return _back(table, cells_table)
