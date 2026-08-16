@@ -310,6 +310,61 @@ def run_threshold(
 
 
 # ---------------------------------------------------------------------------
+# chain step: segment.declump_store (shard = frame)
+# ---------------------------------------------------------------------------
+
+
+def _declump_frame_shard(args: tuple[str, int, int, dict[str, Any]]) -> int:
+    """Split merged blobs of one frame's labels and write back in place."""
+    store_path, fov_id, t, params_dict = args
+    store = ExperimentStore.open(store_path, mode="a")
+    labels = store.get_labels_frame(fov_id, t)
+    if labels.max() == 0:
+        return 0
+    new_labels = segment_ops.declump(
+        labels > 0, params=segment_ops.DeclumpParams(**params_dict)
+    )
+    store.set_labels_frame(fov_id, t, new_labels.astype(np.uint32))
+    return int(new_labels.max())
+
+
+@register(
+    "segment.declump_store",
+    params_model=segment_ops.DeclumpParams,
+    inputs={"experiment": "store"},
+    outputs={"experiment": "store"},
+    shard="frame",
+    description=(
+        "Split merged foreground blobs of every (fov, frame) shard of an "
+        "experiment store (EDT + peak_local_max seeds + marker watershed); "
+        "labels are rewritten in place."
+    ),
+    verify=("fov_*/labels",),
+    func=segment_ops.declump,
+)
+def run_declump_store(
+    inputs: dict[str, Any], params: segment_ops.DeclumpParams, ctx: StepContext
+) -> dict[str, Any]:
+    """Runner of ``segment.declump_store`` (see registry description)."""
+    store_path = Path(inputs["experiment"])
+    store = ExperimentStore.open(store_path, mode="r")
+    items: list[tuple[str, int, int, dict[str, Any]]] = []
+    for fov_id in store.fov_ids:
+        n_t = int(store.labels(fov_id).shape[0])
+        items += [
+            (str(store_path), fov_id, t, params.model_dump(mode="json"))
+            for t in range(n_t)
+        ]
+    counts = ctx.map_shards(_declump_frame_shard, items)
+    logger.info(
+        "segment.declump_store: %d shard(s), max %d instance(s)/frame",
+        len(counts),
+        max(counts, default=0),
+    )
+    return {"experiment": store_path}
+
+
+# ---------------------------------------------------------------------------
 # chain step: measure.cells (shard = frame)
 # ---------------------------------------------------------------------------
 

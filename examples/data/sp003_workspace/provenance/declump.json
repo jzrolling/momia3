@@ -1,0 +1,24 @@
+{
+  "cache_key": "808fc44b28a9a1b99a9fe117e82873294e96e087e19c873545ab2476cafc1b9d",
+  "duration_s": 0.0,
+  "git_hash": "0bdfa52d7b2a56d9a7d7dfa39986cfc2f268f681",
+  "op": "segment.declump_store",
+  "params": {
+    "compactness": 0.0,
+    "exclude_border": false,
+    "footprint_radius": null,
+    "h_maxima": 1.0,
+    "min_cell_size": 10,
+    "min_distance": 5,
+    "smooth_sigma": 1.0,
+    "threshold_abs": 2.0,
+    "watershed_line": true
+  },
+  "status": "cached",
+  "step_id": "declump",
+  "timestamp": "2026-08-16T14:39:08.292038+00:00",
+  "upstream": [
+    "9c8b1705fdc8875ccf7d11eb74ea031607ea4f4cd8e0a8d17dac4d3e5a635f9d"
+  ],
+  "version": "0.1.0"
+}

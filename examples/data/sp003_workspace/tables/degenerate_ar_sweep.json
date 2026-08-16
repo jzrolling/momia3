@@ -1,0 +1,23 @@
+{
+  "1.2": {
+    "refined": 310,
+    "geodesic": 18,
+    "degenerate": 45,
+    "failed": 1,
+    "refined_max_curv_median": 0.05828858503687685
+  },
+  "1.3": {
+    "refined": 257,
+    "geodesic": 16,
+    "degenerate": 100,
+    "failed": 1,
+    "refined_max_curv_median": 0.0366667350715468
+  },
+  "1.4": {
+    "refined": 213,
+    "geodesic": 14,
+    "degenerate": 146,
+    "failed": 1,
+    "refined_max_curv_median": 0.02970036515459844
+  }
+}

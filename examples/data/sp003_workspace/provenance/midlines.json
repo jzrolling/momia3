@@ -1,0 +1,28 @@
+{
+  "cache_key": "26237b52e91aa9071f115ffb67b7cbdca61e32ed97a211fe9e875e59cd3eecbe",
+  "duration_s": 0.0,
+  "git_hash": "0bdfa52d7b2a56d9a7d7dfa39986cfc2f268f681",
+  "op": "midline.extract",
+  "params": {
+    "knn": 24,
+    "method": "zhang",
+    "min_branch_length_um": 0.2,
+    "n_points": 32,
+    "pad": 2,
+    "pixel_microns": null,
+    "pole_fit_points": 5,
+    "refine_anchor": 3,
+    "refine_iterations": 10,
+    "refine_max_step": 1.5,
+    "refine_tolerance": 0.1,
+    "smooth": 1.0
+  },
+  "status": "cached",
+  "step_id": "midlines",
+  "timestamp": "2026-08-16T14:39:08.476596+00:00",
+  "upstream": [
+    "4f924c995d050a62df7c712d5743c3b10dfc92356a82f20beaa874a04de6f12d",
+    "808fc44b28a9a1b99a9fe117e82873294e96e087e19c873545ab2476cafc1b9d"
+  ],
+  "version": "0.1.0"
+}

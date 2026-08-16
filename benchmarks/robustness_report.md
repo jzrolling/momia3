@@ -96,3 +96,17 @@
 | **total** | 0.949 | 100% |
 
 Bottleneck: **cells** (36% of wall time) — the per-cell feature step (contour/midline-ready measurements); consistent with the midline benchmark's finding that per-cell ops dominate momia3's cost.
+
+---
+
+## Real-data end-to-end validation — SP_003 (S. pneumoniae, phase + 2 FL, 2048², 0.0497 µm/px)
+
+Pipeline: `examples/pipeline_sp003.json` (import_tiff → threshold → declump_store → cells → outlines → midlines → efd_shape_space), run via CLI with `--workers 4`.
+
+- **End-to-end wall time: 5.9 s** (7 steps; second run 0 computed / 7 cached — content-addressed cache verified on real data).
+- **374 cells**, all with outlines, midlines, poles, width profiles, 3-channel intensity stats; length 1.40 µm / width 0.81 µm medians (biologically plausible).
+- New pole-first midline on real data: 213 refined / 14 geodesic / 146 degenerate / 1 failed (hole-bearing mask, correctly refused); refined-cell median max-curvature 0.030 rad (old skeleton-first algorithm: mean total curvature 3.6 rad).
+- `degenerate_ar` sweep on real data (`tables/degenerate_ar_sweep.json`): 1.2 → 310 refined (83%), curvature still smooth (0.058); 1.4 → 213 refined. **Recommended default for cocci: 1.2–1.3.**
+- Frame-level characterize ops verified on real data: demographic projections (373/374 cells), orientation coherence 0.757 (chained field, plausible), EFD shape space continuum with length gradient.
+- **Methodological finding**: declump's 1-px watershed separator lines make adjacent-cell shared boundaries zero by construction — `contact_metrics` must be computed on 1-px-dilated labels (then 98.1% of cells show contact, median 0.26, matching the densely chained field). A `contact_dilation` parameter should be added to the op.
+- QC figures: `examples/data/sp003_workspace/sp003_characterize_report.png`, `data/sp003_qc_overlay.png`, `data/sp003_midline_zoom.png`.

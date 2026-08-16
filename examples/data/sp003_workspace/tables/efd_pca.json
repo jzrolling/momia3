@@ -1,0 +1,10 @@
+{
+  "explained_variance_ratio": [
+    0.14411917373704372,
+    0.1300247552194756,
+    0.11920794005020204
+  ],
+  "n_harmonics": 10,
+  "n_components": 3,
+  "n_cells_used": 374
+}

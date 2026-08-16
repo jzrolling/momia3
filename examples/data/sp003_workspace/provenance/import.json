@@ -1,0 +1,23 @@
+{
+  "cache_key": "cff78d0394daae42ded33b14084f78b46c42235c3d2654b7e505bf3b9201e471",
+  "duration_s": 0.0,
+  "git_hash": "0bdfa52d7b2a56d9a7d7dfa39986cfc2f268f681",
+  "op": "io.import_tiff",
+  "params": {
+    "axes": null,
+    "channels": [
+      "phase",
+      "ch1",
+      "ch2"
+    ],
+    "fov_id": 0,
+    "path": "data/SP_003.tif",
+    "pixel_microns": 0.04968,
+    "time_interval_s": null
+  },
+  "status": "cached",
+  "step_id": "import",
+  "timestamp": "2026-08-16T14:39:08.270046+00:00",
+  "upstream": [],
+  "version": "0.1.0"
+}

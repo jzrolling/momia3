@@ -1,0 +1,18 @@
+{
+  "cache_key": "68698b684c2881833b695c87f7f4cf7e69db80c4456096175bc1073d169bce11",
+  "duration_s": 0.0,
+  "git_hash": "0bdfa52d7b2a56d9a7d7dfa39986cfc2f268f681",
+  "op": "measure.cells",
+  "params": {
+    "channel": "phase",
+    "include_intensity": true,
+    "pixel_microns": null
+  },
+  "status": "cached",
+  "step_id": "cells",
+  "timestamp": "2026-08-16T14:39:08.449761+00:00",
+  "upstream": [
+    "808fc44b28a9a1b99a9fe117e82873294e96e087e19c873545ab2476cafc1b9d"
+  ],
+  "version": "0.1.0"
+}

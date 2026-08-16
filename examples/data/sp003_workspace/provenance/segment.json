@@ -1,0 +1,26 @@
+{
+  "cache_key": "9c8b1705fdc8875ccf7d11eb74ea031607ea4f4cd8e0a8d17dac4d3e5a635f9d",
+  "duration_s": 0.0,
+  "git_hash": "0bdfa52d7b2a56d9a7d7dfa39986cfc2f268f681",
+  "op": "segment.threshold",
+  "params": {
+    "block_size": 15,
+    "channel": "phase",
+    "dark_foreground": true,
+    "dilation": true,
+    "local_offset": 0.0,
+    "method": "composite",
+    "min_size": 50,
+    "opening": false,
+    "overlap_threshold": 0.5,
+    "sauvola_k": 0.05,
+    "sauvola_window": 9
+  },
+  "status": "cached",
+  "step_id": "segment",
+  "timestamp": "2026-08-16T14:39:08.282673+00:00",
+  "upstream": [
+    "cff78d0394daae42ded33b14084f78b46c42235c3d2654b7e505bf3b9201e471"
+  ],
+  "version": "0.1.0"
+}

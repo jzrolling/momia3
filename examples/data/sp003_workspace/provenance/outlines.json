@@ -1,0 +1,28 @@
+{
+  "cache_key": "4f924c995d050a62df7c712d5743c3b10dfc92356a82f20beaa874a04de6f12d",
+  "duration_s": 0.0,
+  "git_hash": "0bdfa52d7b2a56d9a7d7dfa39986cfc2f268f681",
+  "op": "outline.extract",
+  "params": {
+    "active_contour": false,
+    "alpha": 0.015,
+    "beta": 10.0,
+    "channel": null,
+    "gamma": 0.001,
+    "level": 0.5,
+    "n_points": 100,
+    "pad": 2,
+    "sigma": 1.0,
+    "simplify": false,
+    "smooth": 1.0,
+    "tolerance": 0.75
+  },
+  "status": "cached",
+  "step_id": "outlines",
+  "timestamp": "2026-08-16T14:39:08.463877+00:00",
+  "upstream": [
+    "68698b684c2881833b695c87f7f4cf7e69db80c4456096175bc1073d169bce11",
+    "808fc44b28a9a1b99a9fe117e82873294e96e087e19c873545ab2476cafc1b9d"
+  ],
+  "version": "0.1.0"
+}

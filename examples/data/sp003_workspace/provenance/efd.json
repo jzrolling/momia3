@@ -1,0 +1,17 @@
+{
+  "cache_key": "4387cde0ad0e0fb4132c03b9448622fa9aa7ac459fa94d980bfb250b6ce7915b",
+  "duration_s": 0.0,
+  "git_hash": "0bdfa52d7b2a56d9a7d7dfa39986cfc2f268f681",
+  "op": "characterize.efd_shape_space",
+  "params": {
+    "n_components": 3,
+    "n_harmonics": 10
+  },
+  "status": "cached",
+  "step_id": "efd",
+  "timestamp": "2026-08-16T14:39:08.489157+00:00",
+  "upstream": [
+    "26237b52e91aa9071f115ffb67b7cbdca61e32ed97a211fe9e875e59cd3eecbe"
+  ],
+  "version": "0.1.0"
+}
