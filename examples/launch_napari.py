@@ -12,6 +12,9 @@ def main() -> None:
     import napari
 
     viewer = napari.Viewer(title="momia3")
+    # Give the canvas a sane size before first paint: a degenerate (few-px)
+    # viewport during layout can fail FBO creation on macOS + PyQt6.
+    viewer.window.resize(1400, 900)
     for wname in ("momia3: Dataset", "momia3: Pipeline", "momia3: Results"):
         try:
             viewer.window.add_plugin_dock_widget("momia3", wname)

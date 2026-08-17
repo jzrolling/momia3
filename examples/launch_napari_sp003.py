@@ -22,6 +22,9 @@ def main() -> None:
     cells = pl.read_parquet(WS / "tables" / "cells.parquet")
 
     viewer = napari.Viewer(title="momia3 — SP_003 (S. pneumoniae)")
+    # Avoid a degenerate (few-px) viewport on first paint — that is what
+    # failed FBO creation on macOS + PyQt6 in the last crash log.
+    viewer.window.resize(1400, 900)
 
     # image channels (t axis present; slider at bottom)
     for ch in store.channels:
