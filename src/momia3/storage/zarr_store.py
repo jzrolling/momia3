@@ -28,7 +28,15 @@ logger = logging.getLogger(__name__)
 CHUNK_Y: int = 512
 CHUNK_X: int = 512
 
-__all__ = ["ExperimentStore", "CHUNK_Y", "CHUNK_X"]
+__all__ = ["ExperimentStore", "CHUNK_Y", "CHUNK_X", "CHANNEL_ROLES"]
+
+CHANNEL_ROLES: tuple[str, ...] = (
+    "brightfield",
+    "fluorescence",
+    "mask",
+    "label",
+    "other",
+)
 
 
 class ExperimentStore:
@@ -157,6 +165,38 @@ class ExperimentStore:
                 except ValueError:
                     logger.debug("ignoring non-fov member %r", name)
         return tuple(sorted(ids))
+
+    # ------------------------------------------------------------------
+    # channel roles (semantic typing for segmentation-source selection)
+    # ------------------------------------------------------------------
+    @property
+    def channel_roles(self) -> dict[str, str]:
+        """Mapping of channel name to semantic role.
+
+        Roles are one of :data:`CHANNEL_ROLES`; channels without an entry
+        are untyped. Stored in root attrs under ``channel_roles``.
+        """
+        return dict(self._root.attrs.get("channel_roles", {}))
+
+    def set_channel_role(self, channel: str, role: str | None) -> None:
+        """Assign (or clear, with ``None``) the semantic role of a channel."""
+        if channel not in self.channels:
+            raise KeyError(f"unknown channel {channel!r}")
+        roles = self.channel_roles
+        if role is None:
+            roles.pop(channel, None)
+        else:
+            if role not in CHANNEL_ROLES:
+                raise ValueError(
+                    f"invalid role {role!r}; expected one of {CHANNEL_ROLES}"
+                )
+            roles[channel] = role
+        self._root.attrs["channel_roles"] = roles
+
+    def channels_by_role(self, role: str) -> tuple[str, ...]:
+        """Channels tagged with ``role``, in registration order."""
+        roles = self.channel_roles
+        return tuple(c for c in self.channels if roles.get(c) == role)
 
     # ------------------------------------------------------------------
     # group / array access

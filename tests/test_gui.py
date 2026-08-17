@@ -396,3 +396,44 @@ def test_recompute_current_frame_after_labels_edit(viewer, synth_store) -> None:
 def store_frame_max(store_path: Path) -> int:
     store = ExperimentStore.open(store_path, mode="r")
     return int(np.asarray(store.get_labels_frame(0, 1)).max())
+
+
+def test_pipeline_preview_step_on_current_frame(viewer, synth_store) -> None:
+    """Preview button: sandbox run on current frame, source store untouched."""
+    dataset = DatasetWidget(viewer)
+    pipeline = PipelineWidget(viewer)
+    viewer.window.add_dock_widget(dataset, name="momia3: Dataset", area="right")
+    viewer.window.add_dock_widget(pipeline, name="momia3: Pipeline", area="right")
+
+    dataset.open_store(synth_store)
+    dataset.load_channel(0, "phase")
+    labels_before = np.asarray(
+        ExperimentStore.open(synth_store, mode="r").labels(0)
+    ).copy()
+
+    # profiling preview: outline.extract (implicit measure.cells on labels)
+    pipeline.select_op("outline.extract")
+    assert pipeline.add_step("ol") is not None
+    pipeline.step_list.setCurrentRow(0)
+    viewer.dims.set_current_step(0, 0)
+    assert pipeline.preview_selected_step()
+    assert "preview: outlines" in viewer.layers
+
+    # segmentation preview: segment.threshold into the sandbox only
+    pipeline.select_op("segment.threshold")
+    pipeline._form  # form built by select_op
+    assert pipeline.add_step("seg") is not None
+    pipeline.step_list.setCurrentRow(1)
+    assert pipeline.preview_selected_step()
+    assert "preview: labels" in viewer.layers
+    labels_after = np.asarray(
+        ExperimentStore.open(synth_store, mode="r").labels(0)
+    )
+    np.testing.assert_array_equal(labels_before, labels_after)
+
+    # re-preview replaces rather than accumulates preview layers
+    assert pipeline.preview_selected_step()
+    names = [layer.name for layer in viewer.layers]
+    assert "preview: labels" in names  # current step's output stays
+    assert "preview: outlines" not in names  # previous step's layers cleared
+    assert "preview" in pipeline.status_label.text()

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Union, get_args, get_origin
 
@@ -66,13 +67,14 @@ from qtpy.QtWidgets import (
 )
 
 from momia3.gui import layers as _layers
+from momia3.gui.preview import preview_step
 from momia3.ops import measure as _measure_ops
 from momia3.ops import midline as _midline_ops
 from momia3.ops import outline as _outline_ops
 from momia3.pipeline import engine
 from momia3.pipeline.registry import REGISTRY, StepContext, get, list_ops, register
 from momia3.storage.tables import read_table
-from momia3.storage.zarr_store import ExperimentStore
+from momia3.storage.zarr_store import CHANNEL_ROLES, ExperimentStore
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,7 @@ __all__ = ["DatasetWidget", "PipelineWidget", "ResultsWidget"]
 _LAYER_OUTLINES = "momia3 outlines"
 _LAYER_MIDLINES = "momia3 midlines"
 _LAYER_TRACKS = "momia3 tracks"
+_PREVIEW_PREFIX = "preview: "
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +421,21 @@ class DatasetWidget(QWidget):
         layout.addWidget(QLabel("Channels:"))
         self.channel_list = QListWidget()
         self.channel_list.setMaximumHeight(90)
+        self.channel_list.currentRowChanged.connect(self._sync_role_combo)
         layout.addWidget(self.channel_list)
+
+        role_row = QHBoxLayout()
+        role_row.addWidget(QLabel("Role:"))
+        self.role_combo = QComboBox()
+        self.role_combo.addItem("(unset)")
+        self.role_combo.addItems(CHANNEL_ROLES)
+        self.role_combo.setToolTip(
+            "Semantic role of the selected channel: brightfield / "
+            "fluorescence / mask / label — used to pick segmentation sources."
+        )
+        self.role_combo.currentTextChanged.connect(self._on_role_changed)
+        role_row.addWidget(self.role_combo, stretch=1)
+        layout.addLayout(role_row)
 
         self.load_image_button = QPushButton("Load channel as Image layer")
         self.load_image_button.clicked.connect(lambda: self.load_channel())
@@ -426,6 +443,13 @@ class DatasetWidget(QWidget):
         self.load_labels_button = QPushButton("Load labels as Labels layer")
         self.load_labels_button.clicked.connect(lambda: self.load_labels())
         layout.addWidget(self.load_labels_button)
+        self.import_labels_button = QPushButton("Import mask as labels…")
+        self.import_labels_button.setToolTip(
+            "Import a pre-segmented label-mask TIFF (io.import_labels) into "
+            "the open store, replacing its labels for the current FOV."
+        )
+        self.import_labels_button.clicked.connect(self._on_import_labels_clicked)
+        layout.addWidget(self.import_labels_button)
         self.recompute_button = QPushButton("Recompute cells (current frame)")
         self.recompute_button.setToolTip(
             "After editing the Labels layer, re-run labels_to_cells + "
@@ -504,6 +528,70 @@ class DatasetWidget(QWidget):
             self.load_channel()
         except Exception as exc:
             logger.debug("auto-load after import failed: %s", exc)
+
+    def _on_import_labels_clicked(self) -> None:
+        """Import a pre-segmented mask TIFF as labels of the open store."""
+        from momia3.pipeline.io_ops import ImportLabelsParams, run_import_labels
+
+        try:
+            store = self._require_store()
+        except RuntimeError as exc:
+            _status(self.status_label, str(exc), error=True)
+            return
+        tiff, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import label mask TIFF",
+            "",
+            "TIFF images (*.tif *.tiff);;All files (*)",
+        )
+        if not tiff:
+            return
+        fov_id = self.fov_combo.currentText()
+        params = ImportLabelsParams(path=tiff, fov_id=int(fov_id or 0))
+        ctx = StepContext(
+            step_id="import_labels",
+            workspace=Path(store.path).parent if store.path else Path.cwd(),
+            outputs={"experiment": Path(store.path)},
+        )
+        try:
+            self.setCursor(Qt.CursorShape.WaitCursor)
+            run_import_labels({"experiment": Path(store.path)}, params, ctx)
+        except Exception as exc:
+            _status(self.status_label, f"label import failed: {exc}", error=True)
+            return
+        finally:
+            self.unsetCursor()
+        _status(self.status_label, f"labels imported from {Path(tiff).name}")
+        try:
+            self.load_labels()
+        except Exception as exc:
+            logger.debug("auto-load labels failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # channel roles
+    # ------------------------------------------------------------------
+    def _sync_role_combo(self, *_args: Any) -> None:
+        """Reflect the selected channel's stored role in the role combo."""
+        role: str | None = None
+        if self._store is not None:
+            channel = self._current_channel()
+            if channel is not None:
+                role = self._store.channel_roles.get(channel)
+        self.role_combo.blockSignals(True)
+        self.role_combo.setCurrentText(role or "(unset)")
+        self.role_combo.blockSignals(False)
+
+    def _on_role_changed(self, text: str) -> None:
+        if self._store is None:
+            return
+        channel = self._current_channel()
+        if channel is None:
+            return
+        try:
+            self._store.set_channel_role(channel, None if text == "(unset)" else text)
+            _status(self.status_label, f"channel {channel!r} role = {text}")
+        except (KeyError, ValueError) as exc:
+            _status(self.status_label, str(exc), error=True)
 
     def open_store(self, path: str | Path) -> ExperimentStore:
         """Open an experiment store and populate the FOV/channel panels."""
@@ -736,6 +824,14 @@ class PipelineWidget(QWidget):
         self.workers_spin.setRange(1, 32)
         self.workers_spin.setValue(1)
         run_row.addWidget(self.workers_spin)
+        self.preview_button = QPushButton("Preview step")
+        self.preview_button.setToolTip(
+            "Test the selected step on the current frame: runs it in a "
+            "sandbox copy (the open store is never modified) and shows the "
+            "result as 'preview: …' layers."
+        )
+        self.preview_button.clicked.connect(self.preview_selected_step)
+        run_row.addWidget(self.preview_button)
         self.run_button = QPushButton("Run")
         self.run_button.clicked.connect(self.run_pipeline)
         run_row.addWidget(self.run_button)
@@ -840,6 +936,122 @@ class PipelineWidget(QWidget):
             dict(self.step_list.item(i).data(Qt.UserRole))
             for i in range(self.step_list.count())
         ]
+
+    # ------------------------------------------------------------------
+    # single-step preview on the current frame (sandbox; store untouched)
+    # ------------------------------------------------------------------
+    def preview_selected_step(self) -> bool:
+        """Run the selected step on the current frame in a sandbox store."""
+        item = self.step_list.currentItem()
+        if item is None:
+            _status(self.status_label, "select a step to preview first", error=True)
+            return False
+        step = item.data(Qt.UserRole)
+        dataset = _sibling_widget(self.viewer, DatasetWidget)
+        if dataset is None or dataset._store is None:
+            _status(
+                self.status_label,
+                "open a store in the Dataset panel first (preview needs the "
+                "current frame as input)",
+                error=True,
+            )
+            return False
+        store = dataset._store
+        try:
+            fov_id = dataset._current_fov()
+        except RuntimeError as exc:
+            _status(self.status_label, str(exc), error=True)
+            return False
+        dims_step = tuple(self.viewer.dims.current_step) if self.viewer is not None else ()
+        t = int(dims_step[0]) if dims_step else 0
+        try:
+            self.setCursor(Qt.CursorShape.WaitCursor)
+            with tempfile.TemporaryDirectory() as td:
+                result = preview_step(
+                    step["op"], step["params"], store, fov_id, t, Path(td)
+                )
+                self._show_preview(step, result)
+        except Exception as exc:
+            _status(self.status_label, f"preview failed: {exc}", error=True)
+            logger.exception("preview failed")
+            return False
+        finally:
+            self.unsetCursor()
+        return True
+
+    def _clear_preview_layers(self) -> None:
+        if self.viewer is None:
+            return
+        for layer in list(self.viewer.layers):
+            if layer.name.startswith(_PREVIEW_PREFIX):
+                self.viewer.layers.remove(layer)
+
+    def _show_preview(self, step: Mapping[str, Any], result: Any) -> None:
+        """Display preview outputs as fresh ``preview: …`` layers."""
+        import polars as pl
+
+        if self.viewer is None:
+            return
+        self._clear_preview_layers()
+        spec = self._specs.get(step["op"])
+        shown: list[str] = []
+        for name, value in result.outputs.items():
+            kind = spec.outputs.get(name) if spec is not None else None
+            if kind == "store":
+                sandbox = ExperimentStore.open(value, mode="r")
+                fov_ids = sandbox.fov_ids or (0,)
+                fov = fov_ids[0]
+                try:
+                    labels = np.asarray(sandbox.get_labels_frame(fov, 0))
+                    self.viewer.add_labels(
+                        labels, name=f"{_PREVIEW_PREFIX}labels", opacity=0.6
+                    )
+                    shown.append(f"labels ({int(labels.max())} cells)")
+                except KeyError:
+                    pass
+                try:
+                    prob = np.asarray(sandbox.prob(fov))[0]  # (c, y, x)
+                    self.viewer.add_image(
+                        prob, name=f"{_PREVIEW_PREFIX}prob",
+                        colormap="magma", blending="additive",
+                    )
+                    shown.append(f"prob {prob.shape}")
+                except KeyError:
+                    pass
+            elif kind in ("table", "table:cells"):
+                df = pl.from_arrow(value)
+                if "outline" in df.columns:
+                    shapes, _, _ = _layers.cells_to_outline_shapes(df, max_cells=None)
+                    ok = [s for s in shapes if len(np.unique(s, axis=0)) >= 3]
+                    if ok:
+                        self.viewer.add_shapes(
+                            ok, shape_type="polygon",
+                            name=f"{_PREVIEW_PREFIX}outlines",
+                            edge_color="#ff3d00", edge_width=1.5,
+                            face_color="transparent",
+                        )
+                        shown.append(f"{len(ok)} outlines")
+                if "midline" in df.columns:
+                    shapes, _, _ = _layers.cells_to_midline_shapes(df, max_cells=None)
+                    ok = [s for s in shapes if len(np.unique(s, axis=0)) >= 2]
+                    if ok:
+                        self.viewer.add_shapes(
+                            ok, shape_type="path",
+                            name=f"{_PREVIEW_PREFIX}midlines",
+                            edge_color="#00e5ff", edge_width=2.0,
+                        )
+                        shown.append(f"{len(ok)} midline paths")
+                if not shown:
+                    shown.append(f"table {name!r} ({df.height} rows)")
+            elif kind == "array":
+                self.viewer.add_image(
+                    np.asarray(value), name=f"{_PREVIEW_PREFIX}{name}"
+                )
+                shown.append(name)
+        _status(
+            self.status_label,
+            f"preview {step['id']}: " + (", ".join(shown) if shown else "no visual output"),
+        )
 
     # ------------------------------------------------------------------
     # pipeline assembly (auto-wiring of step inputs)

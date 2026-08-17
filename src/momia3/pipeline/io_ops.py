@@ -26,7 +26,91 @@ from momia3.storage.zarr_store import ExperimentStore
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ImportTiffParams", "ImportSynthParams"]
+__all__ = ["ImportTiffParams", "ImportSynthParams", "ImportLabelsParams"]
+
+
+# ---------------------------------------------------------------------------
+# labels import (pre-segmented masks)
+# ---------------------------------------------------------------------------
+
+
+class ImportLabelsParams(BaseModel):
+    """Parameters of the ``io.import_labels`` operation."""
+
+    path: str = Field(description="Label-mask TIFF to import (absolute or cwd-relative)")
+    fov_id: int = Field(0, ge=0, description="FOV id whose labels are replaced")
+
+
+def _read_labels_tiff(path: Path) -> np.ndarray:
+    """Read a label-mask TIFF as a ``(t, y, x)`` integer stack.
+
+    Accepts plain 2D masks and ``(t, y, x)`` stacks (singleton non-spatial
+    axes are squeezed). Values are cast to uint32; negative values are
+    rejected because 0 is reserved for background.
+    """
+    import tifffile
+
+    data = np.asarray(tifffile.imread(str(path)))
+    for ax in range(data.ndim - 1, 1, -1):
+        if data.shape[ax] == 1:
+            data = np.squeeze(data, axis=ax)
+    if data.ndim == 2:
+        data = data[np.newaxis]
+    if data.ndim != 3:
+        raise ValueError(
+            f"label mask must be 2D or (t, y, x), got shape {data.shape}"
+        )
+    if np.any(data < 0):
+        raise ValueError("label mask contains negative values")
+    return data.astype(np.uint32)
+
+
+@register(
+    "io.import_labels",
+    params_model=ImportLabelsParams,
+    inputs={"experiment": "store"},
+    outputs={"experiment": "store"},
+    shard=None,
+    verify=("fov_*/labels",),
+    description=(
+        "Import a pre-segmented label-mask TIFF into the labels array of an "
+        "existing experiment store (in place). Use when segmentation was "
+        "done externally (e.g. Cellpose/Omnipose GUI, Ilastik)."
+    ),
+)
+def run_import_labels(
+    inputs: dict[str, Any], params: ImportLabelsParams, ctx: StepContext
+) -> dict[str, Any]:
+    """Runner of ``io.import_labels`` (see registry description)."""
+    del ctx  # store-mutation op; no workspace artifacts
+    store_path = Path(inputs["experiment"])
+    src = Path(params.path).expanduser()
+    if not src.is_file():
+        raise FileNotFoundError(f"label mask not found: {src}")
+    labels = _read_labels_tiff(src)
+    store = ExperimentStore.open(store_path, mode="a")
+    for channel in store.channels:
+        shape = store.shape(params.fov_id, channel)
+        if labels.shape[-2:] != shape[-2:]:
+            raise ValueError(
+                f"label mask spatial shape {labels.shape[-2:]} does not match "
+                f"channel {channel!r} images {shape[-2:]}"
+            )
+        if labels.shape[0] not in (1, shape[0]):
+            raise ValueError(
+                f"label mask has {labels.shape[0]} frame(s); channel {channel!r} "
+                f"has {shape[0]} (only 1 or a matching count is supported)"
+            )
+        break
+    store.write_labels(params.fov_id, labels)
+    logger.info(
+        "io.import_labels: %s -> %s fov=%d shape=%s",
+        src,
+        store_path,
+        params.fov_id,
+        labels.shape,
+    )
+    return {"experiment": store_path}
 
 
 # ---------------------------------------------------------------------------
