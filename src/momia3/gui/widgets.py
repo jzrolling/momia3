@@ -44,7 +44,11 @@ from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -170,6 +174,47 @@ def _status(label: QLabel, text: str, error: bool = False) -> None:
 def _ask_directory(parent: QWidget, caption: str) -> str | None:
     path = QFileDialog.getExistingDirectory(parent, caption)
     return path or None
+
+
+class _ImportTiffDialog(QDialog):
+    """Collect ``io.import_tiff`` parameters for a one-click TIFF import."""
+
+    def __init__(
+        self, parent: QWidget, tiff_path: Path, pixel_microns: float
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Import TIFF")
+        form = QFormLayout(self)
+        path_label = QLabel(str(tiff_path))
+        path_label.setWordWrap(True)
+        form.addRow("TIFF:", path_label)
+        self.pixel_spin = QDoubleSpinBox()
+        self.pixel_spin.setDecimals(5)
+        self.pixel_spin.setRange(0.0001, 100.0)
+        self.pixel_spin.setSingleStep(0.001)
+        self.pixel_spin.setValue(pixel_microns)
+        form.addRow("Pixel size (µm):", self.pixel_spin)
+        self.channels_edit = QLineEdit()
+        self.channels_edit.setPlaceholderText(
+            "optional, comma-separated (default: ch0, ch1, …)"
+        )
+        form.addRow("Channels:", self.channels_edit)
+        self.workspace_edit = QLineEdit(
+            str(tiff_path.parent / f"{tiff_path.stem}_workspace")
+        )
+        form.addRow("Workspace:", self.workspace_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def channels(self) -> list[str] | None:
+        text = self.channels_edit.text().strip()
+        if not text:
+            return None
+        return [c.strip() for c in text.split(",") if c.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -345,12 +390,20 @@ class DatasetWidget(QWidget):
         self.viewer = napari_viewer
         self._store: ExperimentStore | None = None
         self._labels_layer: Any = None
+        self._last_pixel_microns = 0.04968
 
         layout = QVBoxLayout(self)
         open_row = QHBoxLayout()
         self.open_button = QPushButton("Open experiment.zarr…")
         self.open_button.clicked.connect(self._on_open_clicked)
         open_row.addWidget(self.open_button)
+        self.import_button = QPushButton("Import TIFF…")
+        self.import_button.setToolTip(
+            "Import a raw TIFF (io.import_tiff) into a new experiment.zarr "
+            "workspace, then open it here."
+        )
+        self.import_button.clicked.connect(self._on_import_clicked)
+        open_row.addWidget(self.import_button)
         layout.addLayout(open_row)
         self.path_label = QLabel("(no store open)")
         self.path_label.setWordWrap(True)
@@ -400,6 +453,57 @@ class DatasetWidget(QWidget):
         path = _ask_directory(self, "Open experiment.zarr")
         if path:
             self.open_store(path)
+
+    def _on_import_clicked(self) -> None:
+        """One-click TIFF import: io.import_tiff into a fresh workspace."""
+        from momia3.pipeline.io_ops import ImportTiffParams, run_import_tiff
+
+        tiff, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import TIFF",
+            "",
+            "TIFF images (*.tif *.tiff *.ome.tif *.ome.tiff);;All files (*)",
+        )
+        if not tiff:
+            return
+        tiff_path = Path(tiff)
+        dialog = _ImportTiffDialog(self, tiff_path, self._last_pixel_microns)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        workspace = Path(dialog.workspace_edit.text()).expanduser()
+        store_path = workspace / "experiment.zarr"
+        if store_path.exists():
+            _status(
+                self.status_label,
+                f"refusing to overwrite existing store: {store_path}",
+                error=True,
+            )
+            return
+        self._last_pixel_microns = float(dialog.pixel_spin.value())
+        params = ImportTiffParams(
+            path=str(tiff_path),
+            pixel_microns=self._last_pixel_microns,
+            channels=dialog.channels(),
+        )
+        workspace.mkdir(parents=True, exist_ok=True)
+        ctx = StepContext(
+            step_id="import",
+            workspace=workspace,
+            outputs={"experiment": store_path},
+        )
+        try:
+            self.setCursor(Qt.CursorShape.WaitCursor)
+            run_import_tiff({}, params, ctx)
+        except Exception as exc:
+            _status(self.status_label, f"import failed: {exc}", error=True)
+            return
+        finally:
+            self.unsetCursor()
+        self.open_store(store_path)
+        try:  # show the first channel right away
+            self.load_channel()
+        except Exception as exc:
+            logger.debug("auto-load after import failed: %s", exc)
 
     def open_store(self, path: str | Path) -> ExperimentStore:
         """Open an experiment store and populate the FOV/channel panels."""
