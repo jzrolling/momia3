@@ -11,6 +11,9 @@ contributions:
     - id: momia3.make_results_widget
       python_name: momia3.gui.widgets:ResultsWidget
       title: Create the momia3 Results dock widget
+    - id: momia3.make_main_panel
+      python_name: momia3.gui.widgets:MainPanel
+      title: Create the momia3 main panel (Dataset/Pipeline/Results tabs)
   widgets:
     - command: momia3.make_dataset_widget
       display_name: "momia3: Dataset"
@@ -18,3 +21,5 @@ contributions:
       display_name: "momia3: Pipeline"
     - command: momia3.make_results_widget
       display_name: "momia3: Results"
+    - command: momia3.make_main_panel
+      display_name: "momia3: Panels"

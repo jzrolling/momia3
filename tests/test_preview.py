@@ -209,6 +209,32 @@ class TestPreviewSandbox:
                     "track.link_frames", {}, store, 0, 0, Path(td)
                 )
 
+    def test_preview_array_channel_input(self, tmp_path):
+        """array 'image' inputs are fed from the selected channel frame."""
+        store = _make_store(tmp_path, with_labels=True)
+        with tempfile.TemporaryDirectory() as td:
+            result = preview_step("preprocess.denoise", {}, store, 0, 0, Path(td))
+            assert result.outputs["image"].shape == (64, 64)
+            assert result.outputs["image"].dtype == np.float32
+
+    def test_preview_array_labels_and_channel_input(self, tmp_path):
+        """array 'labels'/'intensity' inputs map to labels + channel frames."""
+        store = _make_store(tmp_path, with_labels=True)
+        with tempfile.TemporaryDirectory() as td:
+            result = preview_step(
+                "outline.extract_outlines", {}, store, 0, 0, Path(td)
+            )
+            outlines = result.outputs["outlines"]
+            assert len(outlines) >= 2  # one closed outline per rod
+
+    def test_preview_intermediate_array_rejected(self, tmp_path):
+        """Arrays that are not store frames (dist/prob/patches) are refused."""
+        store = _make_store(tmp_path, with_labels=True)
+        with tempfile.TemporaryDirectory() as td:
+            # mask comes from labels; dist is an intermediate array.
+            with pytest.raises(ValueError, match="cannot produce the array input"):
+                preview_step("segment.declump", {}, store, 0, 0, Path(td))
+
     def test_preview_param_validation_applies(self, tmp_path):
         store = _make_store(tmp_path, with_labels=True)
         with tempfile.TemporaryDirectory() as td:

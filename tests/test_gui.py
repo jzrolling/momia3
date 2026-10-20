@@ -37,7 +37,12 @@ pytest.importorskip("qtpy", reason="momia3 gui extra (qtpy) not installed")
 from qtpy.QtWidgets import QApplication
 
 from momia3.gui import layers as gui_layers
-from momia3.gui.widgets import DatasetWidget, PipelineWidget, ResultsWidget
+from momia3.gui.widgets import (
+    DatasetWidget,
+    MainPanel,
+    PipelineWidget,
+    ResultsWidget,
+)
 from momia3.keys import encode_key
 from momia3.pipeline import engine
 from momia3.storage.zarr_store import ExperimentStore
@@ -242,6 +247,86 @@ def test_dataset_widget_loads_layers(viewer, synth_store) -> None:
     assert viewer.dims.ndim == 3  # time axis mapped to the napari slider
 
 
+def test_dock_widgets_scrollable_vertically(qapp) -> None:
+    """Right-dock panels wrap their content in a QScrollArea (small screens)."""
+    from qtpy.QtWidgets import QScrollArea
+
+    for widget in (DatasetWidget(), PipelineWidget(), ResultsWidget()):
+        scrolls = [
+            w for w in widget.findChildren(QScrollArea) if w.parent() is widget
+        ]
+        assert scrolls, f"{type(widget).__name__} lacks a scroll wrapper"
+        assert scrolls[0].widgetResizable()
+
+
+def test_main_panel_hosts_all_three_tabs(viewer) -> None:
+    """MainPanel: Dataset / Pipeline / Results as tabs of one dock."""
+    panel = MainPanel(viewer)
+    viewer.window.add_dock_widget(panel, name="momia3: Panels", area="right")
+
+    assert panel.count() == 3
+    labels = [panel.tabText(i) for i in range(panel.count())]
+    assert labels == ["Dataset", "Pipeline", "Results"]
+    assert isinstance(panel.widget(0), DatasetWidget)
+    assert isinstance(panel.widget(1), PipelineWidget)
+    assert isinstance(panel.widget(2), ResultsWidget)
+
+
+def test_sibling_widget_finds_panels_inside_tab_dock(viewer) -> None:
+    """Cross-panel lookups descend into the tabbed MainPanel."""
+    from momia3.gui.widgets import _sibling_widget
+
+    panel = MainPanel(viewer)
+    viewer.window.add_dock_widget(panel, name="momia3: Panels", area="right")
+
+    found_dataset = _sibling_widget(viewer, DatasetWidget)
+    assert found_dataset is panel.dataset_widget
+    found_results = _sibling_widget(viewer, ResultsWidget)
+    assert found_results is panel.results_widget
+
+
+def test_import_tiff_runs_off_gui_thread(qapp, tmp_path) -> None:
+    """start_import_tiff returns immediately; the store is written in background."""
+    import tifffile
+
+    tif = tmp_path / "input.tif"
+    arr = np.zeros((2, 1, 96, 96), dtype=np.uint16)
+    arr[:, 0, 20:80, 20:80] = 800
+    tifffile.imwrite(str(tif), arr, metadata={"axes": "TCYX"})
+
+    widget = DatasetWidget()  # no viewer: only open_store/status assertions
+    ws = tmp_path / "ws"
+    assert widget.start_import_tiff(tif, 0.065, None, ws) is True
+    assert widget._importers_busy  # returned immediately, not blocking
+    assert _pump_until(60.0, lambda: not widget._importers_busy)
+    store_path = ws / "experiment.zarr"
+    assert store_path.is_dir()
+    store = ExperimentStore.open(store_path, mode="r")
+    assert list(store.channels) == ["ch0"]
+    assert list(store.shape(0, "ch0")) == [2, 96, 96]
+    assert "imported" in widget.status_label.text()
+
+
+def test_import_labels_runs_off_gui_thread(qapp, synth_store, tmp_path) -> None:
+    """start_import_labels writes the mask into the open store in background."""
+    import tifffile
+
+    labels = np.zeros((96, 96), dtype=np.uint32)
+    labels[10:40, 10:40] = 1
+    mask_tif = tmp_path / "mask.tif"
+    tifffile.imwrite(str(mask_tif), labels)
+
+    widget = DatasetWidget()
+    widget.open_store(synth_store)
+    assert widget.start_import_labels(mask_tif, 0) is True
+    assert widget._importers_busy
+    assert _pump_until(60.0, lambda: not widget._importers_busy)
+    store = ExperimentStore.open(synth_store, mode="r")
+    frame = np.asarray(store.get_labels_frame(0, 0))
+    assert frame.max() == 1
+    assert (frame == 1).sum() == labels.sum()
+
+
 # ---------------------------------------------------------------------------
 # PipelineWidget
 # ---------------------------------------------------------------------------
@@ -347,6 +432,93 @@ def test_results_widget_missing_cells(viewer, tmp_path) -> None:
     widget.open_workspace(tmp_path)  # no parquets here
     assert "no cells.parquet" in widget.status_label.text()
     assert "momia3 tracks" not in viewer.layers
+
+
+def test_results_refine_lineage_requires_store_and_tables(viewer) -> None:
+    """Refine button is guarded: needs tables + an open Dataset store."""
+    widget = ResultsWidget(viewer)
+    assert widget.refine_lineage_action() is False
+    assert "cells + edges" in widget.status_label.text()
+
+    widget.open_workspace(DEMO_WORKSPACE)  # has tables, but no store panel
+    assert widget.refine_lineage_action() is False
+    assert "Dataset panel" in widget.status_label.text()
+
+
+def test_results_refine_lineage_splits_converged_cell(viewer, tmp_path) -> None:
+    """Refine button: splits the converged cell, writes labels back, refreshes."""
+    from momia3.keys import ROOT_KEY, decode_key, encode_key
+    from momia3.ops import measure as m_ops
+    from momia3.storage.zarr_store import ExperimentStore
+
+    labels = np.zeros((3, 60, 70), dtype=np.uint32)
+    labels[0, 28:33, 10:50] = 1
+    labels[1, 28:33, 12:29] = 1
+    labels[1, 28:33, 32:49] = 2
+    labels[2, 28:33, 12:49] = 3
+    ka = encode_key(0, 0, 1)
+    kb = encode_key(0, 1, 1)
+    kc = encode_key(0, 1, 2)
+    kd = encode_key(0, 2, 3)
+    edges = pl.DataFrame(
+        {
+            "parent_key": [ROOT_KEY, ka, ka, kb, kc],
+            "child_key": [ka, kb, kc, kd, kd],
+            "event": ["appear", "division", "division", "continue", "continue"],
+            "confidence": [1.0, 1.0, 1.0, 1.0, 1.0],
+        }
+    )
+    cells = pl.concat(
+        [
+            pl.from_arrow(
+                m_ops.labels_to_cells(labels[t], 0, t, pixel_microns=0.065)
+            )
+            for t in range(3)
+        ],
+        how="diagonal_relaxed",
+    )
+
+    store_path = tmp_path / "experiment.zarr"
+    store = ExperimentStore.create(
+        store_path, pixel_microns=0.065, channels=["phase"], time_interval_s=60.0
+    )
+    store.write_labels(0, labels)
+
+    dataset = DatasetWidget(viewer)
+    results = ResultsWidget(viewer)
+    viewer.window.add_dock_widget(dataset, name="momia3: Dataset", area="right")
+    viewer.window.add_dock_widget(results, name="momia3: Results", area="right")
+    dataset.open_store(store_path)
+    results.open_dataframes(cells=cells, edges=edges)
+
+    assert results.refine_lineage_action() is True
+    assert _pump_until(60.0, lambda: not results._refine_busy)
+    assert "refined" in results.status_label.text()
+
+    # Edges rewired: each mother keeps one fresh-fragment child, not kd.
+    pairs = {
+        (int(r["parent_key"]), int(r["child_key"])): r["event"]
+        for r in results._edges.to_dicts()
+    }
+    assert (kb, kd) not in pairs and (kc, kd) not in pairs
+    b_children = [c for (p, c) in pairs if p == kb]
+    c_children = [c for (p, c) in pairs if p == kc]
+    assert len(b_children) == 1 and len(c_children) == 1
+    assert b_children[0] != c_children[0]
+    frag_labels = {decode_key(k)[2] for k in b_children + c_children}
+
+    # Split fragments were written back into the store's labels (frame 2).
+    reopened = ExperimentStore.open(store_path, mode="r")
+    frame2 = np.asarray(reopened.get_labels_frame(0, 2))
+    assert (frame2 == 3).sum() == 0
+    assert set(np.unique(frame2[frame2 > 3]).tolist()) == frag_labels
+
+    # The in-memory cells table gained rows for the fresh fragments.
+    assert results._cells is not None
+    frag_rows = results._cells.filter(
+        (pl.col("fov_id") == 0) & (pl.col("frame") == 2) & (pl.col("label") > 3)
+    )
+    assert frag_rows.height == 2
 
 
 # ---------------------------------------------------------------------------

@@ -50,6 +50,7 @@ from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -62,6 +63,7 @@ from qtpy.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -78,7 +80,7 @@ from momia3.storage.zarr_store import CHANNEL_ROLES, ExperimentStore
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DatasetWidget", "PipelineWidget", "ResultsWidget"]
+__all__ = ["DatasetWidget", "PipelineWidget", "ResultsWidget", "MainPanel"]
 
 _LAYER_OUTLINES = "momia3 outlines"
 _LAYER_MIDLINES = "momia3 midlines"
@@ -128,8 +130,32 @@ if "gui.open_store" not in REGISTRY:
 # ---------------------------------------------------------------------------
 
 
+def _scrollable_layout(root: QWidget) -> QVBoxLayout:
+    """Root layout wrapped in a vertical QScrollArea.
+
+    Dock widgets live in napari's right side bar, which gives them the
+    full window height; on small screens the content is taller than the
+    viewport and would otherwise be unreachable. Wrapping the root layout
+    in a border-less QScrollArea makes the whole panel scroll vertically
+    while still stretching horizontally to the dock width.
+    """
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    content = QWidget()
+    scroll.setWidget(content)
+    outer = QVBoxLayout(root)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.addWidget(scroll)
+    return QVBoxLayout(content)
+
+
 def _sibling_widget(viewer: Any, cls: type) -> Any:
-    """Find another momia3 dock widget attached to the same viewer."""
+    """Find a momia3 dock widget attached to the same viewer.
+
+    Also descends into a dock widget's children, so widgets living inside
+    a tabbed :class:`MainPanel` are still found by the other panels.
+    """
     if viewer is None:
         return None
     try:
@@ -153,6 +179,12 @@ def _sibling_widget(viewer: Any, cls: type) -> Any:
             native = getattr(widget, "native", None)  # magicgui wrapper
             if isinstance(native, cls):
                 return native
+            for qwidget in (widget, native):
+                if qwidget is None or not hasattr(qwidget, "findChildren"):
+                    continue
+                found = qwidget.findChildren(cls)
+                if found:
+                    return found[0]
     except Exception:  # pragma: no cover - defensive against napari internals
         logger.debug("dock widget scan failed", exc_info=True)
     return None
@@ -380,6 +412,89 @@ def _engine_worker(
     return engine.run(pipeline, workspace=workspace, n_workers=n_workers)
 
 
+@thread_worker
+def _import_tiff_worker(
+    params: Any, workspace: Path, store_path: Path
+) -> Path:
+    """Import a TIFF into a fresh store off the GUI thread (no UI freeze)."""
+    from momia3.pipeline.io_ops import run_import_tiff
+
+    ctx = StepContext(
+        step_id="import",
+        workspace=workspace,
+        outputs={"experiment": store_path},
+    )
+    run_import_tiff({}, params, ctx)
+    return store_path
+
+
+@thread_worker
+def _import_labels_worker(store_path: Path, params: Any) -> Path:
+    """Replace a store's labels from a mask TIFF off the GUI thread."""
+    from momia3.pipeline.io_ops import run_import_labels
+
+    ctx = StepContext(
+        step_id="import_labels",
+        workspace=store_path.parent,
+        outputs={"experiment": store_path},
+    )
+    run_import_labels({"experiment": store_path}, params, ctx)
+    return store_path
+
+
+def _edge_signature(edges: Any) -> frozenset[tuple[int, int, str]]:
+    """Column-order-insensitive signature of an edges table (identity)."""
+    return frozenset(
+        zip(
+            edges["parent_key"].to_list(),
+            edges["child_key"].to_list(),
+            edges["event"].to_list(),
+        )
+    )
+
+
+@thread_worker
+def _refine_lineage_worker(
+    store_path: str | Path, fov_id: int, edges_df: Any, pixel_microns: float
+) -> tuple[bool, Any, Any]:
+    """Graph-surgery lineage refine off the GUI thread.
+
+    Runs :func:`momia3.ops.track.refine_lineage` on the FOV's full labels
+    stack with label writeback, persists the corrected labels into the
+    store, and re-measures every frame's cells so the split fragments show
+    up in the results panel. Returns ``(changed, edges, cells)`` — when no
+    suspect is found, ``edges``/``cells`` are ``None`` and nothing is
+    written back.
+    """
+    import polars as pl
+
+    from momia3.ops import measure as _measure
+    from momia3.ops import track as _track
+    from momia3.storage.zarr_store import ExperimentStore
+
+    store_path = Path(store_path)
+    store = ExperimentStore.open(store_path, mode="r")
+    labels = np.asarray(store.labels(fov_id)).astype(np.uint32)
+    new_edges = _track.refine_lineage(
+        labels, edges_df, writeback_labels=True
+    )
+    changed = _edge_signature(new_edges) != _edge_signature(edges_df)
+    if not changed:
+        return False, None, None  # no suspect to split; labels untouched
+    writer = ExperimentStore.open(store_path, mode="a")
+    writer.write_labels(fov_id, labels)
+    parts = [
+        pl.from_arrow(
+            _measure.labels_to_cells(
+                labels[t], fov_id, t, intensity=None, pixel_microns=pixel_microns
+            )
+        )
+        for t in range(labels.shape[0])
+    ]
+    cells = pl.concat(parts, how="diagonal_relaxed") if parts else pl.DataFrame()
+    return True, new_edges, cells
+
+
 # ---------------------------------------------------------------------------
 # DatasetWidget
 # ---------------------------------------------------------------------------
@@ -393,9 +508,10 @@ class DatasetWidget(QWidget):
         self.viewer = napari_viewer
         self._store: ExperimentStore | None = None
         self._labels_layer: Any = None
+        self._importers_busy = False
         self._last_pixel_microns = 0.04968
 
-        layout = QVBoxLayout(self)
+        layout = _scrollable_layout(self)
         open_row = QHBoxLayout()
         self.open_button = QPushButton("Open experiment.zarr…")
         self.open_button.clicked.connect(self._on_open_clicked)
@@ -480,8 +596,6 @@ class DatasetWidget(QWidget):
 
     def _on_import_clicked(self) -> None:
         """One-click TIFF import: io.import_tiff into a fresh workspace."""
-        from momia3.pipeline.io_ops import ImportTiffParams, run_import_tiff
-
         tiff, _ = QFileDialog.getOpenFileName(
             self,
             "Import TIFF",
@@ -494,7 +608,34 @@ class DatasetWidget(QWidget):
         dialog = _ImportTiffDialog(self, tiff_path, self._last_pixel_microns)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        workspace = Path(dialog.workspace_edit.text()).expanduser()
+        self._last_pixel_microns = float(dialog.pixel_spin.value())
+        self.start_import_tiff(
+            tiff_path,
+            self._last_pixel_microns,
+            dialog.channels(),
+            Path(dialog.workspace_edit.text()),
+        )
+
+    def start_import_tiff(
+        self,
+        tiff_path: str | Path,
+        pixel_microns: float,
+        channels: list[str] | None,
+        workspace: str | Path,
+    ) -> bool:
+        """Import a TIFF in a background thread; refresh the UI when done.
+
+        Returns ``True`` if the import was started. The heavy read + zarr
+        write run off the GUI thread (:func:`_import_tiff_worker`), so a
+        large TIFF no longer freezes the interface; the Dataset panel is
+        refreshed from the finished store on completion.
+        """
+        from momia3.pipeline.io_ops import ImportTiffParams
+
+        if self._importers_busy:
+            _status(self.status_label, "an import is already running", error=True)
+            return False
+        workspace = Path(workspace).expanduser()
         store_path = workspace / "experiment.zarr"
         if store_path.exists():
             _status(
@@ -502,39 +643,50 @@ class DatasetWidget(QWidget):
                 f"refusing to overwrite existing store: {store_path}",
                 error=True,
             )
-            return
-        self._last_pixel_microns = float(dialog.pixel_spin.value())
+            return False
         params = ImportTiffParams(
-            path=str(tiff_path),
-            pixel_microns=self._last_pixel_microns,
-            channels=dialog.channels(),
+            path=str(Path(tiff_path).expanduser()),
+            pixel_microns=pixel_microns,
+            channels=channels,
         )
         workspace.mkdir(parents=True, exist_ok=True)
-        ctx = StepContext(
-            step_id="import",
-            workspace=workspace,
-            outputs={"experiment": store_path},
-        )
+        self._set_import_busy(True)
+        _status(self.status_label, f"importing {Path(tiff_path).name}…")
+        worker = _import_tiff_worker(params, workspace, store_path)
+        worker.returned.connect(self._on_import_done)
+        worker.errored.connect(self._on_import_failed)
+        worker.start()
+        return True
+
+    def _on_import_done(self, store_path: Path) -> None:
+        """Import finished: open the store and show the first channel."""
+        self._set_import_busy(False)
         try:
-            self.setCursor(Qt.CursorShape.WaitCursor)
-            run_import_tiff({}, params, ctx)
+            self.open_store(store_path)
         except Exception as exc:
-            _status(self.status_label, f"import failed: {exc}", error=True)
+            _status(self.status_label, f"open failed: {exc}", error=True)
             return
-        finally:
-            self.unsetCursor()
-        self.open_store(store_path)
         try:  # show the first channel right away
             self.load_channel()
         except Exception as exc:
             logger.debug("auto-load after import failed: %s", exc)
+        _status(self.status_label, f"imported {Path(store_path).name}")
+
+    def _on_import_failed(self, exc: BaseException) -> None:
+        self._set_import_busy(False)
+        _status(self.status_label, f"import failed: {exc}", error=True)
+        logger.exception("import failed", exc_info=exc)
+
+    def _set_import_busy(self, busy: bool) -> None:
+        """Disable the import buttons while a background import is running."""
+        self._importers_busy = busy
+        self.import_button.setEnabled(not busy)
+        self.import_labels_button.setEnabled(not busy)
 
     def _on_import_labels_clicked(self) -> None:
         """Import a pre-segmented mask TIFF as labels of the open store."""
-        from momia3.pipeline.io_ops import ImportLabelsParams, run_import_labels
-
         try:
-            store = self._require_store()
+            self._require_store()
         except RuntimeError as exc:
             _status(self.status_label, str(exc), error=True)
             return
@@ -547,21 +699,33 @@ class DatasetWidget(QWidget):
         if not tiff:
             return
         fov_id = self.fov_combo.currentText()
-        params = ImportLabelsParams(path=tiff, fov_id=int(fov_id or 0))
-        ctx = StepContext(
-            step_id="import_labels",
-            workspace=Path(store.path).parent if store.path else Path.cwd(),
-            outputs={"experiment": Path(store.path)},
-        )
+        self.start_import_labels(tiff, int(fov_id or 0))
+
+    def start_import_labels(self, tiff_path: str | Path, fov_id: int) -> bool:
+        """Replace the open store's labels from a mask TIFF in a background thread."""
+        from momia3.pipeline.io_ops import ImportLabelsParams
+
         try:
-            self.setCursor(Qt.CursorShape.WaitCursor)
-            run_import_labels({"experiment": Path(store.path)}, params, ctx)
-        except Exception as exc:
-            _status(self.status_label, f"label import failed: {exc}", error=True)
-            return
-        finally:
-            self.unsetCursor()
-        _status(self.status_label, f"labels imported from {Path(tiff).name}")
+            store = self._require_store()
+        except RuntimeError as exc:
+            _status(self.status_label, str(exc), error=True)
+            return False
+        if self._importers_busy:
+            _status(self.status_label, "an import is already running", error=True)
+            return False
+        params = ImportLabelsParams(path=str(Path(tiff_path).expanduser()), fov_id=fov_id)
+        store_path = Path(store.path)
+        self._set_import_busy(True)
+        _status(self.status_label, f"importing labels from {Path(tiff_path).name}…")
+        worker = _import_labels_worker(store_path, params)
+        worker.returned.connect(self._on_import_labels_done)
+        worker.errored.connect(self._on_import_failed)
+        worker.start()
+        return True
+
+    def _on_import_labels_done(self, store_path: Path) -> None:
+        self._set_import_busy(False)
+        _status(self.status_label, f"labels imported to {Path(store_path).name}")
         try:
             self.load_labels()
         except Exception as exc:
@@ -750,7 +914,7 @@ class PipelineWidget(QWidget):
         self._form: ParamForm | None = None
         self._worker: Any = None
 
-        layout = QVBoxLayout(self)
+        layout = _scrollable_layout(self)
         layout.addWidget(QLabel("Operation:"))
         self.op_combo = QComboBox()
         self._specs = {spec.name: spec for spec in list_ops()}
@@ -761,10 +925,10 @@ class PipelineWidget(QWidget):
         self.op_info.setWordWrap(True)
         layout.addWidget(self.op_info)
 
-        self.form_scroll = QScrollArea()
-        self.form_scroll.setWidgetResizable(True)
-        self.form_scroll.setMinimumHeight(140)
-        layout.addWidget(self.form_scroll)
+        self.form_holder = QWidget()
+        self._form_layout = QVBoxLayout(self.form_holder)
+        self._form_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.form_holder)
 
         id_row = QHBoxLayout()
         id_row.addWidget(QLabel("Step id:"))
@@ -864,7 +1028,12 @@ class PipelineWidget(QWidget):
         )
         self.op_info.setToolTip(spec.description)
         self._form = ParamForm(spec.params_model)
-        self.form_scroll.setWidget(self._form.native)
+        while self._form_layout.count():
+            child = self._form_layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self._form_layout.addWidget(self._form.native)
         self.step_id_edit.setText(self._next_step_id(name))
 
     def _next_step_id(self, op_name: str) -> str:
@@ -968,7 +1137,13 @@ class PipelineWidget(QWidget):
             self.setCursor(Qt.CursorShape.WaitCursor)
             with tempfile.TemporaryDirectory() as td:
                 result = preview_step(
-                    step["op"], step["params"], store, fov_id, t, Path(td)
+                    step["op"],
+                    step["params"],
+                    store,
+                    fov_id,
+                    t,
+                    Path(td),
+                    channel=dataset._current_channel(),
                 )
                 self._show_preview(step, result)
         except Exception as exc:
@@ -1249,7 +1424,7 @@ class ResultsWidget(QWidget):
         self._tracks: pl.DataFrame | None = None
         self._tracks_full: tuple[np.ndarray, dict[str, np.ndarray], dict[int, int]] | None = None
 
-        layout = QVBoxLayout(self)
+        layout = _scrollable_layout(self)
         self.open_button = QPushButton("Open workspace…")
         self.open_button.clicked.connect(self._on_open_clicked)
         layout.addWidget(self.open_button)
@@ -1291,10 +1466,133 @@ class ResultsWidget(QWidget):
         self.show_all_button.clicked.connect(self.show_all_tracks)
         layout.addWidget(self.show_all_button)
 
+        refine_row = QHBoxLayout()
+        self.refine_button = QPushButton("Refine lineage…")
+        self.refine_button.setToolTip(
+            "Graph-surgery correction of spurious convergence (ARCHITECTURE "
+            "§8): re-splits cells whose two ancestral branches re-merge "
+            "(track.refine_lineage), writes the split fragments back into "
+            "the store's labels, and refreshes the cells/edges tables and "
+            "layers. Needs the experiment store open in the Dataset panel."
+        )
+        self.refine_button.clicked.connect(self.refine_lineage_action)
+        refine_row.addWidget(self.refine_button, stretch=1)
+        layout.addLayout(refine_row)
+
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         layout.addStretch(1)
+
+        self._refine_busy = False
+
+    # ------------------------------------------------------------------
+    # lineage refinement (§8 interactive correction)
+    # ------------------------------------------------------------------
+    def refine_lineage_action(self) -> bool:
+        """Run lineage refinement for the Dataset panel's current FOV.
+
+        Requires an open store (Dataset widget) plus a cells/edges result
+        set in this widget. The heavy work (watershed splits, label
+        writeback, full-FOV re-measurement) runs off the GUI thread.
+        """
+        if self._refine_busy:
+            _status(self.status_label, "refinement is already running", error=True)
+            return False
+        if self._cells is None or self._edges is None:
+            _status(
+                self.status_label,
+                "need cells + edges tables first (run a pipeline or open a workspace)",
+                error=True,
+            )
+            return False
+        dataset = _sibling_widget(self.viewer, DatasetWidget)
+        if dataset is None or dataset._store is None:
+            _status(
+                self.status_label,
+                "open the experiment store in the Dataset panel first",
+                error=True,
+            )
+            return False
+        try:
+            fov_id = dataset._current_fov()
+        except RuntimeError as exc:
+            _status(self.status_label, str(exc), error=True)
+            return False
+        # Restrict the edges to this FOV (ROOT terminal edges are kept);
+        # refine_lineage indexes labels by the decoded FOV, so feeding it
+        # other FOVs' edges would apply their splits to the wrong labels.
+        from momia3.keys import ROOT_KEY, decode_key
+
+        def keep_edge(parent: int, child: int) -> bool:
+            for key in (parent, child):
+                if key == ROOT_KEY:
+                    continue
+                if decode_key(key)[0] != fov_id:
+                    return False
+            return True
+
+        rows = [r for r in self._edges.to_dicts() if keep_edge(int(r["parent_key"]), int(r["child_key"]))]
+        if not rows:
+            _status(self.status_label, f"no edges for fov{fov_id}; nothing to refine", error=True)
+            return False
+        edges = pl.DataFrame(rows)
+        self._refine_busy = True
+        self.refine_button.setEnabled(False)
+        self._refine_fov = fov_id
+        _status(self.status_label, f"refining lineage of fov{fov_id}…")
+        store_path = Path(dataset._store.path)
+        worker = _refine_lineage_worker(
+            store_path, fov_id, edges, float(dataset._store.pixel_microns)
+        )
+        worker.returned.connect(self._on_refine_done)
+        worker.errored.connect(self._on_refine_failed)
+        worker.start()
+        return True
+
+    def _on_refine_done(
+        self, result: tuple[bool, Any, Any]
+    ) -> None:
+        changed, new_edges, new_cells = result
+        self._refine_busy = False
+        self.refine_button.setEnabled(True)
+        if not changed:
+            _status(
+                self.status_label,
+                "no convergence suspects found — lineage unchanged",
+            )
+            return
+        fov_id = self._refine_fov
+        # Replace this FOV's rows; other FOVs keep their previous values.
+        if self._cells is not None:
+            kept = self._cells.filter(pl.col("fov_id") != int(fov_id))
+            self._cells = pl.concat([kept, new_cells], how="diagonal_relaxed")
+        else:
+            self._cells = new_cells
+        if "fov_id" in self._edges.columns:
+            kept = self._edges.filter(pl.col("fov_id") != int(fov_id))
+            self._edges = pl.concat([kept, new_edges], how="diagonal_relaxed")
+        else:
+            self._edges = new_edges
+        self._tracks = None  # re-derived from the corrected edges
+        self.rebuild_layers()
+        dataset = _sibling_widget(self.viewer, DatasetWidget)
+        if dataset is not None and dataset._store is not None:
+            try:  # reload the labels layer to show the split fragments
+                dataset.load_labels()
+            except Exception:
+                logger.debug("labels reload after refine failed", exc_info=True)
+        _status(
+            self.status_label,
+            f"refined fov{fov_id}: suspect cells split; cells/edges updated "
+            f"({self._edges.height} edges)",
+        )
+
+    def _on_refine_failed(self, exc: BaseException) -> None:
+        self._refine_busy = False
+        self.refine_button.setEnabled(True)
+        _status(self.status_label, f"refinement failed: {exc}", error=True)
+        logger.exception("refine failed", exc_info=exc)
 
     # ------------------------------------------------------------------
     # data access
@@ -1532,3 +1830,28 @@ class ResultsWidget(QWidget):
         layer = self.viewer.layers[_LAYER_TRACKS]
         if name in layer.properties or name == "track_id":
             layer.color_by = name
+
+
+# ---------------------------------------------------------------------------
+# MainPanel: Dataset / Pipeline / Results as one tabbed dock
+# ---------------------------------------------------------------------------
+
+
+class MainPanel(QTabWidget):
+    """Dataset / Pipeline / Results panels as tabs of a single dock widget.
+
+    The three panels share a lot of vertical space; stacking them in one
+    dock with tabs keeps the right sidebar compact and lets each panel use
+    the full dock width. Panels stay individually accessible: sibling
+    lookups (:func:`_sibling_widget`) descend into this widget's children,
+    so e.g. the Refine-lineage button still finds the Dataset panel.
+    """
+
+    def __init__(self, napari_viewer: Any = None) -> None:
+        super().__init__()
+        self.dataset_widget = DatasetWidget(napari_viewer)
+        self.pipeline_widget = PipelineWidget(napari_viewer)
+        self.results_widget = ResultsWidget(napari_viewer)
+        self.addTab(self.dataset_widget, "Dataset")
+        self.addTab(self.pipeline_widget, "Pipeline")
+        self.addTab(self.results_widget, "Results")

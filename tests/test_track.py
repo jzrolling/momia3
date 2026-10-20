@@ -372,6 +372,37 @@ def test_refine_lineage_noop_on_clean_lineage() -> None:
     )
 
 
+def test_refine_lineage_writeback_labels() -> None:
+    """writeback_labels=True replaces the suspect pixels with the fragments."""
+    labels, edges_df, keys = _merge_scenario()
+    d_area = int((labels[2] == 3).sum())
+    out = tr.refine_lineage(labels, edges_df, writeback_labels=True)
+    rows = out.to_dicts()
+    pairs = {(int(r["parent_key"]), int(r["child_key"])): r["event"] for r in rows}
+    b_children = [c for (p, c) in pairs if p == keys["b"]]
+    c_children = [c for (p, c) in pairs if p == keys["c"]]
+    fragment_labels = {
+        decode_key(k)[2] for k in b_children + c_children
+    }
+    assert len(fragment_labels) == 2  # two distinct fresh labels
+
+    # The converged label is gone from the stack; both fragments cover the
+    # whole former mask (partitioning the merged blob between the mothers).
+    frame2 = labels[2]
+    assert (frame2 == 3).sum() == 0  # old D label replaced
+    for lab in fragment_labels:
+        assert (frame2 == lab).sum() > 0
+    assert (frame2 > 3).sum() == d_area
+
+
+def test_refine_lineage_writeback_default_off() -> None:
+    """Without writeback_labels the input stack is left untouched."""
+    labels, edges_df, _keys_ = _merge_scenario()
+    before = labels.copy()
+    tr.refine_lineage(labels, edges_df)
+    np.testing.assert_array_equal(labels, before)
+
+
 # ---------------------------------------------------------------------------
 # ctc_metrics
 # ---------------------------------------------------------------------------

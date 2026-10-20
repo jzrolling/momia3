@@ -14,7 +14,9 @@ WS = Path(__file__).resolve().parent / "data" / "sp003_workspace"
 
 def main() -> None:
     import napari
+    from qtpy.QtCore import Qt
 
+    from momia3.gui.widgets import MainPanel
     from momia3.storage.zarr_store import ExperimentStore
     from momia3.gui.layers import cells_to_midline_shapes, cells_to_outline_shapes
 
@@ -54,12 +56,17 @@ def main() -> None:
         )
         sh.properties = {k: [v[i] for i in okm] for k, v in mprops.items()}
 
-    # momia3 dock widgets (Dataset / Pipeline / Results)
-    for wname in ("momia3: Dataset", "momia3: Pipeline", "momia3: Results"):
-        try:
-            viewer.window.add_plugin_dock_widget("momia3", wname)
-        except Exception as exc:  # keep viewer usable even if a widget fails
-            print(f"dock widget {wname} failed: {exc}")
+    # momia3 dock widgets (Dataset / Pipeline / Results) as one tabbed panel
+    try:
+        dock = viewer.window.add_dock_widget(
+            MainPanel(viewer), name="momia3: Panels", area="right"
+        )
+        # The right sidebar is ~20% wider than napari's default.
+        viewer.window.resizeDocks(
+            [dock], [max(int(dock.width() * 1.2), 460)], Qt.Orientation.Horizontal
+        )
+    except Exception as exc:  # keep viewer usable even if a widget fails
+        print(f"momia3 panels failed: {exc}")
 
     napari.run()
 

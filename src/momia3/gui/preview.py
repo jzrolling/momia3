@@ -22,7 +22,13 @@ Input wiring rules
   (default parameters) run against the sandbox labels — this covers
   ``outline.extract`` / ``midline.extract`` tuning without requiring a
   prior real run.
-- Other input kinds raise ``ValueError`` (preview unsupported).
+- ``array`` inputs are assembled from the sandbox store's current frame
+  by argument-name convention (see :func:`_array_source_for`): ``image``/
+  ``stack``/``intensity`` come from the selected channel frame, ``labels``/
+  ``mask`` from the labels frame. Intermediate arrays (``dist``, ``prob``,
+  ``patches``, …) and ``json``/``table:edges`` inputs are not previewable
+  and raise ``ValueError``.
+- Any other input kind raises ``ValueError`` (preview unsupported).
 """
 
 from __future__ import annotations
@@ -115,6 +121,61 @@ register(
 
 
 # ---------------------------------------------------------------------------
+# sandbox frame array source op (preview helper)
+# ---------------------------------------------------------------------------
+
+
+class _FrameArrayParams(BaseModel):
+    """Parameters of the ``preview.frame_array`` helper op."""
+
+    arg: str = Field(description="Pipeline input argument name being served")
+    channel: str = Field(description="Channel name; '__labels__' serves the labels frame")
+
+
+def _array_source_for(arg: str) -> str | None:
+    """Map a pipeline argument name to a sandbox-store frame source.
+
+    Returns ``"channel"`` (the selected channel's current frame) or
+    ``"labels"`` (the labels frame), or ``None`` when the argument is an
+    intermediate array that cannot be produced from the store alone
+    (``dist``, ``prob``, ``patches``, ``grid``, …).
+    """
+    if arg in ("image", "stack", "intensity"):
+        return "channel"
+    if arg in ("labels", "mask"):
+        return "labels"
+    return None
+
+
+def _run_frame_array(
+    inputs: dict[str, Any], params: _FrameArrayParams, ctx: StepContext
+) -> dict[str, Any]:
+    """Runner of ``preview.frame_array`` (serves one frame as a 2D array)."""
+    del ctx
+    sandbox = ExperimentStore.open(inputs["experiment"], mode="r")
+    fov_id = sandbox.fov_ids[0]
+    if params.channel == "__labels__":
+        frame = sandbox.get_labels_frame(fov_id, 0)
+    else:
+        frame = sandbox.get_frame(fov_id, params.channel, 0)
+    return {"value": np.asarray(frame)}
+
+
+register(
+    "preview.frame_array",
+    params_model=_FrameArrayParams,
+    inputs={"experiment": "store"},
+    outputs={"value": "array"},
+    shard=None,
+    runner=_run_frame_array,
+    description=(
+        "Serve one frame of the sandbox store as a 2D array input (preview "
+        "helper; argument-name convention of _array_source_for)."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
 # single-step preview
 # ---------------------------------------------------------------------------
 
@@ -145,6 +206,7 @@ def preview_step(
     fov_id: int,
     t: int,
     sandbox_dir: Path,
+    channel: str | None = None,
 ) -> PreviewResult:
     """Run one pipeline step against a one-frame sandbox copy of ``src``.
 
@@ -162,6 +224,9 @@ def preview_step(
         Temporary directory holding the sandbox store and artifacts. The
         caller owns its lifetime; display code must read results eagerly
         before deleting it.
+    channel : str, optional
+        Channel serving ``array`` inputs named ``image``/``stack``/
+        ``intensity``; defaults to the store's first channel.
 
     Returns
     -------
@@ -174,6 +239,7 @@ def preview_step(
     # /var -> /private/var symlink would otherwise break relative_to()).
     sandbox_dir = Path(sandbox_dir).resolve()
     store_path = build_sandbox_store(src, fov_id, t, sandbox_dir / "sandbox")
+    channel = channel or (src.channels[0] if src.channels else None)
 
     steps: list[dict[str, Any]] = [
         {
@@ -199,6 +265,27 @@ def preview_step(
                 }
             )
             inputs[arg] = "cells.cells"
+        elif kind == "array":
+            source = _array_source_for(arg)
+            if source is None:
+                raise ValueError(
+                    f"preview cannot produce the array input {arg!r} "
+                    f"(an intermediate array, not a store frame)"
+                )
+            arr_channel = channel or "__labels__"
+            if source == "labels":
+                arr_channel = "__labels__"
+            arr_id = f"arr_{arg}"
+            steps.append(
+                {
+                    "id": arr_id,
+                    "op": "preview.frame_array",
+                    "params": {"arg": arg, "channel": arr_channel},
+                    "inputs": {"experiment": "sandbox.experiment"},
+                    "outputs": {"value": arg},
+                }
+            )
+            inputs[arg] = f"{arr_id}.value"
         else:
             raise ValueError(
                 f"preview does not support input {arg!r} of kind {kind!r} "

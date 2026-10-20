@@ -931,6 +931,7 @@ def refine_lineage(
     edges_table: pa.Table | pl.DataFrame,
     cells_table: pa.Table | pl.DataFrame | None = None,
     params: RefineParams | None = None,
+    writeback_labels: bool = False,
 ) -> pl.DataFrame:
     """Correct spurious convergence events by re-splitting suspect cells.
 
@@ -969,6 +970,12 @@ def refine_lineage(
         Reserved for API symmetry; currently unused.
     params : RefineParams, optional
         Refinement parameters.
+    writeback_labels : bool, optional
+        When ``True``, the split fragments are written back into
+        ``labels_stack`` in place (the suspect's pixels are replaced by
+        the fresh fragment labels), so the caller's copy of the labels
+        matches the returned edges. Off by default to keep the function
+        side-effect free.
 
     Returns
     -------
@@ -976,7 +983,8 @@ def refine_lineage(
         Corrected edges table (schema-conforming, ``vsnap`` column
         preserved when present). Split fragments receive fresh labels
         (frame-local max + 1, + 2, …); the suspect's own edges are
-        removed and replaced.
+        removed and replaced. With ``writeback_labels=True`` the input
+        ``labels_stack`` carries the same fresh fragment labels.
     """
     del cells_table  # reserved for future feature-guided seeding
     params = params or RefineParams()
@@ -1050,6 +1058,12 @@ def refine_lineage(
         for seed in range(1, seed_id + 1):
             new_label = base + seed
             fragment_key[seed] = _keys.encode_key(fov, frame, new_label)
+        if writeback_labels:
+            # Replace the suspect's pixels with the fresh fragments so the
+            # caller's labels match the rewired edges (§8 interactive fix).
+            labels[frame][mask] = 0
+            for seed, frag_key in fragment_key.items():
+                labels[frame][mask & (split == seed)] = _keys.decode_key(frag_key)[2]
         # Rewire mothers -> their own fragments.
         for seed, mother in mother_of_seed.items():
             drop.add((mother, suspect))
