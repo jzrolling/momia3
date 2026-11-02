@@ -135,6 +135,9 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "degenerate_refine_anchor": 2,  # end points only constrain the spline, not moved by chords
     "degenerate_refine_damp": 0.6,
     "degenerate_refine_smooth": 0.03,
+    "degenerate_refine_points": 12,  # coarse polyline used by the chord iteration
+    "degenerate_refine_spacing_px": 0.0,  # >0: n = arc / spacing (overrides points)
+    "degenerate_solidity_min": 0.85,  # only convex-ish masks take the degenerate path
     # end-point handling / resampling (opt-in; defaults keep legacy behavior)
     "pole_endpoint": "extended",  # "extended" (legacy) | "initial" (outline pole pair)
     "n_points_auto": False,  # True: n = arc_length / n_points_target_spacing_px
@@ -1304,6 +1307,17 @@ def _assemble_result(
     }
 
 
+def _mask_solidity(crop: np.ndarray) -> float:
+    """Convexity (solidity = area / convex hull area) of a binary mask."""
+    try:
+        props = skmeasure.regionprops(np.asarray(crop, dtype=np.int32))
+        if props:
+            return float(props[0].solidity)
+    except Exception as exc:  # pragma: no cover - advisory only
+        logger.debug("solidity computation failed (%s)", exc)
+    return 1.0
+
+
 def _refine_degenerate_axis(
     main_global: np.ndarray,
     outline_global: np.ndarray,
@@ -1327,7 +1341,13 @@ def _refine_degenerate_axis(
     damp = float(params.get("degenerate_refine_damp", 0.6))
     iters = int(params.get("degenerate_refine_iters", 3))
     orig = np.asarray(main_global, dtype=np.float64)
-    pnts = _resample_arclength(orig, len(orig))
+    n_out = len(orig)
+    spacing = float(params.get("degenerate_refine_spacing_px", 0.0) or 0.0)
+    if spacing > 0:
+        n_ref = int(np.clip(round(_arc_length(orig) / spacing), 6, n_out))
+    else:
+        n_ref = int(np.clip(int(params.get("degenerate_refine_points", 16)), 6, n_out))
+    pnts = _resample_arclength(orig, n_ref)
     for _ in range(max(iters, 0)):
         q = pnts.copy()
         for i in range(anchor, len(pnts) - anchor):
@@ -1350,6 +1370,8 @@ def _refine_degenerate_axis(
         )
         pnts = _smooth_open_weighted(pnts, s, n=len(pnts), w_end=60.0)
         pnts = _resample_arclength(pnts, len(pnts))
+    # Back to the requested output density (coarse iteration is more stable).
+    pnts = _resample_arclength(pnts, n_out)
     pnts[0] = orig[0]
     pnts[-1] = orig[-1]
     return pnts
@@ -2369,13 +2391,16 @@ def _midline_single(
 
         centroid_xy, axis_xy, aspect_ratio = _mask_major_axis(crop)
 
-        # Degenerate near-round cells: major-axis segment, then one
-        # equidistant chord-midpoint refinement round.
+        # Degenerate near-round CONVEX cells: major-axis segment, then the
+        # equidistant chord-midpoint refinement. Non-convex (lobed/branched)
+        # masks should not be forced onto a straight axis.
         if aspect_ratio < float(params["degenerate_ar"]):
-            return _axis_segment_result(
-                crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
-                outline_global=outline,
-            )
+            solidity = _mask_solidity(crop)
+            if solidity >= float(params.get("degenerate_solidity_min", 0.85)):
+                return _axis_segment_result(
+                    crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
+                    outline_global=outline,
+                )
 
         outline_crop = np.asarray(outline, dtype=np.float64) - offset_xy
 
@@ -2400,16 +2425,21 @@ def _midline_single(
                     return candidate
             else:
                 guard_reason = "failed"
-            # Guard rejections are routed to the (now refined) degenerate
-            # spine instead of the default spline: the degenerate result is
-            # stable and, after the chord-midpoint pass, follows the cell.
-            deg = _axis_segment_result(
-                crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
-                outline_global=outline,
-            )
-            deg["midline_quality"] = "degenerate"
-            deg["equidistant_guard"] = guard_reason
-            return deg
+            # Convex-ish masks: guard rejections are routed to the refined
+            # degenerate spine (stable, follows the cell). Non-convex masks
+            # must not be forced onto a straight axis: keep the equidistant
+            # candidate even though the strict guard rejected it.
+            solidity = _mask_solidity(crop)
+            if solidity >= float(params.get("degenerate_solidity_min", 0.85)):
+                deg = _axis_segment_result(
+                    crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
+                    outline_global=outline,
+                )
+                deg["midline_quality"] = "degenerate"
+                deg["equidistant_guard"] = guard_reason
+                return deg
+            if candidate is not None:
+                return candidate
 
         # Step 1 — pole-first initialization.
         pole1_xy, pole2_xy = _find_pole_pair(
