@@ -144,6 +144,7 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_outline_smooth": 45,
     "equidistant_final_smooth": 20,
     "equidistant_n_points": 128,
+    "equidistant_guard": True,  # False = raw equidistant (no fallback, for evaluation)
     "energy_data_weight": 1.0,
     "energy_curv_weight": 10.0,
     "energy_spacing_weight": 50.0,
@@ -1789,7 +1790,10 @@ def _midline_single(
             )
             if candidate is not None and candidate.get("midline_quality") == "degenerate":
                 return candidate
-            if candidate is not None and _equidistant_guard(candidate, offset_xy, aspect_ratio):
+            guard_on = bool(params.get("equidistant_guard", True))
+            if candidate is not None and (
+                not guard_on or _equidistant_guard(candidate, offset_xy, aspect_ratio)
+            ):
                 return candidate
             equidistant_fallback = True
 
