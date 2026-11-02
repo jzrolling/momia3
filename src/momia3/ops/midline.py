@@ -2658,16 +2658,22 @@ def _midline_single(
             return _empty_result(params, "failed")
 
         centroid_xy, axis_xy, aspect_ratio = _mask_major_axis(crop)
+        outline_local = np.asarray(outline, dtype=np.float64) - offset_xy
         solidity = _mask_solidity(crop)
+        ellipse_dev = _ellipse_deviation(
+            crop, outline_local, centroid_xy, axis_xy, aspect_ratio
+        )
 
-        # Degenerate spine only for near-round, convex cells. Short rods that
-        # merely *look* simple still need the skeleton/equidistant geometry:
-        # the straight major axis is visibly off for gently curved cells
-        # (streptomyces lab 9: 65 px rod, straight spine cut the bend).
-        if (
-            aspect_ratio < float(params["degenerate_ar"])
-            and solidity >= float(params.get("degenerate_solidity_min", 0.85))
-        ):
+        # Curvature-aware simple-shape gate (as of 4a88696): convex masks with
+        # low ellipse residual and low chord-midpoint sagitta take the cheap
+        # degenerate spine; everything else pays for the skeleton.
+        sagitta_ratio = _chord_sagitta_ratio(outline_local, centroid_xy, axis_xy)
+        simple_shape = (
+            solidity >= float(params.get("degenerate_simple_solidity", 0.88))
+            and ellipse_dev <= float(params.get("degenerate_simple_ellipse_dev", 0.12))
+            and sagitta_ratio <= float(params.get("degenerate_simple_sagitta", 0.08))
+        )
+        if simple_shape or aspect_ratio < 1.25:
             return _axis_segment_result(
                 crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
                 outline_global=outline,
