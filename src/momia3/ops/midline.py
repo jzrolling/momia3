@@ -145,6 +145,7 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_final_smooth": 20,
     "equidistant_n_points": 128,
     "equidistant_guard": True,  # False = raw equidistant (no fallback, for evaluation)
+    "equidistant_branch_min_px": 4.0,  # side branches shorter than this are dropped
     "energy_data_weight": 1.0,
     "energy_curv_weight": 10.0,
     "energy_spacing_weight": 50.0,
@@ -1561,6 +1562,131 @@ def _skeleton_longest_path(mask: np.ndarray) -> np.ndarray | None:
     return np.array([[xs[i], ys[i]] for i in path], dtype=np.float64)
 
 
+def _skeleton_graph_data(mask: np.ndarray):
+    """Skeleton pixel adjacency graph (8-connectivity) and (x, y) points."""
+    skel = morphology.skeletonize(np.asarray(mask, dtype=bool))
+    ys, xs = np.nonzero(skel)
+    if ys.size < 5:
+        return None
+    node = {(int(y), int(x)): i for i, (y, x) in enumerate(zip(ys, xs))}
+    graph: dict[int, dict[int, float]] = {}
+    for (y, x), i in node.items():
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                j = node.get((y + dy, x + dx))
+                if j is not None:
+                    w = float(np.hypot(dy, dx))
+                    graph.setdefault(i, {})[j] = w
+                    graph.setdefault(j, {})[i] = w
+    if len(graph) < 5:
+        return None
+    pts = np.array([[xs[i], ys[i]] for i in range(len(xs))], dtype=np.float64)
+    degree = {k: len(v) for k, v in graph.items()}
+    return graph, pts, degree
+
+
+def _graph_dijkstra(graph, sources, want_prev: bool = False):
+    """Multi-source Dijkstra over the skeleton graph."""
+    import heapq
+
+    dist = {s: 0.0 for s in sources}
+    prev: dict[int, int] = {s: -1 for s in sources}
+    pq = [(0.0, s) for s in sources]
+    heapq.heapify(pq)
+    while pq:
+        dd, u = heapq.heappop(pq)
+        if dd > dist.get(u, 1e18):
+            continue
+        for v, w in graph.get(u, {}).items():
+            nd = dd + w
+            if nd < dist.get(v, 1e18):
+                dist[v] = nd
+                if want_prev:
+                    prev[v] = u
+                heapq.heappush(pq, (nd, v))
+    return dist, prev
+
+
+def _graph_reconstruct(prev: Mapping[int, int], dst: int) -> list[int]:
+    path = []
+    u = dst
+    while u != -1:
+        path.append(u)
+        u = int(prev.get(u, -1))
+    path.reverse()
+    return path
+
+
+def _skeleton_trunk_and_branches(
+    work: np.ndarray,
+    pole_pair_crop: tuple[np.ndarray, np.ndarray],
+    min_branch_px: float,
+) -> tuple[np.ndarray | None, list[np.ndarray]]:
+    """Pole-to-pole trunk plus hanging side branches.
+
+    The trunk is the skeleton path between the skeleton nodes nearest the
+    outline pole pair (momia3 prior); if that path is much shorter than the
+    longest skeleton path (ambiguous poles), fall back to the longest path.
+    Branches are skeleton arms hanging off the trunk, ordered attachment -> tip.
+    """
+    data = _skeleton_graph_data(work)
+    if data is None:
+        return None, []
+    graph, pts, degree = data
+    ends = [k for k, d in degree.items() if d == 1]
+    if len(ends) < 2:
+        return None, []
+    # longest path (fallback reference)
+    d0, _ = _graph_dijkstra(graph, [ends[0]])
+    far = max(d0, key=d0.get)
+    dist, prev = _graph_dijkstra(graph, [far], want_prev=True)
+    tip = max(dist, key=dist.get)
+    longest = pts[_graph_reconstruct(prev, tip)]
+    longest_len = float(dist[tip])
+    # trunk between nearest skeleton nodes to the outline poles
+    def _nearest(pt):
+        dd = np.linalg.norm(pts - np.asarray(pt, dtype=np.float64)[None, :], axis=1)
+        i = int(np.argmin(dd))
+        return i, float(dd[i])
+
+    n1, e1 = _nearest(pole_pair_crop[0])
+    n2, e2 = _nearest(pole_pair_crop[1])
+    trunk = None
+    trunk_ids: list[int] = []
+    trunk_len = 0.0
+    if n1 != n2:
+        dist, prev = _graph_dijkstra(graph, [n1], want_prev=True)
+        if n2 in dist:
+            trunk_ids = _graph_reconstruct(prev, n2)
+            trunk = pts[trunk_ids]
+            trunk_len = float(dist[n2])
+    if trunk is None or len(trunk) < 3 or trunk_len < 0.7 * longest_len:
+        trunk = longest
+        trunk_ids = _graph_reconstruct(prev, tip) if False else []
+        trunk_len = longest_len
+        # longest path node ids are reconstructed below from its points
+        trunk_ids = []
+        for pxy in longest:
+            d = np.linalg.norm(pts - pxy[None, :], axis=1)
+            trunk_ids.append(int(np.argmin(d)))
+    trunk_nodes = set(trunk_ids)
+    # branches: distance to nearest trunk node + shortest path
+    dist, prev = _graph_dijkstra(graph, list(trunk_nodes), want_prev=True)
+    branches: list[np.ndarray] = []
+    for end in ends:
+        if end in trunk_nodes:
+            continue
+        if end not in dist or dist[end] < min_branch_px:
+            continue
+        path = _graph_reconstruct(prev, end)
+        if len(path) < 3:
+            continue
+        branches.append(pts[path])
+    return trunk, branches
+
+
 def _ray_outline_hit(outline: np.ndarray, origin: np.ndarray, direction: np.ndarray) -> np.ndarray:
     """Nearest sub-pixel intersection of a ray with a closed polyline."""
     ring = np.asarray(outline, dtype=np.float64)
@@ -1675,9 +1801,17 @@ def _equidistant_result(
     work = crop.astype(np.float32)
     if sigma > 0:
         work = ndimage.gaussian_filter(work, sigma) > 0.5
-    axis = _skeleton_longest_path(work)
+    centroid_xy, axis_xy, _ar = _mask_major_axis(crop)
+    pole_pair = _find_pole_pair(
+        outline_crop,
+        axis_xy,
+        int(params["pole_max_candidates"]),
+        float(params["pole_axis_tol_deg"]),
+    )
+    axis, side_branches = _skeleton_trunk_and_branches(
+        work, pole_pair, float(params.get("equidistant_branch_min_px", 4.0))
+    )
     if axis is None or len(axis) < 8:
-        centroid_xy, axis_xy, _ = _mask_major_axis(crop)
         return _axis_segment_result(crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns)
     axis = _resample_arclength(axis, int(params["equidistant_axis_points"]))
     axis = _taubin_open_fixed(axis, int(params["equidistant_axis_smooth"]))
@@ -1728,14 +1862,16 @@ def _equidistant_result(
     length_px = _arc_length(main_global)
     pole_dist = float(np.hypot(*(tips[1] - tips[0])))
     _, max_curv = _curvature_stats(main_global)
+    branches_global = [np.asarray(b, dtype=np.float64) + offset_xy for b in side_branches]
     return {
-        "midline": [main_global],
+        "midline": [main_global, *branches_global],
         "width_profile": width_profile,
         "pole1": tips[0] + offset_xy,
         "pole2": tips[1] + offset_xy,
         "length_um": length_px * float(pixel_microns),
         "sinuosity": float(length_px / pole_dist) if pole_dist > 0 else 1.0,
-        "branched": 0.0,
+        "branched": 1.0 if branches_global else 0.0,
+        "branch_lengths": [float(_arc_length(b)) for b in branches_global],
         "midline_quality": "equidistant",
         "n_iter": 0,
         "final_residual": float("nan"),
