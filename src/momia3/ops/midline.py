@@ -55,6 +55,7 @@ import pyarrow as pa
 from numba import njit
 from scipy import interpolate, ndimage
 from scipy.spatial import cKDTree
+from skimage import measure as skmeasure
 from skimage import morphology
 from skimage.graph import route_through_array
 
@@ -149,6 +150,7 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_branch_min_um": 0.2,  # momia2 default; effective min = max(px, um/pixel_microns)
     "equidistant_fill_holes": True,  # close interior holes before skeletonizing
     "equidistant_opening_radius": 1.0,  # binary opening radius (px) to strip mask rags
+    "equidistant_outline_from_clean_mask": True,  # draw outline on the cleaned mask
     "energy_data_weight": 1.0,
     "energy_curv_weight": 10.0,
     "energy_spacing_weight": 50.0,
@@ -1565,6 +1567,32 @@ def _skeleton_longest_path(mask: np.ndarray) -> np.ndarray | None:
     return np.array([[xs[i], ys[i]] for i in path], dtype=np.float64)
 
 
+def _project_to_polyline(point: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Closest point on a closed polyline."""
+    a = np.asarray(poly, dtype=np.float64)
+    b = np.roll(a, -1, axis=0)
+    ab = b - a
+    ap = np.asarray(point, dtype=np.float64)[None, :] - a
+    denom = np.sum(ab * ab, axis=1) + 1e-12
+    t = np.clip(np.sum(ap * ab, axis=1) / denom, 0.0, 1.0)
+    proj = a + t[:, None] * ab
+    d = np.sum((proj - np.asarray(point, dtype=np.float64)[None, :]) ** 2, axis=1)
+    return proj[int(np.argmin(d))]
+
+
+def _mask_contour_xy(mask: np.ndarray) -> np.ndarray | None:
+    """Sub-pixel outer contour of a binary mask as (x, y) points."""
+    contours = skmeasure.find_contours(np.asarray(mask, dtype=np.float64), 0.5)
+    if not contours:
+        return None
+    c = max(contours, key=len)
+    if len(c) < 8:
+        return None
+    if np.allclose(c[0], c[-1]):
+        c = c[:-1]
+    return np.stack([c[:, 1], c[:, 0]], axis=1)
+
+
 def _skeleton_graph_data(mask: np.ndarray):
     """Skeleton pixel adjacency graph (8-connectivity) and (x, y) points."""
     skel = morphology.skeletonize(np.asarray(mask, dtype=bool))
@@ -1789,6 +1817,7 @@ def _refine_branch(
     outline_s: np.ndarray,
     min_len_px: float,
     n_points: int = 64,
+    snap_poly: np.ndarray | None = None,
 ) -> np.ndarray | None:
     """Smooth a skeleton branch and extend its tip to the smoothed contour.
 
@@ -1811,6 +1840,8 @@ def _refine_branch(
     tip = _ray_outline_hit(outline_s, p[-1], tangent)
     if tip is None or float(np.hypot(*(tip - p[-1]))) < 0.5:
         tip = p[-1]
+    if snap_poly is not None:
+        tip = _project_to_polyline(tip, snap_poly)
     q = np.vstack([p, tip[None, :]])
     q = _resample_arclength(q, n)
     smooth_s = float(np.clip(0.02 * _arc_length(q), 2.0, 30.0))
@@ -1841,11 +1872,16 @@ def _equidistant_result(
     work = np.asarray(crop, dtype=bool)
     if sigma > 0:
         work = ndimage.gaussian_filter(work.astype(np.float32), sigma) > 0.5
+    cleaned = False
     if bool(params.get("equidistant_fill_holes", True)):
-        work = ndimage.binary_fill_holes(work)
+        filled = ndimage.binary_fill_holes(work)
+        cleaned = cleaned or bool(np.any(filled != work))
+        work = filled
     opening_r = float(params.get("equidistant_opening_radius", 0.0) or 0.0)
     if opening_r > 0:
-        work = ndimage.binary_opening(work, structure=morphology.disk(opening_r))
+        opened = ndimage.binary_opening(work, structure=morphology.disk(opening_r))
+        cleaned = cleaned or bool(np.any(opened != work))
+        work = opened
     centroid_xy, axis_xy, _ar = _mask_major_axis(crop)
     pole_pair = _find_pole_pair(
         outline_crop,
@@ -1864,10 +1900,19 @@ def _equidistant_result(
     axis = _taubin_open_fixed(axis, int(params["equidistant_axis_smooth"]))
     axis = _resample_arclength(axis, int(params["equidistant_axis_points"]))
 
-    outline_s = _resample_closed(outline_crop, int(params["equidistant_outline_points"]))
+    outline_src = np.asarray(outline_crop, dtype=np.float64)
+    clean_contour = None
+    if (
+        cleaned
+        and bool(params.get("equidistant_outline_from_clean_mask", True))
+    ):
+        clean_contour = _mask_contour_xy(work)
+        if clean_contour is not None:
+            outline_src = clean_contour
+    outline_s = _resample_closed(outline_src, int(params["equidistant_outline_points"]))
     outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
 
-    edt = ndimage.distance_transform_edt(crop)
+    edt = ndimage.distance_transform_edt(work)
     ax_cols = np.clip(np.round(axis[:, 0]).astype(int), 0, crop.shape[1] - 1)
     ax_rows = np.clip(np.round(axis[:, 1]).astype(int), 0, crop.shape[0] - 1)
     width = 2.0 * float(np.median(edt[ax_rows, ax_cols]))
@@ -1883,6 +1928,8 @@ def _equidistant_result(
         if float(np.hypot(tangent[0], tangent[1])) <= 1e-9:
             tangent = np.array([1.0, 0.0])
         tip = _ray_outline_hit(outline_s, axis[k], tangent)
+        if clean_contour is not None:
+            tip = _project_to_polyline(tip, clean_contour)
         c1, c2 = _arc_walk_closed(outline_s, tip, base_offset)
         tips.append(tip)
         bases.append(0.5 * (c1 + c2))
@@ -1911,7 +1958,7 @@ def _equidistant_result(
     _, max_curv = _curvature_stats(main_global)
     branches_global = []
     for b_raw in side_branches:
-        b_ref = _refine_branch(b_raw, outline_s, branch_min_px)
+        b_ref = _refine_branch(b_raw, outline_s, branch_min_px, snap_poly=clean_contour)
         if b_ref is not None:
             # snap the attachment exactly onto the final trunk
             dd = np.sum((main[:, None, :] - b_ref[0][None, :]) ** 2, axis=2)
