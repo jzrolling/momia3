@@ -141,7 +141,9 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_base_factor": 0.8,
     "equidistant_axis_points": 128,
     "equidistant_axis_smooth": 60,
-    "equidistant_outline_points": 200,
+    "equidistant_outline_points": None,  # None: ~perimeter / equidistant_outline_downsample
+    "equidistant_outline_downsample": 2.0,  # px spacing of the outline ring
+    "outline_densify_spacing": 1.0,  # internal outline resample for pole/width search (px); 0 = off
     "equidistant_outline_smooth": 45,
     "equidistant_final_smooth": 20,
     "equidistant_n_points": 128,
@@ -1597,16 +1599,7 @@ def _smoothed_mask_contour(mask: np.ndarray) -> np.ndarray | None:
         )
         contour = outlines.get(1)
         if contour is not None and len(contour) > 8:
-            contour = np.asarray(contour, dtype=np.float64)
-            # Second pass: the first spline is evaluated at the natural point
-            # count, so the pixel staircase survives. Downsample to ~2 px
-            # spacing, then fit a stiffer spline and evaluate at 200 points.
-            ring = np.vstack([contour, contour[:1]])
-            perimeter = float(np.sum(np.hypot(np.diff(ring[:, 0]), np.diff(ring[:, 1]))))
-            n_down = int(np.clip(round(perimeter / 2.0), 24, 200))
-            down = _resample_closed(contour, n_down)
-            smooth = float(np.clip(0.05 * n_down, 2.0, 12.0))
-            return _smooth_closed(down, smooth, 200)
+            return np.asarray(contour, dtype=np.float64)
     except Exception as exc:  # pragma: no cover - fall back to raw contour
         logger.debug("smoothed outline extraction failed (%s)", exc)
     return _mask_contour_xy(mask)
@@ -1860,7 +1853,7 @@ def _refine_branch(
     raw = np.asarray(branch_local, dtype=np.float64)
     if len(raw) < 3 or _arc_length(raw) < max(float(min_len_px), 1.0):
         return None
-    n = int(np.clip(round(_arc_length(raw) * 2.0), 16, n_points))
+    n = int(np.clip(round(_arc_length(raw) / 2.0), 12, n_points))
     p = _resample_arclength(raw, n)
     p = _taubin_open_fixed(p, 30)
     p = _resample_arclength(p, n)
@@ -1941,7 +1934,15 @@ def _equidistant_result(
         clean_contour = _smoothed_mask_contour(work)
         if clean_contour is not None:
             outline_src = clean_contour
-    outline_s = _resample_closed(outline_src, int(params["equidistant_outline_points"]))
+    n_outline = params.get("equidistant_outline_points")
+    if n_outline is None:
+        edge = np.vstack([outline_src, outline_src[:1]])
+        perimeter = float(np.sum(np.hypot(np.diff(edge[:, 0]), np.diff(edge[:, 1]))))
+        n_outline = max(
+            16,
+            int(round(perimeter / float(params.get("equidistant_outline_downsample", 2.0)))),
+        )
+    outline_s = _resample_closed(outline_src, int(n_outline))
     outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
 
     edt = ndimage.distance_transform_edt(work)
@@ -2174,6 +2175,19 @@ def _midline_single(
         return _empty_result(params, "failed")
 
 
+def _densify_outline(ring: np.ndarray, target_spacing: float) -> np.ndarray:
+    """Resample a closed outline to ~target_spacing px vertex spacing."""
+    pts = np.asarray(ring, dtype=np.float64)
+    if len(pts) < 3 or target_spacing <= 0:
+        return pts
+    closed = np.vstack([pts, pts[:1]])
+    edges = np.hypot(np.diff(closed[:, 0]), np.diff(closed[:, 1]))
+    if float(np.median(edges)) <= target_spacing * 1.2:
+        return pts
+    n = max(len(pts), int(round(float(edges.sum()) / target_spacing)))
+    return _resample_closed(pts, n)
+
+
 def extract_midlines(
     labels_2d: np.ndarray,
     outlines: Mapping[int, np.ndarray] | None = None,
@@ -2232,6 +2246,15 @@ def extract_midlines(
         from momia3.ops.outline import extract_outlines
 
         outlines = extract_outlines(labels_2d, None, {"n_points": None})
+    # Global outlines are pixel-equidistant at ~2 px spacing; densify them to
+    # ~1 px spacing here so pole search, geodesic endpoints and the width
+    # profile keep sub-pixel accuracy (the returned outlines are unaffected).
+    densify = float(p.get("outline_densify_spacing", 0.0) or 0.0)
+    if densify > 0:
+        outlines = {
+            lab: _densify_outline(ring, densify) if ring is not None else ring
+            for lab, ring in outlines.items()
+        }
     results: dict[int, dict[str, Any]] = {}
     pad = int(p["pad"])
     img_h, img_w = labels.shape

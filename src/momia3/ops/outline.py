@@ -60,7 +60,12 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "simplify": False,
     "tolerance": 0.75,
     "smooth": 1.0,
-    "n_points": 100,
+    # Pixel-equidistant outline sampling: output ~perimeter / downsample_factor
+    # points, and fit the spline with s = smooth_scale * n_down. Evaluating the
+    # spline at the natural marching-squares count keeps the pixel staircase.
+    "n_points": None,
+    "downsample_factor": 2.0,
+    "smooth_scale": 0.03,
     "active_contour": False,
     "alpha": 0.015,
     "beta": 10.0,
@@ -196,7 +201,28 @@ def _outline_single(
 
     # (row, col) -> (x, y), crop coordinates
     ring_xy = np.column_stack([ring_rc[:, 1], ring_rc[:, 0]])
-    ring_xy = _smooth_closed(ring_xy, float(params["smooth"]), params["n_points"])
+    # Pixel-equidistant anti-staircase smoothing: downsample the marching-
+    # squares ring to ~downsample_factor px spacing, then fit a stiffer
+    # closed B-spline (s proportional to the point count).
+    factor = float(params.get("downsample_factor", 2.0) or 0.0)
+    if factor > 0 and len(ring_xy) > 8:
+        closed = np.vstack([ring_xy, ring_xy[:1]])
+        perimeter = float(
+            np.sum(np.hypot(np.diff(closed[:, 0]), np.diff(closed[:, 1])))
+        )
+        n_down = max(16, int(round(perimeter / factor)))
+        base_ring = _resample_closed_arclength(ring_xy, n_down)
+    else:
+        base_ring = ring_xy
+        n_down = len(ring_xy)
+    n_out = n_down if params["n_points"] is None else int(params["n_points"])
+    smooth_scale = params.get("smooth_scale")
+    smooth = (
+        float(smooth_scale) * n_down
+        if smooth_scale is not None
+        else float(params["smooth"])
+    )
+    ring_xy = _smooth_closed(base_ring, smooth, n_out)
 
     if bool(params["active_contour"]) and intensity_crop is not None:
         icrop = np.asarray(intensity_crop, dtype=np.float64)
@@ -239,9 +265,12 @@ def extract_outlines(
     params : mapping, optional
         ``sigma`` (mask smoothing, px; default 1.0 — a real parameter,
         unlike momia2 which ignored it), ``level`` (marching-squares
-        level, default 0.5), ``simplify``/``tolerance`` (RDP), ``smooth``
-        (B-spline smoothing factor, default 1.0), ``n_points`` (uniform
-        resample count, default 100; None keeps the natural count),
+        level, default 0.5), ``simplify``/``tolerance`` (RDP),
+        ``downsample_factor`` (px spacing of the working ring, default 2.0),
+        ``smooth_scale`` (B-spline s = smooth_scale * n_down, default 0.05),
+        ``smooth`` (absolute B-spline smoothing factor, used only when
+        ``smooth_scale`` is None), ``n_points`` (output count; None =
+        ~perimeter / downsample_factor),
         ``active_contour``/``alpha``/``beta``/``gamma`` (snake
         refinement), ``pad`` (bbox padding, px).
 
