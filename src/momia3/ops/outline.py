@@ -66,6 +66,13 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "n_points": None,
     "downsample_factor": 2.0,
     "smooth_scale": 0.03,
+    # Opt-in constriction refinement: after the base B-spline smoothing, pull
+    # the outline back toward the raw marching-squares contour for 1-2 rounds,
+    # with a light re-smoothing each round. Restores septum neck depth that the
+    # global smoothing rounds away, while keeping the outline smooth.
+    "constriction_iters": 0,  # 0 = off (default, backwards compatible)
+    "constriction_strength": 0.6,  # pull fraction toward the raw contour per round
+    "constriction_smooth_scale": 0.01,  # light spline stiffness per round (x n_out)
     "active_contour": False,
     "alpha": 0.015,
     "beta": 10.0,
@@ -201,6 +208,7 @@ def _outline_single(
 
     # (row, col) -> (x, y), crop coordinates
     ring_xy = np.column_stack([ring_rc[:, 1], ring_rc[:, 0]])
+    raw_contour = ring_xy  # pre-smoothing marching-squares ring
     # Pixel-equidistant anti-staircase smoothing: downsample the marching-
     # squares ring to ~downsample_factor px spacing, then fit a stiffer
     # closed B-spline (s proportional to the point count).
@@ -223,6 +231,49 @@ def _outline_single(
         else float(params["smooth"])
     )
     ring_xy = _smooth_closed(base_ring, smooth, n_out)
+
+    # Opt-in: restore septum constriction lost to the global spline smoothing.
+    # Snap toward the raw marching-squares ring, then re-smooth lightly; 1-2
+    # rounds deepen the necks without bringing back the pixel staircase.
+    constriction_iters = int(params.get("constriction_iters", 0) or 0)
+    if constriction_iters > 0 and len(ring_xy) > 16 and len(raw_contour) > 8:
+        # Target the *un-Gaussian-smoothed* mask contour: sigma=1 blurs thin
+        # necks, so pulling toward the sigma=1 ring barely changes anything.
+        # On the raw binary mask the septum waist is sharper.
+        raw_target = raw_contour
+        try:
+            raw_contours = measure.find_contours(work, level=0.5)
+            if raw_contours:
+                raw_ring_rc = max(raw_contours, key=len)
+                raw_target = np.column_stack([raw_ring_rc[:, 1], raw_ring_rc[:, 0]])
+        except Exception as exc:  # pragma: no cover - fall back to smoothed ring
+            logger.debug("raw mask contour failed (%s)", exc)
+        raw_closed = np.vstack([raw_target, raw_target[:1]])
+        raw_seg = np.hypot(np.diff(raw_closed[:, 0]), np.diff(raw_closed[:, 1]))
+        raw_cum = np.concatenate([[0.0], np.cumsum(raw_seg)])
+        raw_total = float(raw_cum[-1])
+        strength = float(np.clip(params.get("constriction_strength", 0.6), 0.0, 1.0))
+        light_smooth = float(params.get("constriction_smooth_scale", 0.01)) * n_out
+        # Arc-length correspondence (not nearest-point): ordering along the
+        # raw ring is preserved, so the pull cannot jump across a thin neck.
+        start = 0
+        if raw_total > 1e-9:
+            from scipy.spatial import cKDTree as _cKDTree
+
+            _, nearest = _cKDTree(raw_closed).query(ring_xy[0])
+            start = int(nearest)
+        for _ in range(constriction_iters):
+            ring_closed = np.vstack([ring_xy, ring_xy[:1]])
+            ring_seg = np.hypot(np.diff(ring_closed[:, 0]), np.diff(ring_closed[:, 1]))
+            ring_cum = np.concatenate([[0.0], np.cumsum(ring_seg)])
+            frac = ring_cum[:-1] / max(float(ring_cum[-1]), 1e-9)
+            target_s = (raw_cum[start] + frac * raw_total) % max(raw_total, 1e-9)
+            target = np.column_stack([
+                np.interp(target_s, raw_cum, raw_closed[:, 0]),
+                np.interp(target_s, raw_cum, raw_closed[:, 1]),
+            ])
+            ring_xy = ring_xy + strength * (target - ring_xy)
+            ring_xy = _smooth_closed(ring_xy, max(light_smooth, 1.0), n_out)
 
     if bool(params["active_contour"]) and intensity_crop is not None:
         icrop = np.asarray(intensity_crop, dtype=np.float64)
