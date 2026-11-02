@@ -129,6 +129,10 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "septum_dip_frac": 0.25,
     # degenerate (near-round) cells
     "degenerate_ar": 1.4,
+    # end-point handling / resampling (opt-in; defaults keep legacy behavior)
+    "pole_endpoint": "extended",  # "extended" (legacy) | "initial" (outline pole pair)
+    "n_points_auto": False,  # True: n = arc_length / n_points_target_spacing_px
+    "n_points_target_spacing_px": 2.0,
     # non-parametric dense-point curve refinement ("energy" method)
     "midline_method": "spline",  # "spline" (default) | "energy"
     "energy_data_weight": 1.0,
@@ -1186,10 +1190,15 @@ def _assemble_result(
     final_residual: float,
     side_branches: list[np.ndarray] | None = None,
     geo_xy: np.ndarray | None = None,
+    initial_poles: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Septum-aware poles + final resample + width profile + diagnostics."""
     knn = int(params["knn"])
     n_points = int(params["n_points"])
+    if bool(params.get("n_points_auto", False)):
+        est_len = float(_arc_length(np.asarray(curve_xy, dtype=np.float64)))
+        spacing = max(float(params["n_points_target_spacing_px"]), 0.5)
+        n_points = int(np.clip(round(est_len / spacing), 24, 1024))
     curve = _resample_arclength(np.asarray(curve_xy, dtype=np.float64), n_points)
 
     # Septum-aware tangent choice: width dip in an end third -> trust the
@@ -1204,6 +1213,12 @@ def _assemble_result(
             src = _resample_arclength(np.asarray(geo_xy, dtype=np.float64), n_points)
         tangents.append(_end_tangent(src, end, float(params["end_window_frac"])))
     pole1, pole2 = _extend_poles(curve, (tangents[0], tangents[1]), index, knn)
+    if initial_poles is not None and str(params.get("pole_endpoint", "extended")) == "initial":
+        q1, q2 = (np.asarray(v, dtype=np.float64) for v in initial_poles)
+        # keep the assignment consistent with the curve end order
+        d_same = float(np.hypot(*(q1 - curve[0])) + np.hypot(*(q2 - curve[-1])))
+        d_swap = float(np.hypot(*(q1 - curve[-1])) + np.hypot(*(q2 - curve[0])))
+        pole1, pole2 = (q1, q2) if d_same <= d_swap else (q2, q1)
 
     extended = np.vstack([pole1[None, :], curve, pole2[None, :]])
     main_resampled = _resample_arclength(extended, n_points)
@@ -1540,6 +1555,7 @@ def _midline_single(
             final_residual,
             side_branches,
             geo_smooth,
+            initial_poles=(pole1_xy + offset_xy, pole2_xy + offset_xy),
         )
         if energy_diag is not None:
             result["energy_data"] = float(energy_diag[0])
