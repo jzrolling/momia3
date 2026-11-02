@@ -1580,6 +1580,29 @@ def _project_to_polyline(point: np.ndarray, poly: np.ndarray) -> np.ndarray:
     return proj[int(np.argmin(d))]
 
 
+def _smoothed_mask_contour(mask: np.ndarray) -> np.ndarray | None:
+    """Outline of a binary mask with the standard momia3 B-spline smoothing.
+
+    The mask is already cleaned by the caller, so the extra Gaussian used by
+    ``extract_outlines`` is disabled; only the spline smoothing (``smooth``)
+    is applied, which removes the pixel staircase of ``find_contours``.
+    """
+    try:
+        from momia3.ops.outline import extract_outlines
+
+        outlines = extract_outlines(
+            np.asarray(mask, dtype=np.int32),
+            None,
+            {"n_points": None},
+        )
+        contour = outlines.get(1)
+        if contour is not None and len(contour) > 8:
+            return np.asarray(contour, dtype=np.float64)
+    except Exception as exc:  # pragma: no cover - fall back to raw contour
+        logger.debug("smoothed outline extraction failed (%s)", exc)
+    return _mask_contour_xy(mask)
+
+
 def _mask_contour_xy(mask: np.ndarray) -> np.ndarray | None:
     """Sub-pixel outer contour of a binary mask as (x, y) points."""
     contours = skmeasure.find_contours(np.asarray(mask, dtype=np.float64), 0.5)
@@ -1906,7 +1929,7 @@ def _equidistant_result(
         cleaned
         and bool(params.get("equidistant_outline_from_clean_mask", True))
     ):
-        clean_contour = _mask_contour_xy(work)
+        clean_contour = _smoothed_mask_contour(work)
         if clean_contour is not None:
             outline_src = clean_contour
     outline_s = _resample_closed(outline_src, int(params["equidistant_outline_points"]))
