@@ -1392,33 +1392,31 @@ def _chord_sagitta_ratio(
     a = ring
     b = np.roll(ring, -1, axis=0)
     e = b - a
-    devs: list[float] = []
-    widths: list[float] = []
-    for tv in ts:
-        p0 = c + tv * axis
-        hits = []
-        for dvec in (perp, -perp):
-            den = dvec[0] * (-e[:, 1]) - (-e[:, 0]) * dvec[1]
-            ok = np.abs(den) > 1e-12
-            if not ok.any():
-                hits.append(None)
-                break
-            rhs = a - p0[None, :]
-            tpar = (rhs[:, 0] * (-e[:, 1]) - (-e[:, 0]) * rhs[:, 1]) / np.where(ok, den, 1.0)
-            uu = (dvec[0] * rhs[:, 1] - dvec[1] * rhs[:, 0]) / np.where(ok, den, 1.0)
-            valid = ok & (uu >= -0.05) & (uu <= 1.05) & (tpar > 1e-6)
-            if not valid.any():
-                hits.append(None)
-                break
-            i = int(np.argmin(np.where(valid, tpar, np.inf)))
-            hits.append(p0 + tpar[i] * dvec)
-        if len(hits) != 2 or hits[0] is None or hits[1] is None:
-            continue
-        mid = 0.5 * (hits[0] + hits[1])
-        devs.append(abs(float((mid - p0) @ perp)))
-        widths.append(float(np.linalg.norm(hits[0] - hits[1])))
-    if len(devs) < 3:
+    p0 = c[None, :] + ts[:, None] * axis[None, :]          # (K, 2)
+    hits_fwd = np.full((len(ts), 2), np.nan)
+    hits_bwd = np.full((len(ts), 2), np.nan)
+    for slot, dvec in ((0, perp), (1, -perp)):
+        den = dvec[0] * (-e[:, 1]) - (-e[:, 0]) * dvec[1]    # (E,)
+        ok = np.abs(den) > 1e-12
+        rhs = a[None, :, :] - p0[:, None, :]                # (K, E, 2)
+        tpar = (rhs[..., 0] * (-e[None, :, 1]) - (-e[None, :, 0]) * rhs[..., 1]) / np.where(ok, den, 1.0)[None, :]
+        uu = (dvec[0] * rhs[..., 1] - dvec[1] * rhs[..., 0]) / np.where(ok, den, 1.0)[None, :]
+        valid = ok[None, :] & (uu >= -0.05) & (uu <= 1.05) & (tpar > 1e-6)
+        tpar = np.where(valid, tpar, np.inf)
+        sel = np.argmin(tpar, axis=1)
+        tval = tpar[np.arange(len(ts)), sel]
+        hit = p0 + tval[:, None] * np.asarray(dvec, dtype=np.float64)[None, :]
+        hit[~np.isfinite(tval)] = np.nan
+        if slot == 0:
+            hits_fwd = hit
+        else:
+            hits_bwd = hit
+    good = np.isfinite(hits_fwd[:, 0]) & np.isfinite(hits_bwd[:, 0])
+    if int(np.count_nonzero(good)) < 3:
         return 1.0
+    mid = 0.5 * (hits_fwd[good] + hits_bwd[good])
+    devs = np.abs((mid - p0[good]) @ perp)
+    widths = np.linalg.norm(hits_fwd[good] - hits_bwd[good], axis=1)
     width = float(np.median(widths))
     if width <= 1e-6:
         return 1.0
@@ -1753,10 +1751,11 @@ def _taubin_closed(points: np.ndarray, iters: int) -> np.ndarray:
     pnt = np.asarray(points, dtype=np.float64).copy()
     if len(pnt) < 3:
         return pnt
+    kernel = np.array([0.5, 0.0, 0.5])
     for _ in range(max(0, int(iters))):
-        lm = 0.5 * (np.roll(pnt, 1, axis=0) + np.roll(pnt, -1, axis=0))
+        lm = ndimage.convolve1d(pnt, kernel, axis=0, mode="wrap")
         pnt += 0.5 * (lm - pnt)
-        lm = 0.5 * (np.roll(pnt, 1, axis=0) + np.roll(pnt, -1, axis=0))
+        lm = ndimage.convolve1d(pnt, kernel, axis=0, mode="wrap")
         pnt += -0.53 * (lm - pnt)
     return pnt
 
@@ -1766,11 +1765,12 @@ def _taubin_open_fixed(points: np.ndarray, iters: int) -> np.ndarray:
     pnt = np.asarray(points, dtype=np.float64).copy()
     if len(pnt) < 3:
         return pnt
+    kernel = np.array([0.5, 0.0, 0.5])
     for _ in range(max(0, int(iters))):
-        lm = 0.5 * (pnt[:-2] + pnt[2:])
-        pnt[1:-1] += 0.5 * (lm - pnt[1:-1])
-        lm = 0.5 * (pnt[:-2] + pnt[2:])
-        pnt[1:-1] += -0.53 * (lm - pnt[1:-1])
+        lm = ndimage.convolve1d(pnt, kernel, axis=0, mode="nearest")
+        pnt[1:-1] += 0.5 * (lm[1:-1] - pnt[1:-1])
+        lm = ndimage.convolve1d(pnt, kernel, axis=0, mode="nearest")
+        pnt[1:-1] += -0.53 * (lm[1:-1] - pnt[1:-1])
     return pnt
 
 
@@ -2079,19 +2079,24 @@ def _sdf_graph_from_outline(
     ys, xs = np.nonzero(skel)
     if ys.size < 5:
         return None
-    node = {(int(y), int(x)): i for i, (y, x) in enumerate(zip(ys, xs))}
-    graph: dict[int, dict[int, float]] = {}
+    n_nodes = int(ys.size)
+    ids = np.full((ny, nx), -1, dtype=np.int64)
+    ids[ys, xs] = np.arange(n_nodes, dtype=np.int64)
+    graph: dict[int, dict[int, float]] = {int(i): {} for i in range(n_nodes)}
     w = 1.0 / ss
-    for (y, x), i in node.items():
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                j = node.get((y + dy, x + dx))
-                if j is not None:
-                    wgt = float(np.hypot(dy, dx)) * w
-                    graph.setdefault(i, {})[j] = wgt
-                    graph.setdefault(j, {})[i] = wgt
+    # Four offsets cover all 8-connected undirected edges exactly once.
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        y0 = max(0, -dy); y1 = ny - max(0, dy)
+        x0 = max(0, -dx); x1 = nx - max(0, dx)
+        src = ids[y0:y1, x0:x1]
+        dst = ids[y0 + dy:y1 + dy, x0 + dx:x1 + dx]
+        m = (src >= 0) & (dst >= 0)
+        if not np.any(m):
+            continue
+        wgt = float(np.hypot(dy, dx)) * w
+        for i, j in zip(src[m].tolist(), dst[m].tolist()):
+            graph[i][j] = wgt
+            graph[j][i] = wgt
     degree = {k: len(v) for k, v in graph.items()}
     pts = np.column_stack([x0f + (xs + 0.5) * w, y0f + (ys + 0.5) * w])
     edge_a = ring
@@ -2326,6 +2331,7 @@ def _equidistant_result(
     pixel_microns: float,
     index: _OutlineIndex,
     knn: int,
+    solidity: float | None = None,
 ) -> dict[str, Any]:
     """MicrobeJ-style contour-cut midline (opt-in midline_method).
 
@@ -2443,13 +2449,8 @@ def _equidistant_result(
     outline_s = _resample_closed(outline_src, int(n_outline))
     outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
 
-    solidity = 1.0
-    try:
-        props = skmeasure.regionprops(np.asarray(crop, dtype=np.int32))
-        if props:
-            solidity = float(props[0].solidity)
-    except Exception as exc:  # pragma: no cover - solidity is advisory only
-        logger.debug("solidity computation failed (%s)", exc)
+    if solidity is None:
+        solidity = _mask_solidity(crop)
     if sdf_at is not None:
         width = 2.0 * float(np.median(sdf_at(axis)))
     else:
@@ -2687,7 +2688,8 @@ def _midline_single(
         suppress_branches = False
         if str(params.get("midline_method", "spline")) == "equidistant":
             candidate = _equidistant_result(
-                crop, offset_xy, outline_crop, params, pixel_microns, index, knn
+                crop, offset_xy, outline_crop, params, pixel_microns, index, knn,
+                solidity=solidity,
             )
             if candidate is not None and candidate.get("midline_quality") == "degenerate":
                 return candidate
