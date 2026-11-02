@@ -2117,6 +2117,21 @@ def _midline_single(
                     return candidate
             else:
                 guard_reason = "failed"
+            # Short/round (high-solidity) cells are better served by the
+            # straight major-axis segment than by the default spline, which
+            # can bend along chain septa or mask bumps. Route them to the
+            # axis result directly; no side branches either.
+            if (
+                guard_reason == "short"
+                and candidate is not None
+                and float(candidate.get("equidistant_solidity", 0.0)) >= 0.85
+            ):
+                axis_res = _axis_segment_result(
+                    crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns
+                )
+                axis_res["midline_quality"] = "equidistant_fallback"
+                axis_res["equidistant_guard"] = "short_axis"
+                return axis_res
             equidistant_fallback = True
             suppress_branches = guard_reason == "chord"
 
