@@ -151,6 +151,9 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_presmooth_sigma": 1.0,
     "equidistant_base_factor": 0.8,
     "equidistant_axis_points": 128,
+    "equidistant_axis_points_auto": True,  # long cells need a dense trunk: fixed 128 undersamples 1900 px cells
+    "equidistant_axis_points_spacing_px": 2.0,
+    "equidistant_axis_points_max": 2048,
     "equidistant_axis_smooth": 60,
     "equidistant_outline_points": None,  # None: ~perimeter / equidistant_outline_downsample
     "equidistant_outline_downsample": 2.0,  # px spacing of the outline ring
@@ -174,6 +177,11 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_n_points_auto": True,  # long cells need more midline samples (fixed 128 undersamples them)
     "equidistant_n_points_spacing_px": 2.0,
     "equidistant_n_points_max": 2048,
+    "equidistant_main_smooth_factor": 0.02,  # spline stiffness per px of mainline length
+    "equidistant_main_smooth_max": 60.0,
+    "equidistant_inside_clamp": True,  # keep interior midline samples inside the mask (long-cell bends)
+    "equidistant_inside_clamp_iters": 3,
+    "equidistant_inside_clamp_smooth": 15,
     "equidistant_sdf_supersample": 4,  # supersampling factor of the outline rasterization
     "equidistant_branch_min_extended_px": 8.0,  # drop branches shorter than this AFTER tip extension
     "equidistant_branch_min_extended_um": 0.0,  # ... or this many microns
@@ -2246,6 +2254,56 @@ def _refine_branch(
     return q
 
 
+def _clamp_polyline_inside(
+    points: np.ndarray,
+    mask: np.ndarray,
+    axis: np.ndarray | None = None,
+    iters: int = 3,
+    smooth_iter: int = 5,
+) -> np.ndarray:
+    """Move outside-of-mask polyline samples to the nearest mask pixel.
+
+    Long cells smoothed with a stiff spline can cut across a concave bend and
+    leave the mask; snapping those samples back and re-smoothing lightly keeps
+    the midline inside without changing its overall path.
+    """
+    pnts = np.asarray(points, dtype=np.float64)
+    n = len(pnts)
+    if n < 8:
+        return pnts
+    mask = np.asarray(mask, dtype=bool)
+    for _ in range(max(int(iters), 0)):
+        cols = np.clip(np.round(pnts[:, 0]).astype(int), 0, mask.shape[1] - 1)
+        rows = np.clip(np.round(pnts[:, 1]).astype(int), 0, mask.shape[0] - 1)
+        outside = ~mask[rows, cols]
+        outside[0] = False
+        outside[-1] = False
+        if not outside.any():
+            break
+        if axis is not None and len(axis) >= 2:
+            # Project back onto the (inside-mask) skeleton trunk, so clamped
+            # samples sit near the medial line instead of hugging the boundary.
+            path = np.asarray(axis, dtype=np.float64)
+            pa = path[:-1]
+            pb = path[1:]
+            pab = pb - pa
+            pen = np.sum(pab * pab, axis=1) + 1e-12
+            sub = pnts[outside]
+            ap = sub[:, None, :] - pa[None, :, :]
+            tt = np.clip(np.sum(ap * pab[None, :, :], axis=2) / pen[None, :], 0.0, 1.0)
+            proj = pa[None, :, :] + tt[:, :, None] * pab[None, :, :]
+            dd = np.sum((proj - sub[:, None, :]) ** 2, axis=2)
+            sel = np.argmin(dd, axis=1)
+            pnts[outside] = proj[np.arange(len(sub)), sel]
+        else:
+            _, inds = ndimage.distance_transform_edt(~mask, return_indices=True)
+            pnts[outside, 0] = inds[1][rows[outside], cols[outside]]
+            pnts[outside, 1] = inds[0][rows[outside], cols[outside]]
+        pnts = _taubin_open_fixed(pnts, int(smooth_iter))
+        pnts = _resample_arclength(pnts, n)
+    return pnts
+
+
 def _equidistant_result(
     crop: np.ndarray,
     offset_xy: np.ndarray,
@@ -2325,11 +2383,25 @@ def _equidistant_result(
         cap_fork_frac=cap_frac,
         cap_fork_max_px=cap_px,
     )
-    if axis is None or len(axis) < 8:
+    if axis is None or len(axis) < 8 or _arc_length(axis) < 6.0:
+        # A handful of skeleton pixels is not a usable trunk (round blobs,
+        # border-truncated cells): resampling it to 128 points only turns it
+        # into a degenerate stub, so use the axis segment instead.
         return _axis_segment_result(crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns)
-    axis = _resample_arclength(axis, int(params["equidistant_axis_points"]))
+    n_axis = int(params["equidistant_axis_points"])
+    if bool(params.get("equidistant_axis_points_auto", True)):
+        axis_spacing = max(float(params.get("equidistant_axis_points_spacing_px", 2.0)), 0.5)
+        n_axis_auto = int(
+            np.clip(
+                round(_arc_length(axis) / axis_spacing),
+                128,
+                int(params.get("equidistant_axis_points_max", 2048)),
+            )
+        )
+        n_axis = max(n_axis, n_axis_auto)
+    axis = _resample_arclength(axis, n_axis)
     axis = _taubin_open_fixed(axis, int(params["equidistant_axis_smooth"]))
-    axis = _resample_arclength(axis, int(params["equidistant_axis_points"]))
+    axis = _resample_arclength(axis, n_axis)
 
     outline_src = np.asarray(outline_crop, dtype=np.float64)
     clean_contour = None
@@ -2406,7 +2478,13 @@ def _equidistant_result(
     # Smooth the pole junctions with a B-spline whose stiffness scales with
     # length (Taubin alone leaves visible kinks on short cells).
     main_len = max(_arc_length(main), 1.0)
-    s_fac = float(np.clip(0.02 * main_len, 4.0, 60.0))
+    s_fac = float(
+        np.clip(
+            float(params.get("equidistant_main_smooth_factor", 0.02)) * main_len,
+            4.0,
+            float(params.get("equidistant_main_smooth_max", 60.0)),
+        )
+    )
     if main_len < 40.0:
         # Very short cells: the pole junctions dominate the arc length, so
         # use a much stiffer spline to avoid residual junction oscillation.
@@ -2414,6 +2492,14 @@ def _equidistant_result(
     main = _smooth_open_weighted(main, s_fac, n=n_main)
     main = _taubin_open_fixed(main, int(params["equidistant_final_smooth"]))
     main = _resample_arclength(main, n_main)
+    if bool(params.get("equidistant_inside_clamp", True)):
+        mask_for_clamp = work if work is not None else crop
+        main = _clamp_polyline_inside(
+            main, mask_for_clamp, axis=axis,
+            iters=int(params.get("equidistant_inside_clamp_iters", 3)),
+            smooth_iter=int(params.get("equidistant_inside_clamp_smooth", 15)),
+        )
+        main = _resample_arclength(main, n_main)
     main_global = main + offset_xy
 
     width_profile = _width_profile(main_global, index, knn, pixel_microns)
