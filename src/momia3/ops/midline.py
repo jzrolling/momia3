@@ -140,6 +140,7 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "degenerate_solidity_min": 0.85,  # only convex-ish masks take the degenerate path
     "degenerate_simple_solidity": 0.88,  # cheap pre-gate: simple shape -> degenerate, skip SDF
     "degenerate_simple_ellipse_dev": 0.12,  # mean |ellipse residual| of the outline
+    "degenerate_simple_sagitta": 0.08,  # max chord-midpoint sagitta / width (curvature gate)
     # end-point handling / resampling (opt-in; defaults keep legacy behavior)
     "pole_endpoint": "extended",  # "extended" (legacy) | "initial" (outline pole pair)
     "n_points_auto": False,  # True: n = arc_length / n_points_target_spacing_px
@@ -1347,6 +1348,70 @@ def _ellipse_deviation(
     return float(np.mean(np.abs(np.hypot(u, v) - 1.0)))
 
 
+def _chord_sagitta_ratio(
+    outline_local: np.ndarray,
+    centroid_xy: np.ndarray,
+    axis_xy: np.ndarray,
+    n_samples: int = 9,
+) -> float:
+    """Max deviation of perpendicular-chord midpoints from the major axis.
+
+    A straight rod gives a small value even when its outline is slightly
+    asymmetric; a bent (banana) cell bows the chord midpoints away from the
+    axis. Normalized by the median chord width, so it is scale-free and needs
+    no skeleton/distance transform.
+    """
+    ring = np.asarray(outline_local, dtype=np.float64)
+    c = np.asarray(centroid_xy, dtype=np.float64)
+    if len(ring) < 8:
+        return 1.0
+    axis = np.asarray(axis_xy, dtype=np.float64)
+    nrm = float(np.hypot(axis[0], axis[1]))
+    if nrm <= 1e-12:
+        return 1.0
+    axis = axis / nrm
+    perp = np.array([-axis[1], axis[0]])
+    t = (ring - c[None, :]) @ axis
+    tmin, tmax = np.percentile(t, [2.0, 98.0])
+    if tmax - tmin < 2.0:
+        return 1.0
+    ts = np.linspace(tmin + 0.15 * (tmax - tmin), tmax - 0.15 * (tmax - tmin), n_samples)
+    a = ring
+    b = np.roll(ring, -1, axis=0)
+    e = b - a
+    devs: list[float] = []
+    widths: list[float] = []
+    for tv in ts:
+        p0 = c + tv * axis
+        hits = []
+        for dvec in (perp, -perp):
+            den = dvec[0] * (-e[:, 1]) - (-e[:, 0]) * dvec[1]
+            ok = np.abs(den) > 1e-12
+            if not ok.any():
+                hits.append(None)
+                break
+            rhs = a - p0[None, :]
+            tpar = (rhs[:, 0] * (-e[:, 1]) - (-e[:, 0]) * rhs[:, 1]) / np.where(ok, den, 1.0)
+            uu = (dvec[0] * rhs[:, 1] - dvec[1] * rhs[:, 0]) / np.where(ok, den, 1.0)
+            valid = ok & (uu >= -0.05) & (uu <= 1.05) & (tpar > 1e-6)
+            if not valid.any():
+                hits.append(None)
+                break
+            i = int(np.argmin(np.where(valid, tpar, np.inf)))
+            hits.append(p0 + tpar[i] * dvec)
+        if len(hits) != 2 or hits[0] is None or hits[1] is None:
+            continue
+        mid = 0.5 * (hits[0] + hits[1])
+        devs.append(abs(float((mid - p0) @ perp)))
+        widths.append(float(np.linalg.norm(hits[0] - hits[1])))
+    if len(devs) < 3:
+        return 1.0
+    width = float(np.median(widths))
+    if width <= 1e-6:
+        return 1.0
+    return float(np.max(devs)) / width
+
+
 def _chord_midpoints_vec(
     points: np.ndarray,
     ring: np.ndarray,
@@ -2489,14 +2554,13 @@ def _midline_single(
         # (cocci, ovals, straight rods) go straight to the degenerate spine
         # with one chord-midpoint round. Only complex shapes (curved, lobed,
         # branched) pay for the outline-SDF skeleton.
+        sagitta_ratio = _chord_sagitta_ratio(outline_local, centroid_xy, axis_xy)
         simple_shape = (
             solidity >= float(params.get("degenerate_simple_solidity", 0.88))
             and ellipse_dev <= float(params.get("degenerate_simple_ellipse_dev", 0.12))
+            and sagitta_ratio <= float(params.get("degenerate_simple_sagitta", 0.08))
         )
-        if simple_shape or (
-            aspect_ratio < float(params["degenerate_ar"])
-            and solidity >= float(params.get("degenerate_solidity_min", 0.85))
-        ):
+        if simple_shape or aspect_ratio < 1.25:
             return _axis_segment_result(
                 crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
                 outline_global=outline,
@@ -2525,19 +2589,12 @@ def _midline_single(
                     return candidate
             else:
                 guard_reason = "failed"
-            # Convex-ish masks: guard rejections are routed to the refined
-            # degenerate spine (stable, follows the cell). Non-convex masks
-            # must not be forced onto a straight axis: keep the equidistant
-            # candidate even though the strict guard rejected it.
-            if solidity >= float(params.get("degenerate_solidity_min", 0.85)):
-                deg = _axis_segment_result(
-                    crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
-                    outline_global=outline,
-                )
-                deg["midline_quality"] = "degenerate"
-                deg["equidistant_guard"] = guard_reason
-                return deg
+            # Complex cells only (simple shapes were already routed above):
+            # keep the SDF equidistant candidate even when the strict guard
+            # rejects it. Forcing them onto the straight degenerate axis is
+            # exactly what cuts corners of gently bent cells.
             if candidate is not None:
+                candidate["equidistant_guard"] = guard_reason
                 return candidate
 
         # Step 1 — pole-first initialization.
