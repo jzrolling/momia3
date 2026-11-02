@@ -147,6 +147,8 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_guard": True,  # False = raw equidistant (no fallback, for evaluation)
     "equidistant_branch_min_px": 3.0,  # absolute minimum branch length (px)
     "equidistant_branch_min_um": 0.2,  # momia2 default; effective min = max(px, um/pixel_microns)
+    "equidistant_fill_holes": True,  # close interior holes before skeletonizing
+    "equidistant_opening_radius": 1.0,  # binary opening radius (px) to strip mask rags
     "energy_data_weight": 1.0,
     "energy_curv_weight": 10.0,
     "energy_spacing_weight": 50.0,
@@ -1836,9 +1838,14 @@ def _equidistant_result(
     chords cut at equal arclength along the smoothed outline.
     """
     sigma = float(params.get("equidistant_presmooth_sigma", 0.0) or 0.0)
-    work = crop.astype(np.float32)
+    work = np.asarray(crop, dtype=bool)
     if sigma > 0:
-        work = ndimage.gaussian_filter(work, sigma) > 0.5
+        work = ndimage.gaussian_filter(work.astype(np.float32), sigma) > 0.5
+    if bool(params.get("equidistant_fill_holes", True)):
+        work = ndimage.binary_fill_holes(work)
+    opening_r = float(params.get("equidistant_opening_radius", 0.0) or 0.0)
+    if opening_r > 0:
+        work = ndimage.binary_opening(work, structure=morphology.disk(opening_r))
     centroid_xy, axis_xy, _ar = _mask_major_axis(crop)
     pole_pair = _find_pole_pair(
         outline_crop,
