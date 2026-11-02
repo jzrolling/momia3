@@ -73,6 +73,12 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "constriction_iters": 0,  # 0 = off (default, backwards compatible)
     "constriction_strength": 0.6,  # pull fraction toward the raw contour per round
     "constriction_smooth_scale": 0.01,  # light spline stiffness per round (x n_out)
+    # Image-guided variant: snap outline samples to the dark cell edge where the
+    # mask boundary still includes bright septum background (phase contrast).
+    "constriction_image_iters": 0,  # 0 = off
+    "constriction_image_max_shift": 3.0,  # px, max inward move per round
+    "constriction_image_strength": 0.8,
+    "constriction_image_threshold_frac": 0.55,  # dark threshold between cell and background
     "active_contour": False,
     "alpha": 0.015,
     "beta": 10.0,
@@ -161,7 +167,124 @@ def _smooth_closed(points: np.ndarray, smooth: float, n_points: int | None) -> n
         return _resample_closed_arclength(pts, n)
 
 
+def _outline_normals(ring: np.ndarray) -> np.ndarray:
+    """Unit normals of a closed ring (direction sign is resolved by caller)."""
+    p = np.asarray(ring, dtype=np.float64)
+    tang = np.roll(p, -1, axis=0) - np.roll(p, 1, axis=0)
+    nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
+    nrm /= np.maximum(np.linalg.norm(nrm, axis=1)[:, None], 1e-12)
+    return nrm
+
+
+def _ring_from_binary_mask(work: np.ndarray, params: Mapping[str, Any]) -> np.ndarray | None:
+    """Same contour pipeline as _outline_single, but starting from a mask.
+
+    Used by the image-guided constriction rounds: the intensity-thresholded
+    mask already excludes the bright septum bridge, so re-extracting its ring
+    gives the deeper waist directly.
+    """
+    sigma = float(params.get("sigma", 1.0))
+    smoothed = ndimage.gaussian_filter(work.astype(np.float64), sigma) if sigma > 0 else work.astype(np.float64)
+    contours = measure.find_contours(smoothed, level=float(params.get("level", 0.5)))
+    if not contours:
+        return None
+    ring_rc = max(contours, key=len)
+    ring_xy = np.column_stack([ring_rc[:, 1], ring_rc[:, 0]])
+    factor = float(params.get("downsample_factor", 2.0) or 0.0)
+    if factor > 0 and len(ring_xy) > 8:
+        closed = np.vstack([ring_xy, ring_xy[:1]])
+        perimeter = float(np.sum(np.hypot(np.diff(closed[:, 0]), np.diff(closed[:, 1]))))
+        n_down = max(16, int(round(perimeter / factor)))
+        base_ring = _resample_closed_arclength(ring_xy, n_down)
+    else:
+        base_ring = ring_xy
+        n_down = len(ring_xy)
+    n_out = n_down if params["n_points"] is None else int(params["n_points"])
+    smooth_scale = params.get("smooth_scale")
+    smooth = (
+        float(smooth_scale) * n_down
+        if smooth_scale is not None
+        else float(params["smooth"])
+    )
+    return _smooth_closed(base_ring, smooth, n_out)
+
+
+def _constriction_intensity_step(
+    ring: np.ndarray,
+    intensity: np.ndarray,
+    mask: np.ndarray,
+    max_shift: float,
+    strength: float,
+    threshold_frac: float,
+    params: Mapping[str, Any] | None = None,
+) -> np.ndarray:
+    """Deepen concave notches toward the intensity-defined dark cell edge.
+
+    The binary mask may bridge a bright septum gap; thresholding the image at a
+    level between cell body and background cuts that gap. The thresholded mask
+    is re-contoured with the normal outline pipeline, and only *concave*
+    boundary points that move *inward* are taken (capped at max_shift). This
+    keeps the overall cell size and only sharpens real constrictions.
+    """
+    pts = np.asarray(ring, dtype=np.float64).copy()
+    h, w = intensity.shape
+    nrm = _outline_normals(pts)
+
+    def sample_mask(pp):
+        cols = np.clip(np.round(pp[:, 0]).astype(int), 0, w - 1)
+        rows = np.clip(np.round(pp[:, 1]).astype(int), 0, h - 1)
+        return mask[rows, cols].astype(np.float64)
+
+    m_plus = sample_mask(pts + 0.8 * nrm)
+    m_minus = sample_mask(pts - 0.8 * nrm)
+    outward = nrm * np.where(m_plus <= m_minus, 1.0, -1.0)[:, None]
+    prev = np.roll(pts, 1, axis=0)
+    nxt = np.roll(pts, -1, axis=0)
+    dev = pts - 0.5 * (prev + nxt)
+    concave = np.sum(dev * outward, axis=1) < 0.0
+
+    dark = float(np.percentile(intensity[mask], 25.0)) if np.any(mask) else 0.0
+    outside = ~mask
+    bright = float(np.percentile(intensity[outside], 75.0)) if np.any(outside) else dark + 1.0
+    if not np.isfinite(dark) or not np.isfinite(bright) or bright - dark < 1e-9:
+        return pts
+    frac = float(np.clip(threshold_frac, 0.05, 0.95))
+    refined = None
+    for _ in range(4):
+        cand = mask & (intensity < dark + frac * (bright - dark))
+        n_labels = int(ndimage.label(cand)[1])
+        if n_labels == 1 and cand.sum() >= 0.45 * mask.sum():
+            refined = cand
+            break
+        frac = min(0.95, frac + 0.1)
+    if refined is None:
+        return pts
+    ref_params = dict(params or {})
+    ref_params["smooth_scale"] = 0.5 * float(ref_params.get("smooth_scale", 0.03) or 0.03)
+    ref = _ring_from_binary_mask(refined, ref_params)
+    if ref is None or len(ref) < 8:
+        return pts
+    from scipy.spatial import cKDTree as _cKDTree
+
+    ref_closed = np.vstack([ref, ref[:1]])
+    _, nearest = _cKDTree(ref_closed).query(pts)
+    target = ref_closed[nearest]
+    delta = target - pts
+    d_out = np.sum(delta * outward, axis=1)
+    shift = np.linalg.norm(delta, axis=1)
+    inward_amt = -d_out
+    # Uniform halo shrink moves every point by roughly the same amount; compare
+    # with the local (circular) median to keep only locally-deeper notches.
+    local = ndimage.median_filter(inward_amt, size=11, mode="wrap")
+    excess = inward_amt - local
+    accept = concave & (excess > 0.2) & (shift <= max_shift)
+    moved = pts.copy()
+    moved[accept] = pts[accept] + strength * delta[accept]
+    return moved
+
+
 def _outline_single(
+
     crop: np.ndarray,
     intensity_crop: np.ndarray | None,
     params: Mapping[str, Any],
@@ -274,6 +397,22 @@ def _outline_single(
             ])
             ring_xy = ring_xy + strength * (target - ring_xy)
             ring_xy = _smooth_closed(ring_xy, max(light_smooth, 1.0), n_out)
+
+    # Image-guided variant: deepen the septum waist where the mask boundary
+    # still covers bright background (phase contrast).
+    image_iters = int(params.get("constriction_image_iters", 0) or 0)
+    if image_iters > 0 and intensity_crop is not None and len(ring_xy) > 16:
+        icrop = np.asarray(intensity_crop, dtype=np.float64)
+        max_shift = float(params.get("constriction_image_max_shift", 3.0))
+        strength_i = float(np.clip(params.get("constriction_image_strength", 0.8), 0.0, 1.0))
+        thr_frac = float(params.get("constriction_image_threshold_frac", 0.55))
+        light_smooth_i = float(params.get("constriction_smooth_scale", 0.01)) * n_out
+        for _ in range(image_iters):
+            ring_xy = _constriction_intensity_step(
+                ring_xy, icrop, np.asarray(crop, dtype=bool),
+                max_shift, strength_i, thr_frac, params,
+            )
+            ring_xy = _smooth_closed(ring_xy, max(light_smooth_i, 1.0), n_out)
 
     if bool(params["active_contour"]) and intensity_crop is not None:
         icrop = np.asarray(intensity_crop, dtype=np.float64)
