@@ -158,6 +158,10 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_fill_holes": True,  # close interior holes before skeletonizing
     "equidistant_opening_radius": 1.0,  # binary opening radius (px) to strip mask rags
     "equidistant_outline_from_clean_mask": True,  # draw outline on the cleaned mask
+    "equidistant_skeleton_from_outline": True,  # skeleton from the outline geometry (4x SDF) instead of the binary mask
+    "equidistant_sdf_supersample": 4,  # supersampling factor of the outline rasterization
+    "equidistant_branch_min_extended_px": 8.0,  # drop branches shorter than this AFTER tip extension
+    "equidistant_branch_min_extended_um": 0.0,  # ... or this many microns
     "energy_data_weight": 1.0,
     "energy_curv_weight": 10.0,
     "energy_spacing_weight": 50.0,
@@ -1680,8 +1684,10 @@ def _graph_reconstruct(prev: Mapping[int, int], dst: int) -> list[int]:
     return path
 
 
-def _skeleton_trunk_and_branches(
-    work: np.ndarray,
+def _trunk_branches_from_graph(
+    graph: Mapping[int, Mapping[int, float]],
+    pts: np.ndarray,
+    degree: Mapping[int, int],
     min_branch_px: float,
     cap_fork_frac: float = 0.12,
     cap_fork_max_px: float = 12.0,
@@ -1694,10 +1700,6 @@ def _skeleton_trunk_and_branches(
     back into the trunk (their split junction becomes the trunk end) and are
     not reported as branches. Remaining arms are ordered attachment -> tip.
     """
-    data = _skeleton_graph_data(work)
-    if data is None:
-        return None, []
-    graph, pts, degree = data
     ends = [k for k, d in degree.items() if d == 1]
     if len(ends) < 2:
         return None, []
@@ -1743,6 +1745,108 @@ def _skeleton_trunk_and_branches(
     trunk = pts[trunk_ids] if len(trunk_ids) >= 3 else None
     branches = [pts[path] for path in kept_arms]
     return trunk, branches
+
+
+def _skeleton_trunk_and_branches(
+    work: np.ndarray,
+    min_branch_px: float,
+    cap_fork_frac: float = 0.12,
+    cap_fork_max_px: float = 12.0,
+) -> tuple[np.ndarray | None, list[np.ndarray]]:
+    """Trunk/branches from a binary mask skeleton (pixel graph)."""
+    data = _skeleton_graph_data(work)
+    if data is None:
+        return None, []
+    graph, pts, degree = data
+    return _trunk_branches_from_graph(
+        graph, pts, degree, min_branch_px, cap_fork_frac, cap_fork_max_px
+    )
+
+
+def _inside_polygon(ring: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Inside test of a closed polygon (matplotlib Path)."""
+    from matplotlib.path import Path
+
+    return Path(ring).contains_points(points)
+
+
+def _sdf_graph_from_outline(
+    outline_local: np.ndarray,
+    supersample: int = 4,
+    pad: int = 3,
+):
+    """Sub-pixel skeleton graph obtained from the outline polygon only.
+
+    The outline is rasterized at ``supersample`` x resolution (pixel centres),
+    the inside is skeletonized at that resolution and mapped back to sub-pixel
+    crop coordinates. This removes binary-mask artefacts (pixel elbows, rags)
+    while keeping protrusions that are real in the outline geometry.
+
+    Returns (graph, pts, degree, sdf_at) or None; ``sdf_at(points)`` samples
+    the half-width (distance to boundary, in original px) at (x, y) points.
+    """
+    ring = np.asarray(outline_local, dtype=np.float64)
+    if len(ring) < 8 or supersample < 2:
+        return None
+    x0f = float(np.floor(ring[:, 0].min())) - pad
+    y0f = float(np.floor(ring[:, 1].min())) - pad
+    x1f = float(np.ceil(ring[:, 0].max())) + pad
+    y1f = float(np.ceil(ring[:, 1].max())) + pad
+    # Adaptive supersampling: cap the working grid so giant filaments stay
+    # tractable (they do not need sub-pixel protrusion resolution anyway).
+    bbox_area = max((x1f - x0f) * (y1f - y0f), 1.0)
+    ss = int(np.clip(round(np.sqrt(4_000_000.0 / bbox_area)), 1, int(supersample)))
+    nx = max(8, int(round((x1f - x0f) * ss)))
+    ny = max(8, int(round((y1f - y0f) * ss)))
+    # Fast supersampled polygon fill (C implementation); Path.contains_points
+    # on a 4x grid is far too slow for long cells.
+    try:
+        from skimage import draw as _skdraw
+
+        col_idx = (ring[:, 0] - x0f) * ss - 0.5
+        row_idx = (ring[:, 1] - y0f) * ss - 0.5
+        rr, cc = _skdraw.polygon(row_idx, col_idx, shape=(ny, nx))
+        inside = np.zeros((ny, nx), dtype=bool)
+        inside[rr, cc] = True
+    except Exception as exc:  # pragma: no cover
+        logger.debug("outline rasterization failed (%s)", exc)
+        return None
+    skel = morphology.skeletonize(inside)
+    ys, xs = np.nonzero(skel)
+    if ys.size < 5:
+        return None
+    node = {(int(y), int(x)): i for i, (y, x) in enumerate(zip(ys, xs))}
+    graph: dict[int, dict[int, float]] = {}
+    w = 1.0 / ss
+    for (y, x), i in node.items():
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                j = node.get((y + dy, x + dx))
+                if j is not None:
+                    wgt = float(np.hypot(dy, dx)) * w
+                    graph.setdefault(i, {})[j] = wgt
+                    graph.setdefault(j, {})[i] = wgt
+    degree = {k: len(v) for k, v in graph.items()}
+    pts = np.column_stack([x0f + (xs + 0.5) * w, y0f + (ys + 0.5) * w])
+    edge_a = ring
+    edge_b = np.roll(ring, -1, axis=0)
+    edge_ab = edge_b - edge_a
+    edge_den = np.sum(edge_ab * edge_ab, axis=1) + 1e-12
+
+    def sdf_at(points: np.ndarray) -> np.ndarray:
+        """Distance from (x, y) points to the outline polygon (original px)."""
+        arr = np.asarray(points, dtype=np.float64)
+        if arr.size == 0:
+            return np.zeros((0,), dtype=np.float64)
+        ap = arr[:, None, :] - edge_a[None, :, :]
+        t = np.clip(np.sum(ap * edge_ab[None, :, :], axis=2) / edge_den[None, :], 0.0, 1.0)
+        proj = edge_a[None, :, :] + t[:, :, None] * edge_ab[None, :, :]
+        d = np.linalg.norm(proj - arr[:, None, :], axis=2)
+        return np.min(d, axis=1)
+
+    return graph, pts, degree, sdf_at
 
 
 def _ray_outline_hit(outline: np.ndarray, origin: np.ndarray, direction: np.ndarray) -> np.ndarray:
@@ -1916,33 +2020,64 @@ def _equidistant_result(
     are sub-pixel contour tips (ray from the axis end tangent) and base
     chords cut at equal arclength along the smoothed outline.
     """
-    sigma = float(params.get("equidistant_presmooth_sigma", 0.0) or 0.0)
-    work = np.asarray(crop, dtype=bool)
-    if sigma > 0:
-        work = ndimage.gaussian_filter(work.astype(np.float32), sigma) > 0.5
-    cleaned = False
-    if bool(params.get("equidistant_fill_holes", True)):
-        filled = ndimage.binary_fill_holes(work)
-        cleaned = cleaned or bool(np.any(filled != work))
-        work = filled
-    opening_r = float(params.get("equidistant_opening_radius", 0.0) or 0.0)
-    if opening_r > 0:
-        opened = ndimage.binary_opening(work, structure=morphology.disk(opening_r))
-        # Opening can sever a thin connection (e.g. the neck of a folded
-        # cell); never let cleanup disconnect the mask.
-        if ndimage.label(opened)[1] <= ndimage.label(work)[1]:
-            cleaned = cleaned or bool(np.any(opened != work))
-            work = opened
     centroid_xy, axis_xy, _ar = _mask_major_axis(crop)
     branch_min_px = max(
         float(params.get("equidistant_branch_min_px", 3.0)),
         float(params.get("equidistant_branch_min_um", 0.2)) / max(float(pixel_microns), 1e-9),
     )
-    axis, side_branches = _skeleton_trunk_and_branches(
-        work,
+    cleaned = False
+    work = None
+    sdf_at = None
+    graph = None
+    pts = None
+    degree = None
+    use_sdf = bool(params.get("equidistant_skeleton_from_outline", True))
+    if use_sdf:
+        data = _sdf_graph_from_outline(
+            np.asarray(outline_crop, dtype=np.float64),
+            supersample=int(params.get("equidistant_sdf_supersample", 4)),
+        )
+        if data is not None:
+            graph, pts, degree, sdf_at = data
+    if graph is None:
+        # Fallback: skeleton from the cleaned binary mask.
+        sigma = float(params.get("equidistant_presmooth_sigma", 0.0) or 0.0)
+        work = np.asarray(crop, dtype=bool)
+        if sigma > 0:
+            work = ndimage.gaussian_filter(work.astype(np.float32), sigma) > 0.5
+        if bool(params.get("equidistant_fill_holes", True)):
+            filled = ndimage.binary_fill_holes(work)
+            cleaned = cleaned or bool(np.any(filled != work))
+            work = filled
+        opening_r = float(params.get("equidistant_opening_radius", 0.0) or 0.0)
+        if opening_r > 0:
+            opened = ndimage.binary_opening(work, structure=morphology.disk(opening_r))
+            # Opening can sever a thin connection (e.g. the neck of a folded
+            # cell); never let cleanup disconnect the mask.
+            if ndimage.label(opened)[1] <= ndimage.label(work)[1]:
+                cleaned = cleaned or bool(np.any(opened != work))
+                work = opened
+        graph_data = _skeleton_graph_data(work)
+        if graph_data is None:
+            return _axis_segment_result(
+                crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns
+            )
+        graph, pts, degree = graph_data
+    # Cap-fork folding is a pixel-skeleton concept; the outline-SDF skeleton
+    # has no blunt-cap splits, and folding there would eat real protrusions
+    # that sit near a pole. Apply it only for the mask-skeleton fallback.
+    if sdf_at is not None:
+        cap_frac, cap_px = 0.0, 0.0
+    else:
+        cap_frac = float(params.get("equidistant_cap_fork_frac", 0.12))
+        cap_px = float(params.get("equidistant_cap_fork_max_px", 12.0))
+    axis, side_branches = _trunk_branches_from_graph(
+        graph,
+        pts,
+        degree,
         branch_min_px,
-        cap_fork_frac=float(params.get("equidistant_cap_fork_frac", 0.12)),
-        cap_fork_max_px=float(params.get("equidistant_cap_fork_max_px", 12.0)),
+        cap_fork_frac=cap_frac,
+        cap_fork_max_px=cap_px,
     )
     if axis is None or len(axis) < 8:
         return _axis_segment_result(crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns)
@@ -1954,11 +2089,16 @@ def _equidistant_result(
     clean_contour = None
     if (
         cleaned
+        and work is not None
         and bool(params.get("equidistant_outline_from_clean_mask", True))
     ):
         clean_contour = _smoothed_mask_contour(work)
         if clean_contour is not None:
             outline_src = clean_contour
+    # Tips are projected onto the contour that drives the geometry.
+    snap_contour = clean_contour
+    if snap_contour is None and sdf_at is not None:
+        snap_contour = np.asarray(outline_crop, dtype=np.float64)
     n_outline = params.get("equidistant_outline_points")
     if n_outline is None:
         edge = np.vstack([outline_src, outline_src[:1]])
@@ -1970,17 +2110,20 @@ def _equidistant_result(
     outline_s = _resample_closed(outline_src, int(n_outline))
     outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
 
-    edt = ndimage.distance_transform_edt(work)
     solidity = 1.0
     try:
-        props = skmeasure.regionprops(work.astype(np.int32))
+        props = skmeasure.regionprops(np.asarray(crop, dtype=np.int32))
         if props:
             solidity = float(props[0].solidity)
     except Exception as exc:  # pragma: no cover - solidity is advisory only
         logger.debug("solidity computation failed (%s)", exc)
-    ax_cols = np.clip(np.round(axis[:, 0]).astype(int), 0, crop.shape[1] - 1)
-    ax_rows = np.clip(np.round(axis[:, 1]).astype(int), 0, crop.shape[0] - 1)
-    width = 2.0 * float(np.median(edt[ax_rows, ax_cols]))
+    if sdf_at is not None:
+        width = 2.0 * float(np.median(sdf_at(axis)))
+    else:
+        edt = ndimage.distance_transform_edt(work)
+        ax_cols = np.clip(np.round(axis[:, 0]).astype(int), 0, crop.shape[1] - 1)
+        ax_rows = np.clip(np.round(axis[:, 1]).astype(int), 0, crop.shape[0] - 1)
+        width = 2.0 * float(np.median(edt[ax_rows, ax_cols]))
     base_offset = float(params["equidistant_base_factor"]) * max(width, 1.0)
 
     tips = []
@@ -1994,8 +2137,8 @@ def _equidistant_result(
         if float(np.hypot(tangent[0], tangent[1])) <= 1e-9:
             tangent = np.array([1.0, 0.0])
         tip = _ray_outline_hit(outline_s, axis[k], tangent)
-        if clean_contour is not None:
-            tip = _project_to_polyline(tip, clean_contour)
+        if snap_contour is not None:
+            tip = _project_to_polyline(tip, snap_contour)
         c1, c2 = _arc_walk_closed(outline_s, tip, base_offset)
         base_mid = 0.5 * (c1 + c2)
         # The chord midpoint can sit off-axis at curved/oblique caps; project
@@ -2028,13 +2171,22 @@ def _equidistant_result(
     pole_dist = float(np.hypot(*(tips[1] - tips[0])))
     _, max_curv = _curvature_stats(main_global)
     branches_global = []
+    branch_ext_min = max(
+        float(params.get("equidistant_branch_min_extended_px", 8.0)),
+        float(params.get("equidistant_branch_min_extended_um", 0.0))
+        / max(float(pixel_microns), 1e-9),
+    )
     for b_raw in side_branches:
-        b_ref = _refine_branch(b_raw, outline_s, branch_min_px, snap_poly=clean_contour)
-        if b_ref is not None:
-            # snap the attachment exactly onto the final trunk
-            dd = np.sum((main[:, None, :] - b_ref[0][None, :]) ** 2, axis=2)
-            b_ref[0] = main[int(np.argmin(dd))]
-            branches_global.append(np.asarray(b_ref, dtype=np.float64) + offset_xy)
+        b_ref = _refine_branch(b_raw, outline_s, branch_min_px, snap_poly=snap_contour)
+        if b_ref is None:
+            continue
+        # Threshold on the *extended* branch (skeleton arm + tip extension).
+        if _arc_length(b_ref) < branch_ext_min:
+            continue
+        # snap the attachment exactly onto the final trunk
+        dd = np.sum((main[:, None, :] - b_ref[0][None, :]) ** 2, axis=2)
+        b_ref[0] = main[int(np.argmin(dd))]
+        branches_global.append(np.asarray(b_ref, dtype=np.float64) + offset_xy)
     return {
         "midline": [main_global, *branches_global],
         "width_profile": width_profile,
@@ -2059,6 +2211,73 @@ def _equidistant_result(
             params.get("equidistant_guard_chord_dev_frac", 0.30)
         ),
     }
+
+
+def _sdf_fallback_branches(
+    crop: np.ndarray,
+    offset_xy: np.ndarray,
+    outline_crop: np.ndarray,
+    main_global: np.ndarray,
+    params: Mapping[str, Any],
+    pixel_microns: float,
+) -> list[np.ndarray]:
+    """Refined side branches (global) from the outline-SDF skeleton.
+
+    Used when the equidistant mainline falls back to the default spine: the
+    branch description still comes from the outline geometry, extended to the
+    contour and filtered by extended length.
+    """
+    try:
+        data = _sdf_graph_from_outline(
+            np.asarray(outline_crop, dtype=np.float64),
+            supersample=int(params.get("equidistant_sdf_supersample", 4)),
+        )
+        if data is None:
+            return []
+        graph, pts, degree, _sdf_at = data
+        branch_min_px = max(
+            float(params.get("equidistant_branch_min_px", 3.0)),
+            float(params.get("equidistant_branch_min_um", 0.2)) / max(float(pixel_microns), 1e-9),
+        )
+        # Outline-SDF skeleton: no blunt-cap folding (it would eat real
+        # protrusions near a pole); extended-length filter handles the rest.
+        _, side = _trunk_branches_from_graph(
+            graph,
+            pts,
+            degree,
+            branch_min_px,
+            cap_fork_frac=0.0,
+            cap_fork_max_px=0.0,
+        )
+        if not side:
+            return []
+        outline_src = np.asarray(outline_crop, dtype=np.float64)
+        edge = np.vstack([outline_src, outline_src[:1]])
+        perimeter = float(np.sum(np.hypot(np.diff(edge[:, 0]), np.diff(edge[:, 1]))))
+        n_out = max(
+            16,
+            int(round(perimeter / float(params.get("equidistant_outline_downsample", 2.0)))),
+        )
+        outline_s = _resample_closed(outline_src, int(n_out))
+        outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
+        main_local = np.asarray(main_global, dtype=np.float64) - offset_xy
+        branch_ext_min = max(
+            float(params.get("equidistant_branch_min_extended_px", 8.0)),
+            float(params.get("equidistant_branch_min_extended_um", 0.0))
+            / max(float(pixel_microns), 1e-9),
+        )
+        out: list[np.ndarray] = []
+        for b in side:
+            rb = _refine_branch(b, outline_s, branch_min_px, snap_poly=outline_src)
+            if rb is None or _arc_length(rb) < branch_ext_min:
+                continue
+            dd = np.sum((main_local[:, None, :] - rb[0][None, :]) ** 2, axis=2)
+            rb[0] = main_local[int(np.argmin(dd))]
+            out.append(np.asarray(rb, dtype=np.float64) + offset_xy)
+        return out
+    except Exception as exc:  # pragma: no cover - branches are advisory
+        logger.debug("SDF fallback branch extraction failed (%s)", exc)
+        return []
 
 
 def _midline_single(
@@ -2222,10 +2441,17 @@ def _midline_single(
         if equidistant_fallback:
             result["midline_quality"] = "equidistant_fallback"
             result["equidistant_guard"] = "failed"
-            if suppress_branches:
-                result["midline"] = [result["midline"][0]]
-                result["branched"] = 0.0
-                result["branch_lengths"] = []
+            extra = [] if suppress_branches else _sdf_fallback_branches(
+                crop,
+                offset_xy,
+                outline_crop,
+                np.asarray(result["midline"][0], dtype=np.float64),
+                params,
+                pixel_microns,
+            )
+            result["midline"] = [result["midline"][0], *extra]
+            result["branched"] = 1.0 if extra else 0.0
+            result["branch_lengths"] = [float(_arc_length(b)) for b in extra]
         return result
     except Exception as exc:
         logger.debug("midline pipeline failed (%s); flagging cell as failed", exc)
