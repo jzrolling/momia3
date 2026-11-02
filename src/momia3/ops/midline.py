@@ -131,7 +131,7 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     # degenerate (near-round) cells
     "degenerate_ar": 1.4,
     "degenerate_refine": True,  # one equidistant chord-midpoint pass on the degenerate axis
-    "degenerate_refine_iters": 3,
+    "degenerate_refine_iters": 1,
     "degenerate_refine_anchor": 2,  # end points only constrain the spline, not moved by chords
     "degenerate_refine_damp": 0.6,
     "degenerate_refine_smooth": 0.03,
@@ -1318,6 +1318,72 @@ def _mask_solidity(crop: np.ndarray) -> float:
     return 1.0
 
 
+def _chord_midpoints_vec(
+    points: np.ndarray,
+    ring: np.ndarray,
+    anchor: int,
+) -> np.ndarray | None:
+    """Vectorized perpendicular chord midpoints for interior polyline points.
+
+    Returns midpoints (same shape as ``points``); anchor points are copied.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < 4 or anchor >= n - 1:
+        return None
+    ring = np.asarray(ring, dtype=np.float64)
+    a = ring
+    b = np.roll(ring, -1, axis=0)
+    e = b - a
+    # central-difference tangents -> normals
+    tang = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
+    nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
+    nrm /= np.maximum(np.linalg.norm(nrm, axis=1)[:, None], 1e-12)
+    out = pts.copy()
+    idx = np.arange(anchor, n - anchor)
+    if idx.size == 0:
+        return out
+    P = pts[idx][:, None, :]          # (K,1,2)
+    D = nrm[idx][:, None, :]          # (K,1,2)
+    A = a[None, :, :]                 # (1,E,2)
+    E = e[None, :, :]                 # (1,E,2)
+    den = D[..., 0] * (-E[..., 1]) - (-E[..., 0]) * D[..., 1]
+    ok = np.abs(den) > 1e-12
+    rhs = A - P
+    tt = (rhs[..., 0] * (-E[..., 1]) - (-E[..., 0]) * rhs[..., 1]) / np.where(ok, den, 1.0)
+    uu = (D[..., 0] * rhs[..., 1] - D[..., 1] * rhs[..., 0]) / np.where(ok, den, 1.0)
+    valid = ok & (uu >= -0.05) & (uu <= 1.05) & (tt > 1e-6)
+    tt = np.where(valid, tt, np.inf)
+    # forward and backward intersections
+    i_fwd = np.argmin(tt, axis=1)
+    t_fwd = tt[np.arange(len(idx)), i_fwd]
+    ring2 = ring[::-1]
+    a2 = ring2
+    b2 = np.roll(ring2, -1, axis=0)
+    e2 = b2 - a2
+    A2 = a2[None, :, :]
+    E2 = e2[None, :, :]
+    den2 = D[..., 0] * (-E2[..., 1]) - (-E2[..., 0]) * D[..., 1]
+    ok2 = np.abs(den2) > 1e-12
+    rhs2 = A2 - P
+    tt2 = (rhs2[..., 0] * (-E2[..., 1]) - (-E2[..., 0]) * rhs2[..., 1]) / np.where(ok2, den2, 1.0)
+    uu2 = (D[..., 0] * rhs2[..., 1] - D[..., 1] * rhs2[..., 0]) / np.where(ok2, den2, 1.0)
+    valid2 = ok2 & (uu2 >= -0.05) & (uu2 <= 1.05) & (tt2 > 1e-6)
+    tt2 = np.where(valid2, tt2, np.inf)
+    i_bwd = np.argmin(tt2, axis=1)
+    t_bwd = tt2[np.arange(len(idx)), i_bwd]
+    good = np.isfinite(t_fwd) & np.isfinite(t_bwd)
+    if not np.any(good):
+        return out
+    gi = idx[good]
+    mid = 0.5 * (
+        pts[gi] + t_fwd[good][:, None] * nrm[gi]
+        + pts[gi] - t_bwd[good][:, None] * nrm[gi]
+    )
+    out[gi] = mid
+    return out
+
+
 def _refine_degenerate_axis(
     main_global: np.ndarray,
     outline_global: np.ndarray,
@@ -1339,38 +1405,32 @@ def _refine_degenerate_axis(
     ring_s = _taubin_closed(ring_s, int(params.get("equidistant_outline_smooth", 45)))
     anchor = int(params.get("degenerate_refine_anchor", 2))
     damp = float(params.get("degenerate_refine_damp", 0.6))
-    iters = int(params.get("degenerate_refine_iters", 3))
+    iters = int(params.get("degenerate_refine_iters", 1))
     orig = np.asarray(main_global, dtype=np.float64)
     n_out = len(orig)
     spacing = float(params.get("degenerate_refine_spacing_px", 0.0) or 0.0)
     if spacing > 0:
         n_ref = int(np.clip(round(_arc_length(orig) / spacing), 6, n_out))
     else:
-        n_ref = int(np.clip(int(params.get("degenerate_refine_points", 16)), 6, n_out))
+        n_ref = int(np.clip(int(params.get("degenerate_refine_points", 12)), 6, n_out))
     pnts = _resample_arclength(orig, n_ref)
     for _ in range(max(iters, 0)):
-        q = pnts.copy()
-        for i in range(anchor, len(pnts) - anchor):
-            t = pnts[i + 1] - pnts[i - 1]
-            normal = np.array([-t[1], t[0]], dtype=np.float64)
-            if float(np.hypot(normal[0], normal[1])) <= 1e-9:
-                continue
-            c1 = _ray_outline_hit(ring_s, pnts[i], normal)
-            c2 = _ray_outline_hit(ring_s, pnts[i], -normal)
-            if not (np.all(np.isfinite(c1)) and np.all(np.isfinite(c2))):
-                continue
-            q[i] = pnts[i] + damp * (0.5 * (c1 + c2) - pnts[i])
-        pnts = _resample_arclength(q, len(q))
-        s = float(
-            np.clip(
-                float(params.get("degenerate_refine_smooth", 0.03)) * _arc_length(pnts),
-                1.5,
-                12.0,
-            )
+        q = _chord_midpoints_vec(pnts, ring_s, anchor)
+        if q is None:
+            break
+        pnts = pnts + damp * (q - pnts)
+        pnts = _taubin_open_fixed(pnts, 12)
+        pnts = _resample_arclength(pnts, n_ref)
+    # Back to the requested output density; one weighted spline for smoothness.
+    pnts = _resample_arclength(pnts, n_out)
+    s = float(
+        np.clip(
+            float(params.get("degenerate_refine_smooth", 0.03)) * _arc_length(pnts),
+            1.5,
+            12.0,
         )
-        pnts = _smooth_open_weighted(pnts, s, n=len(pnts), w_end=60.0)
-        pnts = _resample_arclength(pnts, len(pnts))
-    # Back to the requested output density (coarse iteration is more stable).
+    )
+    pnts = _smooth_open_weighted(pnts, s, n=n_out, w_end=60.0)
     pnts = _resample_arclength(pnts, n_out)
     pnts[0] = orig[0]
     pnts[-1] = orig[-1]
