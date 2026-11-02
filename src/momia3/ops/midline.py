@@ -150,6 +150,8 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_guard": True,  # False = raw equidistant (no fallback, for evaluation)
     "equidistant_branch_min_px": 3.0,  # absolute minimum branch length (px)
     "equidistant_branch_min_um": 0.2,  # momia2 default; effective min = max(px, um/pixel_microns)
+    "equidistant_cap_fork_frac": 0.12,  # arms attached within this trunk-length fraction of an end are cap forks
+    "equidistant_cap_fork_max_px": 12.0,  # cap-fork arm max length (px)
     "equidistant_fill_holes": True,  # close interior holes before skeletonizing
     "equidistant_opening_radius": 1.0,  # binary opening radius (px) to strip mask rags
     "equidistant_outline_from_clean_mask": True,  # draw outline on the cleaned mask
@@ -1677,15 +1679,17 @@ def _graph_reconstruct(prev: Mapping[int, int], dst: int) -> list[int]:
 
 def _skeleton_trunk_and_branches(
     work: np.ndarray,
-    pole_pair_crop: tuple[np.ndarray, np.ndarray],
     min_branch_px: float,
+    cap_fork_frac: float = 0.12,
+    cap_fork_max_px: float = 12.0,
 ) -> tuple[np.ndarray | None, list[np.ndarray]]:
-    """Pole-to-pole trunk plus hanging side branches.
+    """Longest skeleton path as the trunk plus its hanging side branches.
 
-    The trunk is the skeleton path between the skeleton nodes nearest the
-    outline pole pair (momia3 prior); if that path is much shorter than the
-    longest skeleton path (ambiguous poles), fall back to the longest path.
-    Branches are skeleton arms hanging off the trunk, ordered attachment -> tip.
+    The trunk is the longest path between skeleton endpoints, so a cell that
+    folds back (U/hook shape) keeps the whole fold in the trunk instead of
+    splitting one arm off as a branch. Short forks at blunt caps are folded
+    back into the trunk (their split junction becomes the trunk end) and are
+    not reported as branches. Remaining arms are ordered attachment -> tip.
     """
     data = _skeleton_graph_data(work)
     if data is None:
@@ -1694,52 +1698,47 @@ def _skeleton_trunk_and_branches(
     ends = [k for k, d in degree.items() if d == 1]
     if len(ends) < 2:
         return None, []
-    # longest path (fallback reference)
+    # Trunk: longest path between skeleton endpoints (follows folds).
     d0, _ = _graph_dijkstra(graph, [ends[0]])
     far = max(d0, key=d0.get)
     dist, prev = _graph_dijkstra(graph, [far], want_prev=True)
     tip = max(dist, key=dist.get)
-    longest = pts[_graph_reconstruct(prev, tip)]
-    longest_len = float(dist[tip])
-    # trunk between nearest skeleton nodes to the outline poles
-    def _nearest(pt):
-        dd = np.linalg.norm(pts - np.asarray(pt, dtype=np.float64)[None, :], axis=1)
-        i = int(np.argmin(dd))
-        return i, float(dd[i])
-
-    n1, e1 = _nearest(pole_pair_crop[0])
-    n2, e2 = _nearest(pole_pair_crop[1])
-    trunk = None
-    trunk_ids: list[int] = []
-    trunk_len = 0.0
-    if n1 != n2:
-        dist, prev = _graph_dijkstra(graph, [n1], want_prev=True)
-        if n2 in dist:
-            trunk_ids = _graph_reconstruct(prev, n2)
-            trunk = pts[trunk_ids]
-            trunk_len = float(dist[n2])
-    if trunk is None or len(trunk) < 3 or trunk_len < 0.7 * longest_len:
-        trunk = longest
-        trunk_ids = _graph_reconstruct(prev, tip) if False else []
-        trunk_len = longest_len
-        # longest path node ids are reconstructed below from its points
-        trunk_ids = []
-        for pxy in longest:
-            d = np.linalg.norm(pts - pxy[None, :], axis=1)
-            trunk_ids.append(int(np.argmin(d)))
-    trunk_nodes = set(trunk_ids)
-    # branches: distance to nearest trunk node + shortest path
-    dist, prev = _graph_dijkstra(graph, list(trunk_nodes), want_prev=True)
-    branches: list[np.ndarray] = []
+    trunk_ids = _graph_reconstruct(prev, tip)
+    trunk_ids_set = set(trunk_ids)
+    # Side arms hanging off the trunk (attachment node is a trunk node).
+    dist2, prev2 = _graph_dijkstra(graph, list(trunk_ids_set), want_prev=True)
+    arms: list[tuple[int, list[int]]] = []
     for end in ends:
-        if end in trunk_nodes:
+        if end in trunk_ids_set:
             continue
-        if end not in dist or dist[end] < min_branch_px:
+        if end not in dist2 or dist2[end] < max(min_branch_px, 1.0):
             continue
-        path = _graph_reconstruct(prev, end)
-        if len(path) < 3:
+        path = _graph_reconstruct(prev2, end)
+        if len(path) >= 3:
+            arms.append((path[0], path))
+    # Cap forks: an arm whose attachment is at a trunk end and which is short
+    # is a skeleton split of the blunt cap, not a real side branch. Fold the
+    # split away: truncate the trunk to the junction and drop the arm.
+    pos = {node: i for i, node in enumerate(trunk_ids)}
+    cap_span = max(3.0, float(cap_fork_frac) * len(trunk_ids))
+    kept_arms: list[list[int]] = []
+    kept_arm_nodes: set[int] = set()
+    for attach, path in arms:
+        j = pos.get(attach)
+        branch_px = float(np.sum(np.hypot(*np.diff(pts[path], axis=0).T)))
+        near_start = j is not None and j <= cap_span
+        near_end = j is not None and j >= len(trunk_ids) - 1 - cap_span
+        if (near_start or near_end) and branch_px <= cap_fork_max_px:
+            if near_start and j is not None:
+                trunk_ids = trunk_ids[j:]
+            elif near_end and j is not None:
+                trunk_ids = trunk_ids[: j + 1]
+            pos = {node: i for i, node in enumerate(trunk_ids)}
             continue
-        branches.append(pts[path])
+        kept_arms.append(path)
+        kept_arm_nodes.add(path[-1])
+    trunk = pts[trunk_ids] if len(trunk_ids) >= 3 else None
+    branches = [pts[path] for path in kept_arms]
     return trunk, branches
 
 
@@ -1905,20 +1904,22 @@ def _equidistant_result(
     opening_r = float(params.get("equidistant_opening_radius", 0.0) or 0.0)
     if opening_r > 0:
         opened = ndimage.binary_opening(work, structure=morphology.disk(opening_r))
-        cleaned = cleaned or bool(np.any(opened != work))
-        work = opened
+        # Opening can sever a thin connection (e.g. the neck of a folded
+        # cell); never let cleanup disconnect the mask.
+        if ndimage.label(opened)[1] <= ndimage.label(work)[1]:
+            cleaned = cleaned or bool(np.any(opened != work))
+            work = opened
     centroid_xy, axis_xy, _ar = _mask_major_axis(crop)
-    pole_pair = _find_pole_pair(
-        outline_crop,
-        axis_xy,
-        int(params["pole_max_candidates"]),
-        float(params["pole_axis_tol_deg"]),
-    )
     branch_min_px = max(
         float(params.get("equidistant_branch_min_px", 3.0)),
         float(params.get("equidistant_branch_min_um", 0.2)) / max(float(pixel_microns), 1e-9),
     )
-    axis, side_branches = _skeleton_trunk_and_branches(work, pole_pair, branch_min_px)
+    axis, side_branches = _skeleton_trunk_and_branches(
+        work,
+        branch_min_px,
+        cap_fork_frac=float(params.get("equidistant_cap_fork_frac", 0.12)),
+        cap_fork_max_px=float(params.get("equidistant_cap_fork_max_px", 12.0)),
+    )
     if axis is None or len(axis) < 8:
         return _axis_segment_result(crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns)
     axis = _resample_arclength(axis, int(params["equidistant_axis_points"]))
@@ -1954,9 +1955,10 @@ def _equidistant_result(
     tips = []
     bases = []
     pole_widths = []
+    tip_base = min(16, max(6, len(axis) // 4))
     for end in (0, 1):
         k = len(axis) - 1 if end == 1 else 0
-        k2 = max(0, k - 5) if end == 1 else min(len(axis) - 1, k + 5)
+        k2 = max(0, k - tip_base) if end == 1 else min(len(axis) - 1, k + tip_base)
         tangent = axis[k] - axis[k2]
         if float(np.hypot(tangent[0], tangent[1])) <= 1e-9:
             tangent = np.array([1.0, 0.0])
@@ -1964,8 +1966,13 @@ def _equidistant_result(
         if clean_contour is not None:
             tip = _project_to_polyline(tip, clean_contour)
         c1, c2 = _arc_walk_closed(outline_s, tip, base_offset)
+        base_mid = 0.5 * (c1 + c2)
+        # The chord midpoint can sit off-axis at curved/oblique caps; project
+        # it back onto the trunk so the pole junction cannot kink sideways.
+        dd = np.sum((axis - base_mid[None, :]) ** 2, axis=1)
+        base_mid = axis[int(np.argmin(dd))]
         tips.append(tip)
-        bases.append(0.5 * (c1 + c2))
+        bases.append(base_mid)
         pole_widths.append(float(np.linalg.norm(c2 - c1)))
 
     inner = axis[8:-8] if len(axis) > 20 else axis[2:-2]
