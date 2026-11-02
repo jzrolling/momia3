@@ -1,0 +1,16 @@
+{
+  "attributes": {
+    "pixel_microns": 0.04968,
+    "channels": [
+      "ch0",
+      "ch1",
+      "ch2"
+    ],
+    "provenance": {
+      "op": "io.import_tiff",
+      "source": "/Users/jzrolling/Desktop/Projects/Playground_kimi/momia3/data/SP_003.tif"
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}

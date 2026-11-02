@@ -129,6 +129,13 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "septum_dip_frac": 0.25,
     # degenerate (near-round) cells
     "degenerate_ar": 1.4,
+    # non-parametric dense-point curve refinement ("energy" method)
+    "midline_method": "spline",  # "spline" (default) | "energy"
+    "energy_data_weight": 1.0,
+    "energy_curv_weight": 10.0,
+    "energy_spacing_weight": 50.0,
+    "energy_max_offset": 2.5,
+    "energy_iters": 200,
 }
 
 
@@ -1302,12 +1309,115 @@ def _skeleton_side_branches(
 # ---------------------------------------------------------------------------
 
 
+def _energy_refine(
+    curve_xy: np.ndarray,
+    field_crop: np.ndarray,
+    offset_xy: np.ndarray,
+    params: Mapping[str, Any],
+) -> tuple[np.ndarray, float, float]:
+    """Dense-point curvature-regularized midline (the "energy" method).
+
+    The midline is a dense polyline (no spline basis, no control points); all
+    interior points are optimized jointly:
+
+        E = -w_d * mean(score(p_i))
+            + w_c * sum(|p_{i+1} - 2 p_i + p_{i-1}|^2)
+            + w_l * sum((|p_{i+1} - p_i| - s0)^2)
+
+    The curvature term charges every point's absolute bending, so neither a
+    local wiggle nor a low-frequency sag can hide in a few basis coefficients;
+    the spacing term keeps the samples uniform and the score map (e.g. the
+    Omnipose distance channel) decides how much bending is worth paying for.
+    Endpoints (poles) stay fixed. Returns (curve, data_energy, curvature_energy).
+    """
+    from scipy.optimize import minimize
+
+    curve = np.asarray(curve_xy, dtype=np.float64)
+    n = len(curve)
+    if n < 8:
+        return curve, 0.0, 0.0
+    offset = np.asarray(offset_xy, dtype=np.float64)
+    p0 = curve - offset
+    p_start, p_end = p0[0].copy(), p0[-1].copy()
+    s0 = float(np.linalg.norm(np.diff(p0, axis=0), axis=1).mean())
+    field = np.asarray(field_crop, dtype=np.float64)
+    gx = np.gradient(field, axis=1)
+    gy = np.gradient(field, axis=0)
+
+    w_d = float(params["energy_data_weight"])
+    w_c = float(params["energy_curv_weight"])
+    w_l = float(params["energy_spacing_weight"])
+    max_off = float(params["energy_max_offset"])
+    iters = int(params["energy_iters"])
+    m = n - 2
+
+    def _interp(arr, pts):
+        return ndimage.map_coordinates(
+            arr, [pts[:, 1], pts[:, 0]], order=1, mode="nearest"
+        )
+
+    def _unpack(x):
+        pts = np.empty((n, 2), dtype=np.float64)
+        pts[0] = p_start
+        pts[-1] = p_end
+        pts[1:-1] = x.reshape(m, 2)
+        return pts
+
+    def _fun(x):
+        pts = _unpack(x)
+        e_data = -w_d * float(_interp(field, pts).mean())
+        c = pts[2:] - 2.0 * pts[1:-1] + pts[:-2]
+        e_curv = w_c * float(np.sum(c * c))
+        e = np.diff(pts, axis=0)
+        e_len = np.linalg.norm(e, axis=1)
+        e_space = w_l * float(np.sum((e_len - s0) ** 2))
+        return e_data + e_curv + e_space
+
+    def _jac(x):
+        pts = _unpack(x)
+        g = -w_d / n * np.stack(
+            [_interp(gx, pts), _interp(gy, pts)], axis=1
+        )
+        c = pts[2:] - 2.0 * pts[1:-1] + pts[:-2]
+        gc = np.zeros((n, 2), dtype=np.float64)
+        gc[0 : n - 2] += c
+        gc[1 : n - 1] += -2.0 * c
+        gc[2:] += c
+        g += 2.0 * w_c * gc
+        e = np.diff(pts, axis=0)
+        e_len = np.linalg.norm(e, axis=1) + 1e-9
+        gs = 2.0 * w_l * (e_len - s0)[:, None] * e / e_len[:, None]
+        g[:-1] += -gs
+        g[1:] += gs
+        return g[1:-1].ravel()
+
+    bounds = []
+    for i in range(1, n - 1):
+        bounds.append((p0[i, 0] - max_off, p0[i, 0] + max_off))
+        bounds.append((p0[i, 1] - max_off, p0[i, 1] + max_off))
+    opt = minimize(
+        _fun,
+        p0[1:-1].ravel(),
+        jac=_jac,
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": iters, "ftol": 1e-9},
+    )
+    pts = _unpack(opt.x)
+    refined = pts + offset
+    e_data = -w_d * float(_interp(field, pts).mean())
+    c = pts[2:] - 2.0 * pts[1:-1] + pts[:-2]
+    e_curv = w_c * float(np.sum(c * c))
+    return refined, e_data, e_curv
+
+
 def _midline_single(
     crop: np.ndarray,
     offset_xy: np.ndarray,
     outline: np.ndarray,
     params: Mapping[str, Any],
     pixel_microns: float,
+    score_crop: np.ndarray | None = None,
 ) -> dict[str, Any] | None:
     """Full pole-first midline pipeline for one cropped instance mask
     (global coords out). See the module docstring for the algorithm."""
@@ -1396,8 +1506,31 @@ def _midline_single(
             crop, offset_xy, params, pixel_microns
         )
 
+        # Optional non-parametric dense-point refinement against a score map
+        # (e.g. Omnipose's predicted distance channel). The existing low-DOF
+        # spline stays the default; the energy method is opt-in.
+        energy_diag = None
+        if (
+            str(params.get("midline_method", "spline")) == "energy"
+            and quality in ("refined", "geodesic")
+        ):
+            field = score_crop
+            if field is None:
+                field = ndimage.distance_transform_edt(ndimage.binary_fill_holes(crop))
+            field = ndimage.gaussian_filter(np.asarray(field, dtype=np.float64), 1.0)
+            scale = float(np.std(field[crop])) if bool(np.any(crop)) else 1.0
+            if not np.isfinite(scale) or scale < 1e-6:
+                scale = 1.0
+            curve_e, e_data, e_curv = _energy_refine(
+                curve, field / scale, offset_xy, params
+            )
+            if np.all(np.isfinite(curve_e)):
+                curve = curve_e
+                quality = "energy"
+                energy_diag = (e_data, e_curv)
+
         # Steps 5+6 — septum-aware poles, width profile, diagnostics.
-        return _assemble_result(
+        result = _assemble_result(
             curve,
             index,
             params,
@@ -1408,6 +1541,10 @@ def _midline_single(
             side_branches,
             geo_smooth,
         )
+        if energy_diag is not None:
+            result["energy_data"] = float(energy_diag[0])
+            result["energy_curv"] = float(energy_diag[1])
+        return result
     except Exception as exc:
         logger.debug("midline pipeline failed (%s); flagging cell as failed", exc)
         return _empty_result(params, "failed")
@@ -1418,6 +1555,7 @@ def extract_midlines(
     outlines: Mapping[int, np.ndarray] | None = None,
     params: Mapping[str, Any] | None = None,
     pixel_microns: float = 0.065,
+    score_map: np.ndarray | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Extract midlines, poles, width profiles and scalars per label.
 
@@ -1444,6 +1582,10 @@ def extract_midlines(
         ``degenerate_ar`` (near-round threshold).
     pixel_microns : float
         Physical pixel size in microns.
+    score_map : numpy.ndarray of float, optional
+        Global score/distance field (e.g. the Omnipose "dist" channel).
+        Used only when params["midline_method"] == "energy"; when None the
+        binary-mask EDT of each crop is used as fallback data term.
 
     Returns
     -------
@@ -1486,7 +1628,10 @@ def extract_midlines(
         x1 = min(sl[1].stop + pad, img_w)
         crop = labels[y0:y1, x0:x1] == lab
         offset_xy = np.array([float(x0), float(y0)])
-        result = _midline_single(crop, offset_xy, outline, p, float(pixel_microns))
+        score_crop = None if score_map is None else np.asarray(score_map)[y0:y1, x0:x1]
+        result = _midline_single(
+            crop, offset_xy, outline, p, float(pixel_microns), score_crop
+        )
         if result is None:
             continue
         width = result["width_profile"]
