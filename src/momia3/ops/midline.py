@@ -152,6 +152,9 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_branch_min_um": 0.2,  # momia2 default; effective min = max(px, um/pixel_microns)
     "equidistant_cap_fork_frac": 0.12,  # arms attached within this trunk-length fraction of an end are cap forks
     "equidistant_cap_fork_max_px": 12.0,  # cap-fork arm max length (px)
+    "equidistant_guard_chord_solidity": 0.85,  # convex masks should not bend off the pole chord
+    "equidistant_guard_chord_dev_frac": 0.30,  # reject if deviation > frac * width
+    "equidistant_guard_chord_dev_px": 1.5,  # ... and at least this many px
     "equidistant_fill_holes": True,  # close interior holes before skeletonizing
     "equidistant_opening_radius": 1.0,  # binary opening radius (px) to strip mask rags
     "equidistant_outline_from_clean_mask": True,  # draw outline on the cleaned mask
@@ -1817,7 +1820,7 @@ def _equidistant_guard(
     candidate: Mapping[str, Any],
     offset_xy: np.ndarray,
     aspect_ratio: float,
-) -> bool:
+) -> tuple[bool, str]:
     """Reject equidistant results where the skeleton-based geometry is unsafe.
 
     Near-round cells (AR < 2) are better served by the straight axis; high
@@ -1825,15 +1828,36 @@ def _equidistant_guard(
     """
     mid = np.asarray(candidate["midline"][0], dtype=np.float64) - offset_xy
     if not np.all(np.isfinite(mid)) or len(mid) < 8:
-        return False
+        return False, "invalid"
     width = float(candidate.get("equidistant_width", 0.0))
     if width > 0 and _arc_length(mid) / width < 2.5:
-        return False
+        return False, "short"
     if float(candidate.get("max_curvature", 0.0)) > 1.0:
-        return False
+        return False, "curvature"
     if _end_angle_deg(mid) > 15.0:
-        return False
-    return True
+        return False, "end_angle"
+    # Convex (nearly straight) masks: the midline must follow the pole chord.
+    # A skeleton that wanders off (oversegmented / drug-treated caps) shows a
+    # large perpendicular deviation on an otherwise convex mask; fall back.
+    solidity = float(candidate.get("equidistant_solidity", 0.0))
+    if solidity >= 0.85 and 3 <= len(mid) < 2000 and width > 0:
+        chord = mid[-1] - mid[0]
+        chord_len = float(np.hypot(chord[0], chord[1]))
+        if chord_len > 1e-6:
+            nrm = np.array([-chord[1], chord[0]]) / chord_len
+            rel = mid - mid[0][None, :]
+            dev = float(np.max(np.abs(rel @ nrm)))
+            dev_frac = float(
+                candidate.get("equidistant_guard_chord_dev_frac", 0.30)
+            )
+            if dev > max(
+                float(candidate.get("equidistant_guard_chord_dev_px", 1.5)),
+                dev_frac * width,
+            ):
+                # Convex mask but bowed midline: fall back to the straight
+                # default spine and suppress the cap-fork side arms too.
+                return False, "chord"
+    return True, ""
 
 
 def _refine_branch(
@@ -1947,6 +1971,13 @@ def _equidistant_result(
     outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
 
     edt = ndimage.distance_transform_edt(work)
+    solidity = 1.0
+    try:
+        props = skmeasure.regionprops(work.astype(np.int32))
+        if props:
+            solidity = float(props[0].solidity)
+    except Exception as exc:  # pragma: no cover - solidity is advisory only
+        logger.debug("solidity computation failed (%s)", exc)
     ax_cols = np.clip(np.round(axis[:, 0]).astype(int), 0, crop.shape[1] - 1)
     ax_rows = np.clip(np.round(axis[:, 1]).astype(int), 0, crop.shape[0] - 1)
     width = 2.0 * float(np.median(edt[ax_rows, ax_cols]))
@@ -2020,6 +2051,13 @@ def _equidistant_result(
         "width_cv": _width_cv(width_profile),
         "pole_widths": pole_widths,
         "equidistant_width": float(width),
+        "equidistant_solidity": float(solidity),
+        "equidistant_guard_chord_dev_px": float(
+            params.get("equidistant_guard_chord_dev_px", 1.5)
+        ),
+        "equidistant_guard_chord_dev_frac": float(
+            params.get("equidistant_guard_chord_dev_frac", 0.30)
+        ),
     }
 
 
@@ -2061,6 +2099,7 @@ def _midline_single(
         # Opt-in alternative: MicrobeJ-style contour-cut poles from a
         # pre-smoothed mask skeleton (does not use the geodesic stage).
         equidistant_fallback = False
+        suppress_branches = False
         if str(params.get("midline_method", "spline")) == "equidistant":
             candidate = _equidistant_result(
                 crop, offset_xy, outline_crop, params, pixel_microns, index, knn
@@ -2068,11 +2107,18 @@ def _midline_single(
             if candidate is not None and candidate.get("midline_quality") == "degenerate":
                 return candidate
             guard_on = bool(params.get("equidistant_guard", True))
-            if candidate is not None and (
-                not guard_on or _equidistant_guard(candidate, offset_xy, aspect_ratio)
-            ):
-                return candidate
+            if candidate is not None:
+                if not guard_on:
+                    return candidate
+                guard_ok, guard_reason = _equidistant_guard(
+                    candidate, offset_xy, aspect_ratio
+                )
+                if guard_ok:
+                    return candidate
+            else:
+                guard_reason = "failed"
             equidistant_fallback = True
+            suppress_branches = guard_reason == "chord"
 
         # Step 1 — pole-first initialization.
         pole1_xy, pole2_xy = _find_pole_pair(
@@ -2176,6 +2222,10 @@ def _midline_single(
         if equidistant_fallback:
             result["midline_quality"] = "equidistant_fallback"
             result["equidistant_guard"] = "failed"
+            if suppress_branches:
+                result["midline"] = [result["midline"][0]]
+                result["branched"] = 0.0
+                result["branch_lengths"] = []
         return result
     except Exception as exc:
         logger.debug("midline pipeline failed (%s); flagging cell as failed", exc)
