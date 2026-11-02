@@ -130,6 +130,11 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "septum_dip_frac": 0.25,
     # degenerate (near-round) cells
     "degenerate_ar": 1.4,
+    "degenerate_refine": True,  # one equidistant chord-midpoint pass on the degenerate axis
+    "degenerate_refine_iters": 3,
+    "degenerate_refine_anchor": 2,  # end points only constrain the spline, not moved by chords
+    "degenerate_refine_damp": 0.6,
+    "degenerate_refine_smooth": 0.03,
     # end-point handling / resampling (opt-in; defaults keep legacy behavior)
     "pole_endpoint": "extended",  # "extended" (legacy) | "initial" (outline pole pair)
     "n_points_auto": False,  # True: n = arc_length / n_points_target_spacing_px
@@ -1299,6 +1304,57 @@ def _assemble_result(
     }
 
 
+def _refine_degenerate_axis(
+    main_global: np.ndarray,
+    outline_global: np.ndarray,
+    params: Mapping[str, Any],
+) -> np.ndarray:
+    """Cross-section chord-midpoint refinement for a degenerate straight axis.
+
+    Interior points are moved to the midpoint of the perpendicular chord
+    (equidistant step); the last ``anchor`` points at each end are excluded
+    from the chord update and only act as spline constraints.
+    """
+    ring = np.asarray(outline_global, dtype=np.float64)
+    if len(ring) < 8 or len(main_global) < 6:
+        return np.asarray(main_global, dtype=np.float64)
+    edge = np.vstack([ring, ring[:1]])
+    perimeter = float(np.sum(np.hypot(np.diff(edge[:, 0]), np.diff(edge[:, 1]))))
+    n_ring = max(16, int(round(perimeter / float(params.get("equidistant_outline_downsample", 2.0)))))
+    ring_s = _resample_closed(ring, n_ring)
+    ring_s = _taubin_closed(ring_s, int(params.get("equidistant_outline_smooth", 45)))
+    anchor = int(params.get("degenerate_refine_anchor", 2))
+    damp = float(params.get("degenerate_refine_damp", 0.6))
+    iters = int(params.get("degenerate_refine_iters", 3))
+    orig = np.asarray(main_global, dtype=np.float64)
+    pnts = _resample_arclength(orig, len(orig))
+    for _ in range(max(iters, 0)):
+        q = pnts.copy()
+        for i in range(anchor, len(pnts) - anchor):
+            t = pnts[i + 1] - pnts[i - 1]
+            normal = np.array([-t[1], t[0]], dtype=np.float64)
+            if float(np.hypot(normal[0], normal[1])) <= 1e-9:
+                continue
+            c1 = _ray_outline_hit(ring_s, pnts[i], normal)
+            c2 = _ray_outline_hit(ring_s, pnts[i], -normal)
+            if not (np.all(np.isfinite(c1)) and np.all(np.isfinite(c2))):
+                continue
+            q[i] = pnts[i] + damp * (0.5 * (c1 + c2) - pnts[i])
+        pnts = _resample_arclength(q, len(q))
+        s = float(
+            np.clip(
+                float(params.get("degenerate_refine_smooth", 0.03)) * _arc_length(pnts),
+                1.5,
+                12.0,
+            )
+        )
+        pnts = _smooth_open_weighted(pnts, s, n=len(pnts), w_end=60.0)
+        pnts = _resample_arclength(pnts, len(pnts))
+    pnts[0] = orig[0]
+    pnts[-1] = orig[-1]
+    return pnts
+
+
 def _axis_segment_result(
     crop: np.ndarray,
     offset_xy: np.ndarray,
@@ -1307,9 +1363,10 @@ def _axis_segment_result(
     index: _OutlineIndex,
     params: Mapping[str, Any],
     pixel_microns: float,
+    outline_global: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Degenerate (near-round) cell: major-axis segment clipped to the
-    outline, NO geodesic/spline refinement."""
+    outline, optionally refined by one equidistant chord-midpoint pass."""
     knn = int(params["knn"])
     centroid_global = centroid_xy + offset_xy
     _, p1 = index.ray_intersections(centroid_global[None, :], axis_xy[None, :], knn)
@@ -1317,20 +1374,25 @@ def _axis_segment_result(
     pole1 = p1[0] if np.isfinite(p1[0]).all() else centroid_global + axis_xy
     pole2 = p2[0] if np.isfinite(p2[0]).all() else centroid_global - axis_xy
     main = _resample_arclength(np.vstack([pole1, pole2]), int(params["n_points"]))
+    if outline_global is not None and bool(params.get("degenerate_refine", True)):
+        main = _refine_degenerate_axis(main, outline_global, params)
     width = _width_profile(main, index, knn, pixel_microns)
     length_px = _arc_length(main)
+    pole_dist = float(np.hypot(*(pole2 - pole1)))
+    sinuosity = float(length_px / pole_dist) if pole_dist > 1e-6 else 1.0
+    _, max_curv = _curvature_stats(main)
     return {
         "midline": [main],
         "width_profile": width,
         "pole1": pole1,
         "pole2": pole2,
         "length_um": length_px * float(pixel_microns),
-        "sinuosity": 1.0,
+        "sinuosity": sinuosity,
         "branched": 0.0,
         "midline_quality": "degenerate",
         "n_iter": 0,
         "final_residual": 0.0,
-        "max_curvature": 0.0,
+        "max_curvature": float(max_curv),
         "width_cv": _width_cv(width),
     }
 
@@ -2307,10 +2369,12 @@ def _midline_single(
 
         centroid_xy, axis_xy, aspect_ratio = _mask_major_axis(crop)
 
-        # Degenerate near-round cells: major-axis segment, no refinement.
+        # Degenerate near-round cells: major-axis segment, then one
+        # equidistant chord-midpoint refinement round.
         if aspect_ratio < float(params["degenerate_ar"]):
             return _axis_segment_result(
-                crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns
+                crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
+                outline_global=outline,
             )
 
         outline_crop = np.asarray(outline, dtype=np.float64) - offset_xy
@@ -2336,8 +2400,16 @@ def _midline_single(
                     return candidate
             else:
                 guard_reason = "failed"
-            equidistant_fallback = True
-            suppress_branches = guard_reason == "chord"
+            # Guard rejections are routed to the (now refined) degenerate
+            # spine instead of the default spline: the degenerate result is
+            # stable and, after the chord-midpoint pass, follows the cell.
+            deg = _axis_segment_result(
+                crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
+                outline_global=outline,
+            )
+            deg["midline_quality"] = "degenerate"
+            deg["equidistant_guard"] = guard_reason
+            return deg
 
         # Step 1 — pole-first initialization.
         pole1_xy, pole2_xy = _find_pole_pair(
