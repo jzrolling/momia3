@@ -1614,6 +1614,46 @@ def _arc_walk_closed(
     return _walk(1), _walk(-1)
 
 
+def _end_angle_deg(points: np.ndarray, k: int = 5) -> float:
+    """Max turning angle at the two ends (degrees)."""
+    p = np.asarray(points, dtype=np.float64)
+    worst = 0.0
+    for seq in (p, p[::-1]):
+        if len(seq) < 2 * k + 2:
+            continue
+        a = seq[-1] - seq[-1 - k]
+        b = seq[-1 - k] - seq[-1 - 2 * k]
+        na, nb = float(np.hypot(a[0], a[1])), float(np.hypot(b[0], b[1]))
+        if na <= 1e-9 or nb <= 1e-9:
+            continue
+        c = float(np.clip((a[0] * b[0] + a[1] * b[1]) / (na * nb), -1.0, 1.0))
+        worst = max(worst, float(np.degrees(np.arccos(c))))
+    return worst
+
+
+def _equidistant_guard(
+    candidate: Mapping[str, Any],
+    offset_xy: np.ndarray,
+    aspect_ratio: float,
+) -> bool:
+    """Reject equidistant results where the skeleton-based geometry is unsafe.
+
+    Near-round cells (AR < 2) are better served by the straight axis; high
+    end curvature means a pole junction is oscillating (lobed/merged masks).
+    """
+    mid = np.asarray(candidate["midline"][0], dtype=np.float64) - offset_xy
+    if not np.all(np.isfinite(mid)) or len(mid) < 8:
+        return False
+    width = float(candidate.get("equidistant_width", 0.0))
+    if width > 0 and _arc_length(mid) / width < 2.5:
+        return False
+    if float(candidate.get("max_curvature", 0.0)) > 1.0:
+        return False
+    if _end_angle_deg(mid) > 15.0:
+        return False
+    return True
+
+
 def _equidistant_result(
     crop: np.ndarray,
     offset_xy: np.ndarray,
@@ -1701,6 +1741,7 @@ def _equidistant_result(
         "max_curvature": float(max_curv),
         "width_cv": _width_cv(width_profile),
         "pole_widths": pole_widths,
+        "equidistant_width": float(width),
     }
 
 
@@ -1741,10 +1782,16 @@ def _midline_single(
 
         # Opt-in alternative: MicrobeJ-style contour-cut poles from a
         # pre-smoothed mask skeleton (does not use the geodesic stage).
+        equidistant_fallback = False
         if str(params.get("midline_method", "spline")) == "equidistant":
-            return _equidistant_result(
+            candidate = _equidistant_result(
                 crop, offset_xy, outline_crop, params, pixel_microns, index, knn
             )
+            if candidate is not None and candidate.get("midline_quality") == "degenerate":
+                return candidate
+            if candidate is not None and _equidistant_guard(candidate, offset_xy, aspect_ratio):
+                return candidate
+            equidistant_fallback = True
 
         # Step 1 — pole-first initialization.
         pole1_xy, pole2_xy = _find_pole_pair(
@@ -1845,6 +1892,9 @@ def _midline_single(
         if energy_diag is not None:
             result["energy_data"] = float(energy_diag[0])
             result["energy_curv"] = float(energy_diag[1])
+        if equidistant_fallback:
+            result["midline_quality"] = "equidistant_fallback"
+            result["equidistant_guard"] = "failed"
         return result
     except Exception as exc:
         logger.debug("midline pipeline failed (%s); flagging cell as failed", exc)
