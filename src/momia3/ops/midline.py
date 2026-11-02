@@ -1900,154 +1900,6 @@ def _refine_branch(
     return q
 
 
-def _prepare_work_mask(
-    crop: np.ndarray, params: Mapping[str, Any]
-) -> tuple[np.ndarray, bool]:
-    """Fill holes + opening (never disconnect) for skeleton geometry."""
-    work = np.asarray(crop, dtype=bool)
-    sigma = float(params.get("equidistant_presmooth_sigma", 0.0) or 0.0)
-    if sigma > 0:
-        work = ndimage.gaussian_filter(work.astype(np.float32), sigma) > 0.5
-    cleaned = False
-    if bool(params.get("equidistant_fill_holes", True)):
-        filled = ndimage.binary_fill_holes(work)
-        cleaned = cleaned or bool(np.any(filled != work))
-        work = filled
-    opening_r = float(params.get("equidistant_opening_radius", 0.0) or 0.0)
-    if opening_r > 0:
-        opened = ndimage.binary_opening(work, structure=morphology.disk(opening_r))
-        if ndimage.label(opened)[1] <= ndimage.label(work)[1]:
-            cleaned = cleaned or bool(np.any(opened != work))
-            work = opened
-    return work, cleaned
-
-
-def _equidistant_side_branches(
-    crop: np.ndarray,
-    offset_xy: np.ndarray,
-    outline_crop: np.ndarray,
-    params: Mapping[str, Any],
-    pixel_microns: float,
-) -> list[np.ndarray]:
-    """Refined skeleton side branches (global coords) for fallback results.
-
-    Same trunk/branch extraction and tip extension as the equidistant method,
-    so anomalous cells keep a correct branch description even when the main
-    midline falls back to the default spine.
-    """
-    try:
-        work, cleaned = _prepare_work_mask(crop, params)
-        branch_min_px = max(
-            float(params.get("equidistant_branch_min_px", 3.0)),
-            float(params.get("equidistant_branch_min_um", 0.2)) / max(float(pixel_microns), 1e-9),
-        )
-        _, side = _skeleton_trunk_and_branches(
-            work,
-            branch_min_px,
-            cap_fork_frac=float(params.get("equidistant_cap_fork_frac", 0.12)),
-            cap_fork_max_px=float(params.get("equidistant_cap_fork_max_px", 12.0)),
-        )
-        if not side:
-            return []
-        clean_contour = None
-        if cleaned and bool(params.get("equidistant_outline_from_clean_mask", True)):
-            clean_contour = _smoothed_mask_contour(work)
-        outline_src = (
-            clean_contour
-            if clean_contour is not None
-            else np.asarray(outline_crop, dtype=np.float64)
-        )
-        edge = np.vstack([outline_src, outline_src[:1]])
-        perimeter = float(np.sum(np.hypot(np.diff(edge[:, 0]), np.diff(edge[:, 1]))))
-        n_out = max(
-            16,
-            int(round(perimeter / float(params.get("equidistant_outline_downsample", 2.0)))),
-        )
-        outline_s = _resample_closed(outline_src, int(n_out))
-        outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
-        out: list[np.ndarray] = []
-        for b in side:
-            rb = _refine_branch(b, outline_s, branch_min_px, snap_poly=clean_contour)
-            if rb is not None:
-                out.append(np.asarray(rb, dtype=np.float64) + offset_xy)
-        return out
-    except Exception as exc:  # pragma: no cover - branches are advisory
-        logger.debug("equidistant side-branch extraction failed (%s)", exc)
-        return []
-
-
-def _refined_fallback_branches(
-    crop: np.ndarray,
-    offset_xy: np.ndarray,
-    outline_crop: np.ndarray,
-    main_global: np.ndarray,
-    params: Mapping[str, Any],
-    pixel_microns: float,
-) -> list[np.ndarray]:
-    """Branch description for fallback results, extended to the outline.
-
-    Uses the default skeleton side-branch tracer (which keeps small wall
-    protrusions that opening would erase), drops blunt-cap forks, and refines
-    each remaining arm with the equidistant tip logic.
-    """
-    try:
-        raw = _skeleton_side_branches(crop, offset_xy, params, pixel_microns)
-        if not raw:
-            return []
-        work, cleaned = _prepare_work_mask(crop, params)
-        clean_contour = None
-        if cleaned and bool(params.get("equidistant_outline_from_clean_mask", True)):
-            clean_contour = _smoothed_mask_contour(work)
-        outline_src = (
-            clean_contour
-            if clean_contour is not None
-            else np.asarray(outline_crop, dtype=np.float64)
-        )
-        edge = np.vstack([outline_src, outline_src[:1]])
-        perimeter = float(np.sum(np.hypot(np.diff(edge[:, 0]), np.diff(edge[:, 1]))))
-        n_out = max(
-            16,
-            int(round(perimeter / float(params.get("equidistant_outline_downsample", 2.0)))),
-        )
-        outline_s = _resample_closed(outline_src, int(n_out))
-        outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
-        main_local = np.asarray(main_global, dtype=np.float64) - offset_xy
-        branch_min_px = max(
-            float(params.get("equidistant_branch_min_px", 3.0)),
-            float(params.get("equidistant_branch_min_um", 0.2)) / max(float(pixel_microns), 1e-9),
-        )
-        main_len = _arc_length(main_local)
-        cap_near = max(3.0, 0.10 * main_len)
-        out: list[np.ndarray] = []
-        for b in raw:
-            b_local = np.asarray(b, dtype=np.float64) - offset_xy
-            if len(b_local) < 3:
-                continue
-            d_start = np.min(np.linalg.norm(main_local - b_local[0][None, :], axis=1))
-            d_end = np.min(np.linalg.norm(main_local - b_local[-1][None, :], axis=1))
-            if d_end < d_start:
-                b_local = b_local[::-1]
-                d_start = d_end
-            branch_len = _arc_length(b_local)
-            end_dist = min(
-                float(np.hypot(*(b_local[0] - main_local[0]))),
-                float(np.hypot(*(b_local[0] - main_local[-1]))),
-            )
-            # blunt-cap fork: short arm attached right at a pole
-            if d_start <= cap_near and end_dist <= cap_near and branch_len <= 12.0:
-                continue
-            rb = _refine_branch(b_local, outline_s, branch_min_px, snap_poly=clean_contour)
-            if rb is None:
-                continue
-            dd = np.sum((main_local[:, None, :] - rb[0][None, :]) ** 2, axis=2)
-            rb[0] = main_local[int(np.argmin(dd))]
-            out.append(np.asarray(rb, dtype=np.float64) + offset_xy)
-        return out
-    except Exception as exc:  # pragma: no cover - branches are advisory
-        logger.debug("fallback branch refinement failed (%s)", exc)
-        return []
-
-
 def _equidistant_result(
     crop: np.ndarray,
     offset_xy: np.ndarray,
@@ -2064,7 +1916,23 @@ def _equidistant_result(
     are sub-pixel contour tips (ray from the axis end tangent) and base
     chords cut at equal arclength along the smoothed outline.
     """
-    work, cleaned = _prepare_work_mask(crop, params)
+    sigma = float(params.get("equidistant_presmooth_sigma", 0.0) or 0.0)
+    work = np.asarray(crop, dtype=bool)
+    if sigma > 0:
+        work = ndimage.gaussian_filter(work.astype(np.float32), sigma) > 0.5
+    cleaned = False
+    if bool(params.get("equidistant_fill_holes", True)):
+        filled = ndimage.binary_fill_holes(work)
+        cleaned = cleaned or bool(np.any(filled != work))
+        work = filled
+    opening_r = float(params.get("equidistant_opening_radius", 0.0) or 0.0)
+    if opening_r > 0:
+        opened = ndimage.binary_opening(work, structure=morphology.disk(opening_r))
+        # Opening can sever a thin connection (e.g. the neck of a folded
+        # cell); never let cleanup disconnect the mask.
+        if ndimage.label(opened)[1] <= ndimage.label(work)[1]:
+            cleaned = cleaned or bool(np.any(opened != work))
+            work = opened
     centroid_xy, axis_xy, _ar = _mask_major_axis(crop)
     branch_min_px = max(
         float(params.get("equidistant_branch_min_px", 3.0)),
@@ -2249,32 +2117,6 @@ def _midline_single(
                     return candidate
             else:
                 guard_reason = "failed"
-            # Short/round (high-solidity) cells are better served by the
-            # straight major-axis segment than by the default spline, which
-            # can bend along chain septa or mask bumps. Route them to the
-            # axis result directly; no side branches either.
-            if (
-                guard_reason == "short"
-                and candidate is not None
-                and float(candidate.get("equidistant_solidity", 0.0)) >= 0.85
-            ):
-                axis_res = _axis_segment_result(
-                    crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns
-                )
-                axis_res["midline_quality"] = "equidistant_fallback"
-                axis_res["equidistant_guard"] = "short_axis"
-                extra = _refined_fallback_branches(
-                    crop,
-                    offset_xy,
-                    outline_crop,
-                    np.asarray(axis_res["midline"][0], dtype=np.float64),
-                    params,
-                    pixel_microns,
-                )
-                axis_res["midline"] = [axis_res["midline"][0], *extra]
-                axis_res["branched"] = 1.0 if extra else 0.0
-                axis_res["branch_lengths"] = [float(_arc_length(b)) for b in extra]
-                return axis_res
             equidistant_fallback = True
             suppress_branches = guard_reason == "chord"
 
@@ -2380,17 +2222,10 @@ def _midline_single(
         if equidistant_fallback:
             result["midline_quality"] = "equidistant_fallback"
             result["equidistant_guard"] = "failed"
-            extra = [] if suppress_branches else _refined_fallback_branches(
-                crop,
-                offset_xy,
-                outline_crop,
-                np.asarray(result["midline"][0], dtype=np.float64),
-                params,
-                pixel_microns,
-            )
-            result["midline"] = [result["midline"][0], *extra]
-            result["branched"] = 1.0 if extra else 0.0
-            result["branch_lengths"] = [float(_arc_length(b)) for b in extra]
+            if suppress_branches:
+                result["midline"] = [result["midline"][0]]
+                result["branched"] = 0.0
+                result["branch_lengths"] = []
         return result
     except Exception as exc:
         logger.debug("midline pipeline failed (%s); flagging cell as failed", exc)
