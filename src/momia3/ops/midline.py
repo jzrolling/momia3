@@ -138,6 +138,8 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "degenerate_refine_points": 12,  # coarse polyline used by the chord iteration
     "degenerate_refine_spacing_px": 0.0,  # >0: n = arc / spacing (overrides points)
     "degenerate_solidity_min": 0.85,  # only convex-ish masks take the degenerate path
+    "degenerate_simple_solidity": 0.88,  # cheap pre-gate: simple shape -> degenerate, skip SDF
+    "degenerate_simple_ellipse_dev": 0.12,  # mean |ellipse residual| of the outline
     # end-point handling / resampling (opt-in; defaults keep legacy behavior)
     "pole_endpoint": "extended",  # "extended" (legacy) | "initial" (outline pole pair)
     "n_points_auto": False,  # True: n = arc_length / n_points_target_spacing_px
@@ -1318,6 +1320,33 @@ def _mask_solidity(crop: np.ndarray) -> float:
     return 1.0
 
 
+def _ellipse_deviation(
+    crop: np.ndarray,
+    outline_local: np.ndarray,
+    centroid_xy: np.ndarray,
+    axis_xy: np.ndarray,
+    aspect_ratio: float,
+) -> float:
+    """Mean relative deviation of the outline from a best-fit ellipse.
+
+    Simple (cocci / oval / straight-rod) masks are close to an ellipse;
+    curved, lobed or branched shapes deviate strongly. Cheap enough to run
+    before deciding whether the SDF skeleton is needed at all.
+    """
+    area = float(np.count_nonzero(crop))
+    if area < 8 or aspect_ratio <= 0:
+        return 1.0
+    a = float(np.sqrt(area * aspect_ratio / np.pi))
+    b = max(a / float(aspect_ratio), 1e-6)
+    rel = np.asarray(outline_local, dtype=np.float64) - np.asarray(centroid_xy, dtype=np.float64)[None, :]
+    axis = np.asarray(axis_xy, dtype=np.float64)
+    axis = axis / max(float(np.hypot(axis[0], axis[1])), 1e-12)
+    perp = np.array([-axis[1], axis[0]])
+    u = (rel @ axis) / max(a, 1e-6)
+    v = (rel @ perp) / max(b, 1e-6)
+    return float(np.mean(np.abs(np.hypot(u, v) - 1.0)))
+
+
 def _chord_midpoints_vec(
     points: np.ndarray,
     ring: np.ndarray,
@@ -2450,17 +2479,28 @@ def _midline_single(
             return _empty_result(params, "failed")
 
         centroid_xy, axis_xy, aspect_ratio = _mask_major_axis(crop)
+        outline_local = np.asarray(outline, dtype=np.float64) - offset_xy
+        solidity = _mask_solidity(crop)
+        ellipse_dev = _ellipse_deviation(
+            crop, outline_local, centroid_xy, axis_xy, aspect_ratio
+        )
 
-        # Degenerate near-round CONVEX cells: major-axis segment, then the
-        # equidistant chord-midpoint refinement. Non-convex (lobed/branched)
-        # masks should not be forced onto a straight axis.
-        if aspect_ratio < float(params["degenerate_ar"]):
-            solidity = _mask_solidity(crop)
-            if solidity >= float(params.get("degenerate_solidity_min", 0.85)):
-                return _axis_segment_result(
-                    crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
-                    outline_global=outline,
-                )
+        # Cheap shape gate BEFORE any skeleton work: convex/simple masks
+        # (cocci, ovals, straight rods) go straight to the degenerate spine
+        # with one chord-midpoint round. Only complex shapes (curved, lobed,
+        # branched) pay for the outline-SDF skeleton.
+        simple_shape = (
+            solidity >= float(params.get("degenerate_simple_solidity", 0.88))
+            and ellipse_dev <= float(params.get("degenerate_simple_ellipse_dev", 0.12))
+        )
+        if simple_shape or (
+            aspect_ratio < float(params["degenerate_ar"])
+            and solidity >= float(params.get("degenerate_solidity_min", 0.85))
+        ):
+            return _axis_segment_result(
+                crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
+                outline_global=outline,
+            )
 
         outline_crop = np.asarray(outline, dtype=np.float64) - offset_xy
 
@@ -2489,7 +2529,6 @@ def _midline_single(
             # degenerate spine (stable, follows the cell). Non-convex masks
             # must not be forced onto a straight axis: keep the equidistant
             # candidate even though the strict guard rejected it.
-            solidity = _mask_solidity(crop)
             if solidity >= float(params.get("degenerate_solidity_min", 0.85)):
                 deg = _axis_segment_result(
                     crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns,
