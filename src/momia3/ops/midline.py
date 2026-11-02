@@ -145,7 +145,8 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_final_smooth": 20,
     "equidistant_n_points": 128,
     "equidistant_guard": True,  # False = raw equidistant (no fallback, for evaluation)
-    "equidistant_branch_min_px": 4.0,  # side branches shorter than this are dropped
+    "equidistant_branch_min_px": 3.0,  # absolute minimum branch length (px)
+    "equidistant_branch_min_um": 0.2,  # momia2 default; effective min = max(px, um/pixel_microns)
     "energy_data_weight": 1.0,
     "energy_curv_weight": 10.0,
     "energy_spacing_weight": 50.0,
@@ -1781,6 +1782,43 @@ def _equidistant_guard(
     return True
 
 
+def _refine_branch(
+    branch_local: np.ndarray,
+    outline_s: np.ndarray,
+    min_len_px: float,
+    n_points: int = 64,
+) -> np.ndarray | None:
+    """Smooth a skeleton branch and extend its tip to the smoothed contour.
+
+    Attachment end (first point) stays on the trunk; the free end is extended
+    along the branch tangent to the contour (equidistant tip handling), then the
+    whole branch is re-smoothed with both end points weighted.
+    """
+    raw = np.asarray(branch_local, dtype=np.float64)
+    if len(raw) < 3 or _arc_length(raw) < max(float(min_len_px), 1.0):
+        return None
+    n = int(np.clip(round(_arc_length(raw) * 2.0), 16, n_points))
+    p = _resample_arclength(raw, n)
+    p = _taubin_open_fixed(p, 30)
+    p = _resample_arclength(p, n)
+    # tip: ray from the last smoothed sample along the local tangent
+    k = min(5, len(p) - 1)
+    tangent = p[-1] - p[-1 - k]
+    if float(np.hypot(tangent[0], tangent[1])) <= 1e-9:
+        return None
+    tip = _ray_outline_hit(outline_s, p[-1], tangent)
+    if tip is None or float(np.hypot(*(tip - p[-1]))) < 0.5:
+        tip = p[-1]
+    q = np.vstack([p, tip[None, :]])
+    q = _resample_arclength(q, n)
+    smooth_s = float(np.clip(0.02 * _arc_length(q), 2.0, 30.0))
+    q = _smooth_open_weighted(q, smooth_s, n=n, w_end=60.0)
+    q = _resample_arclength(q, n)
+    q[0] = raw[0]
+    q[-1] = tip
+    return q
+
+
 def _equidistant_result(
     crop: np.ndarray,
     offset_xy: np.ndarray,
@@ -1808,9 +1846,11 @@ def _equidistant_result(
         int(params["pole_max_candidates"]),
         float(params["pole_axis_tol_deg"]),
     )
-    axis, side_branches = _skeleton_trunk_and_branches(
-        work, pole_pair, float(params.get("equidistant_branch_min_px", 4.0))
+    branch_min_px = max(
+        float(params.get("equidistant_branch_min_px", 3.0)),
+        float(params.get("equidistant_branch_min_um", 0.2)) / max(float(pixel_microns), 1e-9),
     )
+    axis, side_branches = _skeleton_trunk_and_branches(work, pole_pair, branch_min_px)
     if axis is None or len(axis) < 8:
         return _axis_segment_result(crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns)
     axis = _resample_arclength(axis, int(params["equidistant_axis_points"]))
@@ -1862,7 +1902,14 @@ def _equidistant_result(
     length_px = _arc_length(main_global)
     pole_dist = float(np.hypot(*(tips[1] - tips[0])))
     _, max_curv = _curvature_stats(main_global)
-    branches_global = [np.asarray(b, dtype=np.float64) + offset_xy for b in side_branches]
+    branches_global = []
+    for b_raw in side_branches:
+        b_ref = _refine_branch(b_raw, outline_s, branch_min_px)
+        if b_ref is not None:
+            # snap the attachment exactly onto the final trunk
+            dd = np.sum((main[:, None, :] - b_ref[0][None, :]) ** 2, axis=2)
+            b_ref[0] = main[int(np.argmin(dd))]
+            branches_global.append(np.asarray(b_ref, dtype=np.float64) + offset_xy)
     return {
         "midline": [main_global, *branches_global],
         "width_profile": width_profile,
