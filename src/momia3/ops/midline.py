@@ -1588,7 +1588,7 @@ def _smoothed_mask_contour(mask: np.ndarray) -> np.ndarray | None:
     is applied, which removes the pixel staircase of ``find_contours``.
     """
     try:
-        from momia3.ops.outline import extract_outlines
+        from momia3.ops.outline import _smooth_closed, extract_outlines
 
         outlines = extract_outlines(
             np.asarray(mask, dtype=np.int32),
@@ -1597,7 +1597,16 @@ def _smoothed_mask_contour(mask: np.ndarray) -> np.ndarray | None:
         )
         contour = outlines.get(1)
         if contour is not None and len(contour) > 8:
-            return np.asarray(contour, dtype=np.float64)
+            contour = np.asarray(contour, dtype=np.float64)
+            # Second pass: the first spline is evaluated at the natural point
+            # count, so the pixel staircase survives. Downsample to ~2 px
+            # spacing, then fit a stiffer spline and evaluate at 200 points.
+            ring = np.vstack([contour, contour[:1]])
+            perimeter = float(np.sum(np.hypot(np.diff(ring[:, 0]), np.diff(ring[:, 1]))))
+            n_down = int(np.clip(round(perimeter / 2.0), 24, 200))
+            down = _resample_closed(contour, n_down)
+            smooth = float(np.clip(0.05 * n_down, 2.0, 12.0))
+            return _smooth_closed(down, smooth, 200)
     except Exception as exc:  # pragma: no cover - fall back to raw contour
         logger.debug("smoothed outline extraction failed (%s)", exc)
     return _mask_contour_xy(mask)
