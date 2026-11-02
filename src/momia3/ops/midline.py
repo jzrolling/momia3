@@ -134,7 +134,16 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "n_points_auto": False,  # True: n = arc_length / n_points_target_spacing_px
     "n_points_target_spacing_px": 2.0,
     # non-parametric dense-point curve refinement ("energy" method)
-    "midline_method": "spline",  # "spline" (default) | "energy"
+    "midline_method": "spline",  # "spline" (default) | "energy" | "equidistant"
+    # opt-in "equidistant" method (MicrobeJ-style contour-cut poles)
+    "equidistant_presmooth_sigma": 1.0,
+    "equidistant_base_factor": 0.8,
+    "equidistant_axis_points": 128,
+    "equidistant_axis_smooth": 60,
+    "equidistant_outline_points": 200,
+    "equidistant_outline_smooth": 45,
+    "equidistant_final_smooth": 20,
+    "equidistant_n_points": 128,
     "energy_data_weight": 1.0,
     "energy_curv_weight": 10.0,
     "energy_spacing_weight": 50.0,
@@ -1426,6 +1435,240 @@ def _energy_refine(
     return refined, e_data, e_curv
 
 
+# ---------------------------------------------------------------------------
+# opt-in "equidistant" method: MicrobeJ-style contour-cut poles
+# ---------------------------------------------------------------------------
+
+
+def _resample_closed(points: np.ndarray, n: int) -> np.ndarray:
+    """Resample a closed ring to n uniform arclength points."""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 2:
+        return np.repeat(pts[:1], int(n), axis=0)
+    ring = np.vstack([pts, pts[:1]])
+    seg = np.linalg.norm(np.diff(ring, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    if s[-1] <= 0:
+        return np.repeat(pts[:1], int(n), axis=0)
+    u = np.linspace(0.0, s[-1], int(n), endpoint=False)
+    return np.column_stack([np.interp(u, s, ring[:, 0]), np.interp(u, s, ring[:, 1])])
+
+
+def _taubin_closed(points: np.ndarray, iters: int) -> np.ndarray:
+    """Taubin (shrink-free) smoothing of a closed ring."""
+    pnt = np.asarray(points, dtype=np.float64).copy()
+    if len(pnt) < 3:
+        return pnt
+    for _ in range(max(0, int(iters))):
+        lm = 0.5 * (np.roll(pnt, 1, axis=0) + np.roll(pnt, -1, axis=0))
+        pnt += 0.5 * (lm - pnt)
+        lm = 0.5 * (np.roll(pnt, 1, axis=0) + np.roll(pnt, -1, axis=0))
+        pnt += -0.53 * (lm - pnt)
+    return pnt
+
+
+def _taubin_open_fixed(points: np.ndarray, iters: int) -> np.ndarray:
+    """Taubin smoothing of an open polyline with endpoints pinned."""
+    pnt = np.asarray(points, dtype=np.float64).copy()
+    if len(pnt) < 3:
+        return pnt
+    for _ in range(max(0, int(iters))):
+        lm = 0.5 * (pnt[:-2] + pnt[2:])
+        pnt[1:-1] += 0.5 * (lm - pnt[1:-1])
+        lm = 0.5 * (pnt[:-2] + pnt[2:])
+        pnt[1:-1] += -0.53 * (lm - pnt[1:-1])
+    return pnt
+
+
+def _skeleton_longest_path(mask: np.ndarray) -> np.ndarray | None:
+    """Ordered longest branch of the pixel skeleton as (x, y) crop coords."""
+    import heapq
+
+    skel = morphology.skeletonize(np.asarray(mask, dtype=bool))
+    ys, xs = np.nonzero(skel)
+    if ys.size < 5:
+        return None
+    node = {(int(y), int(x)): i for i, (y, x) in enumerate(zip(ys, xs))}
+    graph: dict[int, dict[int, float]] = {}
+    for (y, x), i in node.items():
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                j = node.get((y + dy, x + dx))
+                if j is not None:
+                    w = float(np.hypot(dy, dx))
+                    graph.setdefault(i, {})[j] = w
+                    graph.setdefault(j, {})[i] = w
+    if len(graph) < 5:
+        return None
+    degree = {k: len(v) for k, v in graph.items()}
+    ends = [k for k, d in degree.items() if d == 1]
+    if len(ends) < 2:
+        return None
+
+    def _dijkstra(src: int) -> tuple[int, float, dict[int, int]]:
+        dist = {src: 0.0}
+        prev: dict[int, int] = {src: -1}
+        pq = [(0.0, src)]
+        while pq:
+            dd, u = heapq.heappop(pq)
+            if dd > dist.get(u, 1e18):
+                continue
+            for v, w in graph.get(u, {}).items():
+                nd = dd + w
+                if nd < dist.get(v, 1e18):
+                    dist[v] = nd
+                    prev[v] = u
+                    heapq.heappush(pq, (nd, v))
+        far = max(dist, key=dist.get)
+        return far, dist[far], prev
+
+    a, _, _ = _dijkstra(ends[0])
+    b, _, prev = _dijkstra(a)
+    path: list[int] = []
+    u = b
+    while u != -1:
+        path.append(u)
+        u = prev.get(u, -1)
+    path.reverse()
+    return np.array([[xs[i], ys[i]] for i in path], dtype=np.float64)
+
+
+def _ray_outline_hit(outline: np.ndarray, origin: np.ndarray, direction: np.ndarray) -> np.ndarray:
+    """Nearest sub-pixel intersection of a ray with a closed polyline."""
+    ring = np.asarray(outline, dtype=np.float64)
+    n = len(ring)
+    d = np.asarray(direction, dtype=np.float64)
+    norm = float(np.hypot(d[0], d[1]))
+    if n < 3 or norm <= 0:
+        return np.asarray(origin, dtype=np.float64)
+    d = d / norm
+    best_t = np.inf
+    best_p = None
+    for i in range(n):
+        a = ring[i]
+        b = ring[(i + 1) % n]
+        e = b - a
+        det = d[0] * (-e[1]) - (-e[0]) * d[1]
+        if abs(det) < 1e-12:
+            continue
+        rhs = a - origin
+        t = (rhs[0] * (-e[1]) - (-e[0]) * rhs[1]) / det
+        u = (d[0] * rhs[1] - d[1] * rhs[0]) / det
+        if -0.05 <= u <= 1.05 and t > 1e-6 and t < best_t:
+            best_t = t
+            best_p = origin + t * d
+    return np.asarray(origin if best_p is None else best_p, dtype=np.float64)
+
+
+def _arc_walk_closed(
+    outline: np.ndarray, tip: np.ndarray, target: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Walk target arclength along both directions of a closed ring."""
+    ring = np.asarray(outline, dtype=np.float64)
+    n = len(ring)
+    if n < 3:
+        return tip.copy(), tip.copy()
+    i0 = int(np.argmin(np.linalg.norm(ring - np.asarray(tip)[None, :], axis=1)))
+    target = max(float(target), 1e-6)
+
+    def _walk(sign: int) -> np.ndarray:
+        acc = 0.0
+        i = i0
+        for _ in range(n):
+            j = (i + sign) % n
+            step = float(np.linalg.norm(ring[j] - ring[i]))
+            if acc + step >= target:
+                f = (target - acc) / max(step, 1e-12)
+                return ring[i] + f * (ring[j] - ring[i])
+            acc += step
+            i = j
+        return ring[i]
+
+    return _walk(1), _walk(-1)
+
+
+def _equidistant_result(
+    crop: np.ndarray,
+    offset_xy: np.ndarray,
+    outline_crop: np.ndarray,
+    params: Mapping[str, Any],
+    pixel_microns: float,
+    index: _OutlineIndex,
+    knn: int,
+) -> dict[str, Any]:
+    """MicrobeJ-style contour-cut midline (opt-in midline_method).
+
+    Mask pre-smoothing removes single-pixel protrusions that bias the
+    pixel-skeleton tip; the axis is skeleton-longest-path + Taubin; poles
+    are sub-pixel contour tips (ray from the axis end tangent) and base
+    chords cut at equal arclength along the smoothed outline.
+    """
+    sigma = float(params.get("equidistant_presmooth_sigma", 0.0) or 0.0)
+    work = crop.astype(np.float32)
+    if sigma > 0:
+        work = ndimage.gaussian_filter(work, sigma) > 0.5
+    axis = _skeleton_longest_path(work)
+    if axis is None or len(axis) < 8:
+        centroid_xy, axis_xy, _ = _mask_major_axis(crop)
+        return _axis_segment_result(crop, offset_xy, centroid_xy, axis_xy, index, params, pixel_microns)
+    axis = _resample_arclength(axis, int(params["equidistant_axis_points"]))
+    axis = _taubin_open_fixed(axis, int(params["equidistant_axis_smooth"]))
+    axis = _resample_arclength(axis, int(params["equidistant_axis_points"]))
+
+    outline_s = _resample_closed(outline_crop, int(params["equidistant_outline_points"]))
+    outline_s = _taubin_closed(outline_s, int(params["equidistant_outline_smooth"]))
+
+    edt = ndimage.distance_transform_edt(crop)
+    ax_cols = np.clip(np.round(axis[:, 0]).astype(int), 0, crop.shape[1] - 1)
+    ax_rows = np.clip(np.round(axis[:, 1]).astype(int), 0, crop.shape[0] - 1)
+    width = 2.0 * float(np.median(edt[ax_rows, ax_cols]))
+    base_offset = float(params["equidistant_base_factor"]) * max(width, 1.0)
+
+    tips = []
+    bases = []
+    pole_widths = []
+    for end in (0, 1):
+        k = len(axis) - 1 if end == 1 else 0
+        k2 = max(0, k - 5) if end == 1 else min(len(axis) - 1, k + 5)
+        tangent = axis[k] - axis[k2]
+        if float(np.hypot(tangent[0], tangent[1])) <= 1e-9:
+            tangent = np.array([1.0, 0.0])
+        tip = _ray_outline_hit(outline_s, axis[k], tangent)
+        c1, c2 = _arc_walk_closed(outline_s, tip, base_offset)
+        tips.append(tip)
+        bases.append(0.5 * (c1 + c2))
+        pole_widths.append(float(np.linalg.norm(c2 - c1)))
+
+    inner = axis[8:-8] if len(axis) > 20 else axis[2:-2]
+    main = np.vstack([tips[0], bases[0], inner, bases[1], tips[1]])
+    main = _resample_arclength(main, int(params["equidistant_n_points"]))
+    main = _taubin_open_fixed(main, int(params["equidistant_final_smooth"]))
+    main = _resample_arclength(main, int(params["equidistant_n_points"]))
+    main_global = main + offset_xy
+
+    width_profile = _width_profile(main_global, index, knn, pixel_microns)
+    length_px = _arc_length(main_global)
+    pole_dist = float(np.hypot(*(tips[1] - tips[0])))
+    _, max_curv = _curvature_stats(main_global)
+    return {
+        "midline": [main_global],
+        "width_profile": width_profile,
+        "pole1": tips[0] + offset_xy,
+        "pole2": tips[1] + offset_xy,
+        "length_um": length_px * float(pixel_microns),
+        "sinuosity": float(length_px / pole_dist) if pole_dist > 0 else 1.0,
+        "branched": 0.0,
+        "midline_quality": "equidistant",
+        "n_iter": 0,
+        "final_residual": float("nan"),
+        "max_curvature": float(max_curv),
+        "width_cv": _width_cv(width_profile),
+        "pole_widths": pole_widths,
+    }
+
+
 def _midline_single(
     crop: np.ndarray,
     offset_xy: np.ndarray,
@@ -1460,6 +1703,13 @@ def _midline_single(
             )
 
         outline_crop = np.asarray(outline, dtype=np.float64) - offset_xy
+
+        # Opt-in alternative: MicrobeJ-style contour-cut poles from a
+        # pre-smoothed mask skeleton (does not use the geodesic stage).
+        if str(params.get("midline_method", "spline")) == "equidistant":
+            return _equidistant_result(
+                crop, offset_xy, outline_crop, params, pixel_microns, index, knn
+            )
 
         # Step 1 — pole-first initialization.
         pole1_xy, pole2_xy = _find_pole_pair(
