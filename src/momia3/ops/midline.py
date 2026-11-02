@@ -174,6 +174,7 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_outline_from_clean_mask": True,  # draw outline on the cleaned mask
     "equidistant_skeleton_from_outline": True,  # skeleton from the outline geometry (4x SDF) instead of the binary mask
     "equidistant_sdf_max_dim": 400,  # outline-SDF is pointless on huge cells: fall back to mask skeleton above this bbox size
+    "equidistant_sdf_max_pixels": 4000000.0,  # supersampled grid budget; smaller cap = faster but coarser
     "equidistant_n_points_auto": True,  # long cells need more midline samples (fixed 128 undersamples them)
     "equidistant_n_points_spacing_px": 2.0,
     "equidistant_n_points_max": 2048,
@@ -2024,6 +2025,7 @@ def _sdf_graph_from_outline(
     outline_local: np.ndarray,
     supersample: int = 4,
     pad: int = 3,
+    max_pixels: float = 4_000_000.0,
 ):
     """Sub-pixel skeleton graph obtained from the outline polygon only.
 
@@ -2045,22 +2047,34 @@ def _sdf_graph_from_outline(
     # Adaptive supersampling: cap the working grid so giant filaments stay
     # tractable (they do not need sub-pixel protrusion resolution anyway).
     bbox_area = max((x1f - x0f) * (y1f - y0f), 1.0)
-    ss = int(np.clip(round(np.sqrt(4_000_000.0 / bbox_area)), 1, int(supersample)))
+    ss = int(np.clip(round(np.sqrt(float(max_pixels) / bbox_area)), 1, int(supersample)))
     nx = max(8, int(round((x1f - x0f) * ss)))
     ny = max(8, int(round((y1f - y0f) * ss)))
-    # Fast supersampled polygon fill (C implementation); Path.contains_points
-    # on a 4x grid is far too slow for long cells.
+    # Fast supersampled polygon fill. PIL's C polygon fill is ~50-100x faster
+    # than skimage.draw.polygon for our many-vertex smooth outlines; it is the
+    # single biggest cost of the SDF route.
+    col_idx = (ring[:, 0] - x0f) * ss - 0.5
+    row_idx = (ring[:, 1] - y0f) * ss - 0.5
     try:
-        from skimage import draw as _skdraw
+        from PIL import Image as _PILImage
+        from PIL import ImageDraw as _PILImageDraw
 
-        col_idx = (ring[:, 0] - x0f) * ss - 0.5
-        row_idx = (ring[:, 1] - y0f) * ss - 0.5
-        rr, cc = _skdraw.polygon(row_idx, col_idx, shape=(ny, nx))
-        inside = np.zeros((ny, nx), dtype=bool)
-        inside[rr, cc] = True
-    except Exception as exc:  # pragma: no cover
-        logger.debug("outline rasterization failed (%s)", exc)
-        return None
+        canvas = _PILImage.new("L", (nx, ny), 0)
+        _PILImageDraw.Draw(canvas).polygon(
+            list(zip(col_idx.tolist(), row_idx.tolist())), fill=1
+        )
+        inside = np.asarray(canvas, dtype=np.uint8).astype(bool)
+    except Exception as exc:  # pragma: no cover - fallback only
+        logger.debug("PIL rasterization failed (%s); trying skimage", exc)
+        try:
+            from skimage import draw as _skdraw
+
+            rr, cc = _skdraw.polygon(row_idx, col_idx, shape=(ny, nx))
+            inside = np.zeros((ny, nx), dtype=bool)
+            inside[rr, cc] = True
+        except Exception as exc2:  # pragma: no cover
+            logger.debug("outline rasterization failed (%s)", exc2)
+            return None
     skel = morphology.skeletonize(inside)
     ys, xs = np.nonzero(skel)
     if ys.size < 5:
@@ -2340,6 +2354,7 @@ def _equidistant_result(
         data = _sdf_graph_from_outline(
             np.asarray(outline_crop, dtype=np.float64),
             supersample=int(params.get("equidistant_sdf_supersample", 4)),
+            max_pixels=float(params.get("equidistant_sdf_max_pixels", 4_000_000.0)),
         )
         if data is not None:
             graph, pts, degree, sdf_at = data
@@ -2567,6 +2582,7 @@ def _sdf_fallback_branches(
         data = _sdf_graph_from_outline(
             np.asarray(outline_crop, dtype=np.float64),
             supersample=int(params.get("equidistant_sdf_supersample", 4)),
+            max_pixels=float(params.get("equidistant_sdf_max_pixels", 4_000_000.0)),
         )
         if data is None:
             return []
