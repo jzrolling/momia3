@@ -170,6 +170,10 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "equidistant_opening_radius": 1.0,  # binary opening radius (px) to strip mask rags
     "equidistant_outline_from_clean_mask": True,  # draw outline on the cleaned mask
     "equidistant_skeleton_from_outline": True,  # skeleton from the outline geometry (4x SDF) instead of the binary mask
+    "equidistant_sdf_max_dim": 400,  # outline-SDF is pointless on huge cells: fall back to mask skeleton above this bbox size
+    "equidistant_n_points_auto": True,  # long cells need more midline samples (fixed 128 undersamples them)
+    "equidistant_n_points_spacing_px": 2.0,
+    "equidistant_n_points_max": 2048,
     "equidistant_sdf_supersample": 4,  # supersampling factor of the outline rasterization
     "equidistant_branch_min_extended_px": 8.0,  # drop branches shorter than this AFTER tip extension
     "equidistant_branch_min_extended_um": 0.0,  # ... or this many microns
@@ -2270,6 +2274,10 @@ def _equidistant_result(
     pts = None
     degree = None
     use_sdf = bool(params.get("equidistant_skeleton_from_outline", True))
+    if use_sdf and max(crop.shape) > int(params.get("equidistant_sdf_max_dim", 400)):
+        # SDF skeleton on a very long cell means a huge supersampled grid
+        # (seconds per cell); the mask skeleton is accurate enough there.
+        use_sdf = False
     if use_sdf:
         data = _sdf_graph_from_outline(
             np.asarray(outline_crop, dtype=np.float64),
@@ -2390,6 +2398,10 @@ def _equidistant_result(
     inner = axis[8:-8] if len(axis) > 20 else axis[2:-2]
     main = np.vstack([tips[0], bases[0], inner, bases[1], tips[1]])
     n_main = int(params["equidistant_n_points"])
+    if bool(params.get("equidistant_n_points_auto", True)):
+        spacing = max(float(params.get("equidistant_n_points_spacing_px", 2.0)), 0.5)
+        n_auto = int(np.clip(round(_arc_length(main) / spacing), 64, int(params.get("equidistant_n_points_max", 2048))))
+        n_main = max(n_main, n_auto)
     main = _resample_arclength(main, n_main)
     # Smooth the pole junctions with a B-spline whose stiffness scales with
     # length (Taubin alone leaves visible kinks on short cells).
