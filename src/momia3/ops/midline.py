@@ -208,6 +208,31 @@ def _smooth_open(points: np.ndarray, smooth: float, n: int | None = None) -> np.
         return _resample_arclength(pts, m)
 
 
+def _smooth_open_weighted(
+    points: np.ndarray, smooth: float, n: int, w_end: float = 60.0
+) -> np.ndarray:
+    """B-spline smoothing with heavy endpoint weights (tips stay put)."""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 4:
+        return _resample_arclength(pts, int(n))
+    seg = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+    u = np.concatenate([[0.0], np.cumsum(seg)])
+    if u[-1] <= 0:
+        return _resample_arclength(pts, int(n))
+    u = u / u[-1]
+    w = np.ones(len(pts))
+    w[0] = w[-1] = float(w_end)
+    try:
+        tck, _ = interpolate.splprep(
+            [pts[:, 0], pts[:, 1]], u=u, s=float(smooth), w=w, per=0, k=3, quiet=1
+        )
+        x, y = interpolate.splev(np.linspace(0.0, 1.0, int(n)), tck, der=0)
+        return np.column_stack([x, y])
+    except (ValueError, TypeError) as exc:
+        logger.debug("weighted open spline fit failed (%s); using resample", exc)
+        return _resample_arclength(pts, int(n))
+
+
 def _normals(points: np.ndarray) -> np.ndarray:
     """Unit normals of an open polyline (central differences)."""
     pts = np.asarray(points, dtype=np.float64)
@@ -1643,9 +1668,19 @@ def _equidistant_result(
 
     inner = axis[8:-8] if len(axis) > 20 else axis[2:-2]
     main = np.vstack([tips[0], bases[0], inner, bases[1], tips[1]])
-    main = _resample_arclength(main, int(params["equidistant_n_points"]))
+    n_main = int(params["equidistant_n_points"])
+    main = _resample_arclength(main, n_main)
+    # Smooth the pole junctions with a B-spline whose stiffness scales with
+    # length (Taubin alone leaves visible kinks on short cells).
+    main_len = max(_arc_length(main), 1.0)
+    s_fac = float(np.clip(0.02 * main_len, 4.0, 60.0))
+    if main_len < 40.0:
+        # Very short cells: the pole junctions dominate the arc length, so
+        # use a much stiffer spline to avoid residual junction oscillation.
+        s_fac = max(s_fac, 1.5 * main_len)
+    main = _smooth_open_weighted(main, s_fac, n=n_main)
     main = _taubin_open_fixed(main, int(params["equidistant_final_smooth"]))
-    main = _resample_arclength(main, int(params["equidistant_n_points"]))
+    main = _resample_arclength(main, n_main)
     main_global = main + offset_xy
 
     width_profile = _width_profile(main_global, index, knn, pixel_microns)
