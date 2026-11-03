@@ -85,11 +85,13 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     # "refine_outline_mode": "edge" | "intensity" | "edge+intensity".
     "refine_outline_iters": 0,  # 0 = off
     "refine_outline_mode": "edge+intensity",
-    "refine_edge_step": 0.5,  # px sampling offset along the normal
-    "refine_edge_cutoff": 0.2,  # normalized Sobel magnitude below which no move
+    "refine_edge_search_px": 3.0,  # half-length of the normal profile (px)
+    "refine_edge_samples": 21,  # profile samples across the search range
+    "refine_edge_cutoff": 0.2,  # normalized edge magnitude below which no move
+    "refine_edge_strength": 0.8,  # fraction of the located offset applied per round
     "refine_edge_max_shift": 1.5,  # px cap per round
     "refine_edge_max_round_shift": 1.5,  # revert points moving farther than this in one round
-    "refine_edge_pre_expand": 0.3,  # px outward expansion before the first round (momia v1)
+    "refine_edge_pre_expand": 0.0,  # px outward pre-expansion (momia v1 uses 0.3)
     "active_contour": False,
     "alpha": 0.015,
     "beta": 10.0,
@@ -312,46 +314,63 @@ def _sobel_edge_map(intensity: np.ndarray, sigma: float = 1.0) -> np.ndarray:
 def _edge_snap_step(
     ring: np.ndarray,
     edge: np.ndarray,
-    step: float,
+    search_px: float,
+    n_samples: int,
+    strength: float,
     cutoff: float,
     max_shift: float,
 ) -> np.ndarray:
-    """One subpixel step of each outline sample to the local Sobel maximum.
+    """One step of each outline sample to the global maximum of the edge profile.
 
-    Mirrors momia v1 contour_optimization: sample the edge map at the current
-    position and +/- one step along the normal, keep the central sample when it
-    is the maximum (subpixel quadratic correction), otherwise move half a step
-    toward the better side. Weak edges (below cutoff) are left alone.
+    Follows MicrobeJ ContourRoi.getCorrectedContour: sample the edge map along a
+    normal profile centred on the point, median-filter and normalize the profile,
+    take the maximum closest to the profile centre, refine it with a parabola,
+    and apply one (fractional) move. momia v1 contour_optimization instead only
+    samples +-half a pixel and moves half a step; this full-profile variant is
+    the MicrobeJ behaviour.
     """
     pts = np.asarray(ring, dtype=np.float64).copy()
     h, w = edge.shape
     nrm = _outline_normals(pts)
-    step = max(float(step), 0.1)
-
-    def sample(pp):
-        cols = np.clip(pp[:, 0], 0, w - 1.0)
-        rows = np.clip(pp[:, 1], 0, h - 1.0)
-        return ndimage.map_coordinates(edge, [rows, cols], order=1, mode="nearest")
-
-    v_in = sample(pts + step * nrm)
-    v0 = sample(pts)
-    v_out = sample(pts - step * nrm)
-    best = np.maximum(np.maximum(v_in, v0), v_out)
-    weak = best < float(cutoff)
-    denom = v_in - 2.0 * v0 + v_out
-    denom = np.where(np.abs(denom) < 1e-9, np.inf, denom)
-    sub = 0.5 * (v_in - v_out) / denom * step  # parabolic vertex offset (px)
-    sub = np.clip(sub, -step, step)
+    n_samples = max(int(n_samples), 5)
+    offsets = np.linspace(-float(search_px), float(search_px), n_samples)
+    xs = pts[None, :, 0] + offsets[:, None] * nrm[None, :, 0]
+    ys = pts[None, :, 1] + offsets[:, None] * nrm[None, :, 1]
+    vals = ndimage.map_coordinates(
+        edge, [np.clip(ys, 0, h - 1.0), np.clip(xs, 0, w - 1.0)], order=1, mode="nearest"
+    )
+    # median filter along the profile (MicrobeJ Geometry.medianFilter(v, 2))
+    vals = ndimage.median_filter(vals, size=(2, 1), mode="nearest")
+    lo = vals.min(axis=0)
+    hi = vals.max(axis=0)
+    span = np.where(hi - lo < 1e-9, 1.0, hi - lo)
+    vals = (vals - lo[None, :]) / span[None, :]
+    is_max = np.zeros_like(vals, dtype=bool)
+    if n_samples > 2:
+        is_max[1:-1] = (vals[1:-1] >= vals[:-2]) & (vals[1:-1] >= vals[2:])
+    is_max &= vals >= float(cutoff)
+    centre = 0.5 * (n_samples - 1)
+    best_idx = np.full(len(pts), -1, dtype=int)
+    for i in range(len(pts)):
+        idxs = np.nonzero(is_max[:, i])[0]
+        if idxs.size == 0:
+            continue
+        dist = np.abs(idxs - centre)
+        best_idx[i] = int(idxs[int(np.argmin(dist))])
     move = np.zeros_like(pts)
-    center_max = (v0 >= v_in) & (v0 >= v_out) & ~weak
-    move[center_max] = sub[center_max, None] * nrm[center_max]
-    in_max = (v_in > v_out) & (v_in > v0) & ~weak
-    move[in_max] = 0.5 * step * nrm[in_max]
-    out_max = (v_out > v_in) & (v_out > v0) & ~weak
-    move[out_max] = -0.5 * step * nrm[out_max]
+    for i in np.nonzero(best_idx >= 0)[0]:
+        k = int(best_idx[i])
+        if 0 < k < n_samples - 1:
+            a, b, c = vals[k - 1, i], vals[k, i], vals[k + 1, i]
+            denom = a - 2.0 * b + c
+            dv = 0.5 * (a - c) / denom if abs(denom) > 1e-9 else 0.0
+            step_px = float(offsets[k] + dv * (offsets[1] - offsets[0]))
+        else:
+            step_px = float(offsets[k])
+        step_px = float(np.clip(step_px, -max_shift, max_shift))
+        move[i] = strength * step_px * nrm[i]
     shift = np.linalg.norm(move, axis=1)
-    too_far = shift > float(max_shift)
-    move[too_far] = 0.0
+    move[shift > float(max_shift)] = 0.0
     return pts + move
 
 
@@ -433,7 +452,6 @@ def _outline_single(
     if refine_iters > 0 and intensity_crop is not None and len(ring_xy) > 16:
         icrop = np.asarray(intensity_crop, dtype=np.float64)
         edge_map = _sobel_edge_map(icrop, sigma=1.0)
-        step = float(params.get("refine_edge_step", 0.5))
         cutoff = float(params.get("refine_edge_cutoff", 0.2))
         max_shift = float(params.get("refine_edge_max_shift", 1.5))
         expand = float(params.get("refine_edge_pre_expand", 0.3))
@@ -443,7 +461,13 @@ def _outline_single(
         for _ in range(refine_iters):
             before = ring_xy.copy()
             if refine_mode in ("edge", "edge+intensity"):
-                ring_xy = _edge_snap_step(ring_xy, edge_map, step, cutoff, max_shift)
+                ring_xy = _edge_snap_step(
+                    ring_xy, edge_map,
+                    float(params.get("refine_edge_search_px", 3.0)),
+                    int(params.get("refine_edge_samples", 21)),
+                    float(np.clip(params.get("refine_edge_strength", 0.8), 0.0, 1.0)),
+                    cutoff, max_shift,
+                )
                 far = np.linalg.norm(ring_xy - before, axis=1) > float(
                     params.get("refine_edge_max_round_shift", 1.5)
                 )
