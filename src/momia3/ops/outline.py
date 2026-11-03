@@ -90,6 +90,11 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "refine_edge_cutoff": 0.1,  # normalized edge magnitude below which no move (MicrobeJ findMaxima threshold)
     "refine_edge_presmooth_sigma": 1.0,  # MicrobeJ: scale*edgeSigma/2 on the channel
     "refine_edge_postsmooth_sigma": 0.25,  # MicrobeJ: edgeSigma/4 after findEdges
+    # Subpixel interpolation of the located edge maximum:
+    # "parabolic" = 3-point parabola on the profile (current default);
+    # "curvature" = MicrobeJ ContourRoi.getCorrectedContour: project onto the
+    # profile chord with the 4.0-curvature weighting term.
+    "refine_edge_subpixel": "parabolic",
     "refine_edge_strength": 0.8,  # fraction of the located offset applied per round
     "refine_edge_max_shift": 1.5,  # px cap per round
     "refine_edge_max_round_shift": 1.5,  # revert points moving farther than this in one round
@@ -333,27 +338,34 @@ def _edge_snap_step(
     strength: float,
     cutoff: float,
     max_shift: float,
+    subpixel: str = "parabolic",
+    curvature_weight: float = 4.0,
+    curvature_window: int = 5,
 ) -> np.ndarray:
-    """One step of each outline sample to the global maximum of the edge profile.
+    """One step of each outline sample to the maximum of its edge profile.
 
     Follows MicrobeJ ContourRoi.getCorrectedContour: sample the edge map along a
     normal profile centred on the point, median-filter and normalize the profile,
-    take the maximum closest to the profile centre, refine it with a parabola,
-    and apply one (fractional) move. momia v1 contour_optimization instead only
-    samples +-half a pixel and moves half a step; this full-profile variant is
-    the MicrobeJ behaviour.
+    take the maximum closest to the profile centre, then interpolate the peak to
+    subpixel. Two subpixel variants are available:
+
+    - "parabolic": 3-point parabola on the profile (momia v1 style, our previous
+      default);
+    - "curvature": MicrobeJ's curvature-weighted chord interpolation. p0/p1 are
+      the profile endpoints oriented toward the curvature centre, kappa is the
+      local curvature, t = 1 - (dist(p0, peak) + weight*kappa) / dist(p0, p1).
     """
     pts = np.asarray(ring, dtype=np.float64).copy()
     h, w = edge.shape
     nrm = _outline_normals(pts)
     n_samples = max(int(n_samples), 5)
-    offsets = np.linspace(-float(search_px), float(search_px), n_samples)
+    search = float(search_px)
+    offsets = np.linspace(-search, search, n_samples)
     xs = pts[None, :, 0] + offsets[:, None] * nrm[None, :, 0]
     ys = pts[None, :, 1] + offsets[:, None] * nrm[None, :, 1]
     vals = ndimage.map_coordinates(
         edge, [np.clip(ys, 0, h - 1.0), np.clip(xs, 0, w - 1.0)], order=1, mode="nearest"
     )
-    # median filter along the profile (MicrobeJ Geometry.medianFilter(v, 2))
     vals = ndimage.median_filter(vals, size=(2, 1), mode="nearest")
     lo = vals.min(axis=0)
     hi = vals.max(axis=0)
@@ -367,20 +379,60 @@ def _edge_snap_step(
     best_idx = np.full(len(pts), -1, dtype=int)
     for i in range(len(pts)):
         idxs = np.nonzero(is_max[:, i])[0]
-        if idxs.size == 0:
-            continue
-        dist = np.abs(idxs - centre)
-        best_idx[i] = int(idxs[int(np.argmin(dist))])
+        if idxs.size:
+            dist = np.abs(idxs - centre)
+            best_idx[i] = int(idxs[int(np.argmin(dist))])
+    mode = str(subpixel or "parabolic").lower()
+    if mode.startswith("curv"):
+        n = len(pts)
+        k = max(int(curvature_window), 1)
+        prev = pts[(np.arange(n) - k) % n]
+        nxt = pts[(np.arange(n) + k) % n]
+        ax, ay = prev[:, 0], prev[:, 1]
+        bx, by = pts[:, 0], pts[:, 1]
+        cx, cy = nxt[:, 0], nxt[:, 1]
+        d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        ok = np.abs(d) > 1e-9
+        ux = np.full(n, np.nan)
+        uy = np.full(n, np.nan)
+        axy = ax * ax + ay * ay
+        bxy = bx * bx + by * by
+        cxy = cx * cx + cy * cy
+        ux[ok] = (axy * (by - cy) + bxy * (cy - ay) + cxy * (ay - by))[ok] / d[ok]
+        uy[ok] = (axy * (cx - bx) + bxy * (ax - cx) + cxy * (bx - ax))[ok] / d[ok]
+        radius = np.hypot(ux - bx, uy - by)
+        kappa = np.where(np.isfinite(radius) & (radius > 1e-6), 1.0 / np.maximum(radius, 1e-6), 0.0)
+        # orient the profile toward the curvature centre (inward)
+        inward_sign = np.ones(n)
+        good_c = np.isfinite(ux) & np.isfinite(uy)
+        dot = (ux - bx) * nrm[:, 0] + (uy - by) * nrm[:, 1]
+        inward_sign[good_c] = np.where(dot[good_c] >= 0.0, 1.0, -1.0)
+    else:
+        kappa = np.zeros(len(pts))
+        inward_sign = np.ones(len(pts))
+    step_size = offsets[1] - offsets[0]
     move = np.zeros_like(pts)
     for i in np.nonzero(best_idx >= 0)[0]:
         k = int(best_idx[i])
-        if 0 < k < n_samples - 1:
-            a, b, c = vals[k - 1, i], vals[k, i], vals[k + 1, i]
-            denom = a - 2.0 * b + c
-            dv = 0.5 * (a - c) / denom if abs(denom) > 1e-9 else 0.0
-            step_px = float(offsets[k] + dv * (offsets[1] - offsets[0]))
+        if mode.startswith("curv"):
+            cand = pts[i] + offsets[k] * nrm[i]
+            p0 = pts[i] + inward_sign[i] * search * nrm[i]
+            p1 = pts[i] - inward_sign[i] * search * nrm[i]
+            chord = float(np.linalg.norm(p1 - p0))
+            if chord <= 1e-9:
+                continue
+            t = 1.0 - (float(np.linalg.norm(cand - p0)) + curvature_weight * float(kappa[i])) / chord
+            t = float(np.clip(t, 0.0, 1.0))
+            target = p0 + t * (p1 - p0)
+            step_px = float(np.dot(target - pts[i], nrm[i]))
         else:
-            step_px = float(offsets[k])
+            if 0 < k < n_samples - 1:
+                a, b, c = vals[k - 1, i], vals[k, i], vals[k + 1, i]
+                denom = a - 2.0 * b + c
+                dv = 0.5 * (a - c) / denom if abs(denom) > 1e-9 else 0.0
+                step_px = float(offsets[k] + dv * step_size)
+            else:
+                step_px = float(offsets[k])
         step_px = float(np.clip(step_px, -max_shift, max_shift))
         move[i] = strength * step_px * nrm[i]
     shift = np.linalg.norm(move, axis=1)
@@ -485,6 +537,7 @@ def _outline_single(
                     int(params.get("refine_edge_samples", 21)),
                     float(np.clip(params.get("refine_edge_strength", 0.8), 0.0, 1.0)),
                     cutoff, max_shift,
+                    subpixel=str(params.get("refine_edge_subpixel", "parabolic")),
                 )
                 far = np.linalg.norm(ring_xy - before, axis=1) > float(
                     params.get("refine_edge_max_round_shift", 1.5)
