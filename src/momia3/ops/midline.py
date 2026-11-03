@@ -73,6 +73,7 @@ from skimage.graph import route_through_array
 
 from momia3 import keys as _keys
 from momia3 import schema as _schema
+from momia3.ops.polygon import inside_polygon
 
 logger = logging.getLogger(__name__)
 
@@ -2044,35 +2045,6 @@ def _trunk_branches_from_graph(
 #     )
 #
 #
-def _inside_polygon(ring: np.ndarray, points: np.ndarray) -> np.ndarray:
-    """Inside test of a closed polygon (matplotlib Path).
-
-    Parameters
-    ----------
-    ring : (N, 2) numpy.ndarray
-        Closed (x, y) polygon; the last point connects back to the first.
-    points : (M, 2) numpy.ndarray
-        Query points in the same coordinate frame.
-
-    Returns
-    -------
-    numpy.ndarray of bool
-        (M,) mask, True where the point is strictly inside the polygon.
-
-    Notes
-    -----
-    Matplotlib is imported lazily so the core package does not depend on a
-    GUI/plotting toolkit at import time. This is the exact point-in-polygon
-    helper used as the slow fallback when PIL rasterization is unavailable,
-    and it is kept for future outline/geometry checks.
-    """
-    from matplotlib.path import Path
-
-    return Path(np.asarray(ring, dtype=np.float64)).contains_points(
-        np.asarray(points, dtype=np.float64)
-    )
-
-
 def _sdf_graph_from_outline(
     outline_local: np.ndarray,
     supersample: int = 4,
@@ -2102,32 +2074,15 @@ def _sdf_graph_from_outline(
     ss = int(np.clip(round(np.sqrt(float(max_pixels) / bbox_area)), 1, int(supersample)))
     nx = max(8, int(round((x1f - x0f) * ss)))
     ny = max(8, int(round((y1f - y0f) * ss)))
-    # Fast supersampled polygon fill. PIL's C polygon fill is ~50-100x faster
-    # than skimage.draw.polygon for our many-vertex smooth outlines; it is the
-    # single biggest cost of the SDF route.
-    col_idx = (ring[:, 0] - x0f) * ss - 0.5
-    row_idx = (ring[:, 1] - y0f) * ss - 0.5
+    # Fast supersampled polygon fill, backend logic in momia3.ops.polygon
+    # (PIL rasterization by default, exact numpy point-in-polygon fallback).
     try:
-        from PIL import Image as _PILImage
-        from PIL import ImageDraw as _PILImageDraw
-
-        canvas = _PILImage.new("L", (nx, ny), 0)
-        _PILImageDraw.Draw(canvas).polygon(
-            list(zip(col_idx.tolist(), row_idx.tolist())), fill=1
+        inside = inside_polygon(
+            ring, x0=x0f, y0=y0f, nx=nx, ny=ny, scale=ss, backend="auto"
         )
-        inside = np.asarray(canvas, dtype=np.uint8).astype(bool)
-    except Exception as exc:  # pragma: no cover - fallback only
-        logger.debug("PIL rasterization failed (%s); using _inside_polygon", exc)
-        try:
-            gx = x0f + (np.arange(nx) + 0.5) / ss
-            gy = y0f + (np.arange(ny) + 0.5) / ss
-            xx, yy = np.meshgrid(gx, gy)
-            inside = _inside_polygon(
-                ring, np.column_stack([xx.ravel(), yy.ravel()])
-            ).reshape(ny, nx)
-        except Exception as exc2:  # pragma: no cover
-            logger.debug("outline rasterization failed (%s)", exc2)
-            return None
+    except Exception as exc:  # pragma: no cover - rasterization failure
+        logger.debug("outline rasterization failed (%s)", exc)
+        return None
     skel = morphology.skeletonize(inside)
     ys, xs = np.nonzero(skel)
     if ys.size < 5:
