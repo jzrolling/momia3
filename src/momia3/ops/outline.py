@@ -79,6 +79,17 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     "constriction_image_max_shift": 3.0,  # px, max inward move per round
     "constriction_image_strength": 0.8,
     "constriction_image_threshold_frac": 0.55,  # dark threshold between cell and background
+    # Combined outline refinement (momia v1 / MicrobeJ style): one subpixel move
+    # per round to the local maximum of a Sobel edge map along the normal, then
+    # the intensity-threshold constriction step above, then light re-smoothing.
+    # "refine_outline_mode": "edge" | "intensity" | "edge+intensity".
+    "refine_outline_iters": 0,  # 0 = off
+    "refine_outline_mode": "edge+intensity",
+    "refine_edge_step": 0.5,  # px sampling offset along the normal
+    "refine_edge_cutoff": 0.2,  # normalized Sobel magnitude below which no move
+    "refine_edge_max_shift": 1.5,  # px cap per round
+    "refine_edge_max_round_shift": 1.5,  # revert points moving farther than this in one round
+    "refine_edge_pre_expand": 0.3,  # px outward expansion before the first round (momia v1)
     "active_contour": False,
     "alpha": 0.015,
     "beta": 10.0,
@@ -283,6 +294,67 @@ def _constriction_intensity_step(
     return moved
 
 
+def _sobel_edge_map(intensity: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+    """Normalized Sobel edge energy map (momia v1: gaussian(sobel(img)))."""
+    from skimage import filters
+
+    img = np.asarray(intensity, dtype=np.float64)
+    lo, hi = np.percentile(img, [2.0, 98.0])
+    img = np.clip((img - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
+    img = ndimage.gaussian_filter(img, sigma=sigma)
+    edge = filters.sobel(img)
+    edge = ndimage.gaussian_filter(edge, sigma=sigma)
+    lo, hi = np.percentile(edge, [2.0, 99.5])
+    edge = np.clip((edge - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
+    return edge
+
+
+def _edge_snap_step(
+    ring: np.ndarray,
+    edge: np.ndarray,
+    step: float,
+    cutoff: float,
+    max_shift: float,
+) -> np.ndarray:
+    """One subpixel step of each outline sample to the local Sobel maximum.
+
+    Mirrors momia v1 contour_optimization: sample the edge map at the current
+    position and +/- one step along the normal, keep the central sample when it
+    is the maximum (subpixel quadratic correction), otherwise move half a step
+    toward the better side. Weak edges (below cutoff) are left alone.
+    """
+    pts = np.asarray(ring, dtype=np.float64).copy()
+    h, w = edge.shape
+    nrm = _outline_normals(pts)
+    step = max(float(step), 0.1)
+
+    def sample(pp):
+        cols = np.clip(pp[:, 0], 0, w - 1.0)
+        rows = np.clip(pp[:, 1], 0, h - 1.0)
+        return ndimage.map_coordinates(edge, [rows, cols], order=1, mode="nearest")
+
+    v_in = sample(pts + step * nrm)
+    v0 = sample(pts)
+    v_out = sample(pts - step * nrm)
+    best = np.maximum(np.maximum(v_in, v0), v_out)
+    weak = best < float(cutoff)
+    denom = v_in - 2.0 * v0 + v_out
+    denom = np.where(np.abs(denom) < 1e-9, np.inf, denom)
+    sub = 0.5 * (v_in - v_out) / denom * step  # parabolic vertex offset (px)
+    sub = np.clip(sub, -step, step)
+    move = np.zeros_like(pts)
+    center_max = (v0 >= v_in) & (v0 >= v_out) & ~weak
+    move[center_max] = sub[center_max, None] * nrm[center_max]
+    in_max = (v_in > v_out) & (v_in > v0) & ~weak
+    move[in_max] = 0.5 * step * nrm[in_max]
+    out_max = (v_out > v_in) & (v_out > v0) & ~weak
+    move[out_max] = -0.5 * step * nrm[out_max]
+    shift = np.linalg.norm(move, axis=1)
+    too_far = shift > float(max_shift)
+    move[too_far] = 0.0
+    return pts + move
+
+
 def _outline_single(
 
     crop: np.ndarray,
@@ -354,6 +426,37 @@ def _outline_single(
         else float(params["smooth"])
     )
     ring_xy = _smooth_closed(base_ring, smooth, n_out)
+
+    # Combined refinement (momia v1 / MicrobeJ style + intensity constriction).
+    refine_iters = int(params.get("refine_outline_iters", 0) or 0)
+    refine_mode = str(params.get("refine_outline_mode", "edge+intensity")).lower()
+    if refine_iters > 0 and intensity_crop is not None and len(ring_xy) > 16:
+        icrop = np.asarray(intensity_crop, dtype=np.float64)
+        edge_map = _sobel_edge_map(icrop, sigma=1.0)
+        step = float(params.get("refine_edge_step", 0.5))
+        cutoff = float(params.get("refine_edge_cutoff", 0.2))
+        max_shift = float(params.get("refine_edge_max_shift", 1.5))
+        expand = float(params.get("refine_edge_pre_expand", 0.3))
+        if expand > 0.0:
+            ring_xy = ring_xy + expand * _outline_normals(ring_xy)
+        light = max(float(params.get("constriction_smooth_scale", 0.01)) * n_out, 1.0)
+        for _ in range(refine_iters):
+            before = ring_xy.copy()
+            if refine_mode in ("edge", "edge+intensity"):
+                ring_xy = _edge_snap_step(ring_xy, edge_map, step, cutoff, max_shift)
+                far = np.linalg.norm(ring_xy - before, axis=1) > float(
+                    params.get("refine_edge_max_round_shift", 1.5)
+                )
+                ring_xy[far] = before[far]
+            if refine_mode in ("intensity", "edge+intensity"):
+                thr_frac = float(params.get("constriction_image_threshold_frac", 0.55))
+                strength_i = float(np.clip(params.get("constriction_image_strength", 0.8), 0.0, 1.0))
+                ring_xy = _constriction_intensity_step(
+                    ring_xy, icrop, np.asarray(crop, dtype=bool),
+                    float(params.get("constriction_image_max_shift", 3.0)),
+                    strength_i, thr_frac, params,
+                )
+            ring_xy = _smooth_closed(ring_xy, light, n_out)
 
     # Opt-in: restore septum constriction lost to the global spline smoothing.
     # Snap toward the raw marching-squares ring, then re-smooth lightly; 1-2
