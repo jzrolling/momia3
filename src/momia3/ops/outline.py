@@ -85,9 +85,11 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     # "refine_outline_mode": "edge" | "intensity" | "edge+intensity".
     "refine_outline_iters": 0,  # 0 = off
     "refine_outline_mode": "edge+intensity",
-    "refine_edge_search_px": 3.0,  # half-length of the normal profile (px)
-    "refine_edge_samples": 21,  # profile samples across the search range
-    "refine_edge_cutoff": 0.2,  # normalized edge magnitude below which no move
+    "refine_edge_search_px": 3.0,  # half-length of the normal profile (px) = MicrobeJ edgeThickness
+    "refine_edge_samples": 21,  # profile samples across the search range (MicrobeJ: axisLen/20)
+    "refine_edge_cutoff": 0.1,  # normalized edge magnitude below which no move (MicrobeJ findMaxima threshold)
+    "refine_edge_presmooth_sigma": 1.0,  # MicrobeJ: scale*edgeSigma/2 on the channel
+    "refine_edge_postsmooth_sigma": 0.25,  # MicrobeJ: edgeSigma/4 after findEdges
     "refine_edge_strength": 0.8,  # fraction of the located offset applied per round
     "refine_edge_max_shift": 1.5,  # px cap per round
     "refine_edge_max_round_shift": 1.5,  # revert points moving farther than this in one round
@@ -296,16 +298,28 @@ def _constriction_intensity_step(
     return moved
 
 
-def _sobel_edge_map(intensity: np.ndarray, sigma: float = 1.0) -> np.ndarray:
-    """Normalized Sobel edge energy map (momia v1: gaussian(sobel(img)))."""
+def _sobel_edge_map(
+    intensity: np.ndarray,
+    pre_sigma: float = 1.0,
+    post_sigma: float = 0.25,
+) -> np.ndarray:
+    """Normalized Sobel edge energy map, matching MicrobeJ ImMask preprocessing.
+
+    MicrobeJ builds its edge image as
+    gaussian(blur) -> FloatProcessor.findEdges() (ImageJ Sobel) -> gaussian(blur)
+    with sigmas scale*edgeSigma/2 and edgeSigma/4; this is the same shape of
+    pipeline with the sigmas exposed as parameters.
+    """
     from skimage import filters
 
     img = np.asarray(intensity, dtype=np.float64)
     lo, hi = np.percentile(img, [2.0, 98.0])
     img = np.clip((img - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
-    img = ndimage.gaussian_filter(img, sigma=sigma)
+    if pre_sigma > 0:
+        img = ndimage.gaussian_filter(img, sigma=float(pre_sigma))
     edge = filters.sobel(img)
-    edge = ndimage.gaussian_filter(edge, sigma=sigma)
+    if post_sigma > 0:
+        edge = ndimage.gaussian_filter(edge, sigma=float(post_sigma))
     lo, hi = np.percentile(edge, [2.0, 99.5])
     edge = np.clip((edge - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
     return edge
@@ -451,7 +465,11 @@ def _outline_single(
     refine_mode = str(params.get("refine_outline_mode", "edge+intensity")).lower()
     if refine_iters > 0 and intensity_crop is not None and len(ring_xy) > 16:
         icrop = np.asarray(intensity_crop, dtype=np.float64)
-        edge_map = _sobel_edge_map(icrop, sigma=1.0)
+        edge_map = _sobel_edge_map(
+            icrop,
+            pre_sigma=float(params.get("refine_edge_presmooth_sigma", 1.0)),
+            post_sigma=float(params.get("refine_edge_postsmooth_sigma", 0.25)),
+        )
         cutoff = float(params.get("refine_edge_cutoff", 0.2))
         max_shift = float(params.get("refine_edge_max_shift", 1.5))
         expand = float(params.get("refine_edge_pre_expand", 0.3))
