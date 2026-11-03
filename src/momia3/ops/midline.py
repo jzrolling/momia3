@@ -2044,15 +2044,35 @@ def _trunk_branches_from_graph(
 #     )
 #
 #
-# # ---------------------------------------------------------------------------
-# # UNUSED (commented out in cleanup): no call sites in the package, tests or scripts.
-# def _inside_polygon(ring: np.ndarray, points: np.ndarray) -> np.ndarray:
-#     """Inside test of a closed polygon (matplotlib Path)."""
-#     from matplotlib.path import Path
-#
-#     return Path(ring).contains_points(points)
-#
-#
+def _inside_polygon(ring: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Inside test of a closed polygon (matplotlib Path).
+
+    Parameters
+    ----------
+    ring : (N, 2) numpy.ndarray
+        Closed (x, y) polygon; the last point connects back to the first.
+    points : (M, 2) numpy.ndarray
+        Query points in the same coordinate frame.
+
+    Returns
+    -------
+    numpy.ndarray of bool
+        (M,) mask, True where the point is strictly inside the polygon.
+
+    Notes
+    -----
+    Matplotlib is imported lazily so the core package does not depend on a
+    GUI/plotting toolkit at import time. This is the exact point-in-polygon
+    helper used as the slow fallback when PIL rasterization is unavailable,
+    and it is kept for future outline/geometry checks.
+    """
+    from matplotlib.path import Path
+
+    return Path(np.asarray(ring, dtype=np.float64)).contains_points(
+        np.asarray(points, dtype=np.float64)
+    )
+
+
 def _sdf_graph_from_outline(
     outline_local: np.ndarray,
     supersample: int = 4,
@@ -2097,13 +2117,14 @@ def _sdf_graph_from_outline(
         )
         inside = np.asarray(canvas, dtype=np.uint8).astype(bool)
     except Exception as exc:  # pragma: no cover - fallback only
-        logger.debug("PIL rasterization failed (%s); trying skimage", exc)
+        logger.debug("PIL rasterization failed (%s); using _inside_polygon", exc)
         try:
-            from skimage import draw as _skdraw
-
-            rr, cc = _skdraw.polygon(row_idx, col_idx, shape=(ny, nx))
-            inside = np.zeros((ny, nx), dtype=bool)
-            inside[rr, cc] = True
+            gx = x0f + (np.arange(nx) + 0.5) / ss
+            gy = y0f + (np.arange(ny) + 0.5) / ss
+            xx, yy = np.meshgrid(gx, gy)
+            inside = _inside_polygon(
+                ring, np.column_stack([xx.ravel(), yy.ravel()])
+            ).reshape(ny, nx)
         except Exception as exc2:  # pragma: no cover
             logger.debug("outline rasterization failed (%s)", exc2)
             return None
