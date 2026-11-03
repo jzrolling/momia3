@@ -41,6 +41,18 @@ never comes from the skeleton.
 Coordinate convention: all output geometry is ``(x, y)`` in *global*
 image coordinates. ``width_profile`` and ``length``/``width`` scalars are
 in microns (``pixel_microns``).
+
+References
+----------
+[1] Ducret, A., Quardokus, E. M. & Brun, Y. V. MicrobeJ, a tool to automate
+    high-content screening for bacterial cell biology. Nat. Microbiol. 1,
+    16209 (2016).
+[2] Zhu, J. MOMIA: Mycobacteria-Optimized Microscopy Image Analysis (PyPI,
+    2021); https://pypi.org/project/momia.
+[3] Zhu, J. momia2: Mycobacteria-optimized microscopy image analysis version 2
+    (PyPI, 2023); https://pypi.org/project/momia2.
+[4] Taubin, G. Curve and surface smoothing without shrinkage. In Proc. Fifth
+    Int. Conf. Comput. Vis. 852-857 (IEEE, 1995).
 """
 
 from __future__ import annotations
@@ -1496,6 +1508,9 @@ def _refine_degenerate_axis(
 ) -> np.ndarray:
     """Cross-section chord-midpoint refinement for a degenerate straight axis.
 
+    The chord-midpoint iteration follows the momia2 midline_approximation
+    design [3].
+
     Interior points are moved to the midpoint of the perpendicular chord
     (equidistant step); the last ``anchor`` points at each end are excluded
     from the chord update and only act as spline constraints.
@@ -1593,7 +1608,8 @@ def _skeleton_side_branches(
     """Skeleton-based side-branch detection for branch REPORTING only.
 
     The main midline never comes from the skeleton; the skeleton graph is
-    traced solely to enumerate residual arms of branched masks. Any
+    traced solely to enumerate residual arms of branched masks. The branch
+    tracing/pruning follows the momia2 skeleton_analysis design [3]. Any
     failure yields no side branches.
     """
     min_branch_px = max(
@@ -1632,6 +1648,12 @@ def _energy_refine(
     params: Mapping[str, Any],
 ) -> tuple[np.ndarray, float, float]:
     """Dense-point curvature-regularized midline (the "energy" method).
+
+    .. deprecated:: 0.1
+       Experimental opt-in path (midline_method="energy"); it is not exercised
+       by the default pipeline or the current QC suite. Kept for the energy
+       benchmark, candidate for removal in the next cleanup pass.
+
 
     The midline is a dense polyline (no spline basis, no control points); all
     interior points are optimized jointly:
@@ -1728,7 +1750,7 @@ def _energy_refine(
 
 
 # ---------------------------------------------------------------------------
-# opt-in "equidistant" method: MicrobeJ-style contour-cut poles
+# opt-in "equidistant" method: MicrobeJ-style contour-cut poles [1]
 # ---------------------------------------------------------------------------
 
 
@@ -1747,7 +1769,7 @@ def _resample_closed(points: np.ndarray, n: int) -> np.ndarray:
 
 
 def _taubin_closed(points: np.ndarray, iters: int) -> np.ndarray:
-    """Taubin (shrink-free) smoothing of a closed ring."""
+    """Taubin (shrink-free) smoothing of a closed ring [4]."""
     pnt = np.asarray(points, dtype=np.float64).copy()
     if len(pnt) < 3:
         return pnt
@@ -1761,7 +1783,7 @@ def _taubin_closed(points: np.ndarray, iters: int) -> np.ndarray:
 
 
 def _taubin_open_fixed(points: np.ndarray, iters: int) -> np.ndarray:
-    """Taubin smoothing of an open polyline with endpoints pinned."""
+    """Taubin smoothing of an open polyline with endpoints pinned [4]."""
     pnt = np.asarray(points, dtype=np.float64).copy()
     if len(pnt) < 3:
         return pnt
@@ -1774,61 +1796,65 @@ def _taubin_open_fixed(points: np.ndarray, iters: int) -> np.ndarray:
     return pnt
 
 
-def _skeleton_longest_path(mask: np.ndarray) -> np.ndarray | None:
-    """Ordered longest branch of the pixel skeleton as (x, y) crop coords."""
-    import heapq
-
-    skel = morphology.skeletonize(np.asarray(mask, dtype=bool))
-    ys, xs = np.nonzero(skel)
-    if ys.size < 5:
-        return None
-    node = {(int(y), int(x)): i for i, (y, x) in enumerate(zip(ys, xs))}
-    graph: dict[int, dict[int, float]] = {}
-    for (y, x), i in node.items():
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                j = node.get((y + dy, x + dx))
-                if j is not None:
-                    w = float(np.hypot(dy, dx))
-                    graph.setdefault(i, {})[j] = w
-                    graph.setdefault(j, {})[i] = w
-    if len(graph) < 5:
-        return None
-    degree = {k: len(v) for k, v in graph.items()}
-    ends = [k for k, d in degree.items() if d == 1]
-    if len(ends) < 2:
-        return None
-
-    def _dijkstra(src: int) -> tuple[int, float, dict[int, int]]:
-        dist = {src: 0.0}
-        prev: dict[int, int] = {src: -1}
-        pq = [(0.0, src)]
-        while pq:
-            dd, u = heapq.heappop(pq)
-            if dd > dist.get(u, 1e18):
-                continue
-            for v, w in graph.get(u, {}).items():
-                nd = dd + w
-                if nd < dist.get(v, 1e18):
-                    dist[v] = nd
-                    prev[v] = u
-                    heapq.heappush(pq, (nd, v))
-        far = max(dist, key=dist.get)
-        return far, dist[far], prev
-
-    a, _, _ = _dijkstra(ends[0])
-    b, _, prev = _dijkstra(a)
-    path: list[int] = []
-    u = b
-    while u != -1:
-        path.append(u)
-        u = prev.get(u, -1)
-    path.reverse()
-    return np.array([[xs[i], ys[i]] for i in path], dtype=np.float64)
-
-
+# ---------------------------------------------------------------------------
+# UNUSED (commented out in cleanup): no call sites in the package, tests or scripts.
+# Kept in git history; re-enable only if a caller reappears.
+# ---------------------------------------------------------------------------
+# def _skeleton_longest_path(mask: np.ndarray) -> np.ndarray | None:
+#     """Ordered longest branch of the pixel skeleton as (x, y) crop coords."""
+#     import heapq
+#
+#     skel = morphology.skeletonize(np.asarray(mask, dtype=bool))
+#     ys, xs = np.nonzero(skel)
+#     if ys.size < 5:
+#         return None
+#     node = {(int(y), int(x)): i for i, (y, x) in enumerate(zip(ys, xs))}
+#     graph: dict[int, dict[int, float]] = {}
+#     for (y, x), i in node.items():
+#         for dy in (-1, 0, 1):
+#             for dx in (-1, 0, 1):
+#                 if dy == 0 and dx == 0:
+#                     continue
+#                 j = node.get((y + dy, x + dx))
+#                 if j is not None:
+#                     w = float(np.hypot(dy, dx))
+#                     graph.setdefault(i, {})[j] = w
+#                     graph.setdefault(j, {})[i] = w
+#     if len(graph) < 5:
+#         return None
+#     degree = {k: len(v) for k, v in graph.items()}
+#     ends = [k for k, d in degree.items() if d == 1]
+#     if len(ends) < 2:
+#         return None
+#
+#     def _dijkstra(src: int) -> tuple[int, float, dict[int, int]]:
+#         dist = {src: 0.0}
+#         prev: dict[int, int] = {src: -1}
+#         pq = [(0.0, src)]
+#         while pq:
+#             dd, u = heapq.heappop(pq)
+#             if dd > dist.get(u, 1e18):
+#                 continue
+#             for v, w in graph.get(u, {}).items():
+#                 nd = dd + w
+#                 if nd < dist.get(v, 1e18):
+#                     dist[v] = nd
+#                     prev[v] = u
+#                     heapq.heappush(pq, (nd, v))
+#         far = max(dist, key=dist.get)
+#         return far, dist[far], prev
+#
+#     a, _, _ = _dijkstra(ends[0])
+#     b, _, prev = _dijkstra(a)
+#     path: list[int] = []
+#     u = b
+#     while u != -1:
+#         path.append(u)
+#         u = prev.get(u, -1)
+#     path.reverse()
+#     return np.array([[xs[i], ys[i]] for i in path], dtype=np.float64)
+#
+#
 def _project_to_polyline(point: np.ndarray, poly: np.ndarray) -> np.ndarray:
     """Closest point on a closed polyline."""
     a = np.asarray(poly, dtype=np.float64)
@@ -1998,29 +2024,35 @@ def _trunk_branches_from_graph(
     return trunk, branches
 
 
-def _skeleton_trunk_and_branches(
-    work: np.ndarray,
-    min_branch_px: float,
-    cap_fork_frac: float = 0.12,
-    cap_fork_max_px: float = 12.0,
-) -> tuple[np.ndarray | None, list[np.ndarray]]:
-    """Trunk/branches from a binary mask skeleton (pixel graph)."""
-    data = _skeleton_graph_data(work)
-    if data is None:
-        return None, []
-    graph, pts, degree = data
-    return _trunk_branches_from_graph(
-        graph, pts, degree, min_branch_px, cap_fork_frac, cap_fork_max_px
-    )
-
-
-def _inside_polygon(ring: np.ndarray, points: np.ndarray) -> np.ndarray:
-    """Inside test of a closed polygon (matplotlib Path)."""
-    from matplotlib.path import Path
-
-    return Path(ring).contains_points(points)
-
-
+# ---------------------------------------------------------------------------
+# UNUSED (commented out in cleanup): no call sites in the package, tests or scripts.
+# Kept in git history; re-enable only if a caller reappears.
+# ---------------------------------------------------------------------------
+# def _skeleton_trunk_and_branches(
+#     work: np.ndarray,
+#     min_branch_px: float,
+#     cap_fork_frac: float = 0.12,
+#     cap_fork_max_px: float = 12.0,
+# ) -> tuple[np.ndarray | None, list[np.ndarray]]:
+#     """Trunk/branches from a binary mask skeleton (pixel graph)."""
+#     data = _skeleton_graph_data(work)
+#     if data is None:
+#         return None, []
+#     graph, pts, degree = data
+#     return _trunk_branches_from_graph(
+#         graph, pts, degree, min_branch_px, cap_fork_frac, cap_fork_max_px
+#     )
+#
+#
+# # ---------------------------------------------------------------------------
+# # UNUSED (commented out in cleanup): no call sites in the package, tests or scripts.
+# def _inside_polygon(ring: np.ndarray, points: np.ndarray) -> np.ndarray:
+#     """Inside test of a closed polygon (matplotlib Path)."""
+#     from matplotlib.path import Path
+#
+#     return Path(ring).contains_points(points)
+#
+#
 def _sdf_graph_from_outline(
     outline_local: np.ndarray,
     supersample: int = 4,
@@ -2333,7 +2365,7 @@ def _equidistant_result(
     knn: int,
     solidity: float | None = None,
 ) -> dict[str, Any]:
-    """MicrobeJ-style contour-cut midline (opt-in midline_method).
+    """MicrobeJ-style contour-cut midline (opt-in midline_method) [1].
 
     Mask pre-smoothing removes single-pixel protrusions that bias the
     pixel-skeleton tip; the axis is skeleton-longest-path + Taubin; poles
@@ -2574,6 +2606,12 @@ def _sdf_fallback_branches(
     pixel_microns: float,
 ) -> list[np.ndarray]:
     """Refined side branches (global) from the outline-SDF skeleton.
+
+    .. deprecated:: 0.1
+       Only reachable from the disabled equidistant-to-spline fallback branch
+       (equidistant_fallback is never True now that the equidistant path always
+       returns a candidate). Candidate for removal.
+
 
     Used when the equidistant mainline falls back to the default spine: the
     branch description still comes from the outline geometry, extended to the

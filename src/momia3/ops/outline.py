@@ -20,6 +20,16 @@ Coordinate convention: outlines are ``(N, 2)`` float64 arrays of
 ``(x, y)`` points in *global* image coordinates. "Closed" means the ring
 is implicitly closed (the last point connects back to the first); the
 first point is *not* duplicated at the end.
+
+References
+----------
+[1] Ducret, A., Quardokus, E. M. & Brun, Y. V. MicrobeJ, a tool to automate
+    high-content screening for bacterial cell biology. Nat. Microbiol. 1,
+    16209 (2016).
+[2] Zhu, J. MOMIA: Mycobacteria-Optimized Microscopy Image Analysis (PyPI,
+    2021); https://pypi.org/project/momia.
+[3] Zhu, J. momia2: Mycobacteria-optimized microscopy image analysis version 2
+    (PyPI, 2023); https://pypi.org/project/momia2.
 """
 
 from __future__ import annotations
@@ -70,7 +80,10 @@ _DEFAULT_PARAMS: dict[str, Any] = {
     # the outline back toward the raw marching-squares contour for 1-2 rounds,
     # with a light re-smoothing each round. Restores septum neck depth that the
     # global smoothing rounds away, while keeping the outline smooth.
-    "constriction_iters": 0,  # 0 = off (default, backwards compatible)
+    # Deprecated: the mask-target constriction pull was superseded by the
+    # image-guided refine_outline_* rounds below; kept for backwards
+    # compatibility, candidate for removal.
+    "constriction_iters": 0,  # 0 = off
     "constriction_strength": 0.6,  # pull fraction toward the raw contour per round
     "constriction_smooth_scale": 0.01,  # light spline stiffness per round (x n_out)
     # Image-guided variant: snap outline samples to the dark cell edge where the
@@ -295,7 +308,12 @@ def _constriction_intensity_step(
 
 
 def _sobel_edge_map(intensity: np.ndarray, sigma: float = 1.0) -> np.ndarray:
-    """Normalized Sobel edge energy map (momia v1: gaussian(sobel(img)))."""
+    """Normalized Sobel edge energy map.
+
+    Preprocessing follows MicrobeJ ImMask [1]: gaussian -> ImageJ Sobel
+    (FloatProcessor.findEdges) -> gaussian, with the same role for the two
+    sigmas. The momia v1 implementation [2] uses the same edge image.
+    """
     from skimage import filters
 
     img = np.asarray(intensity, dtype=np.float64)
@@ -318,10 +336,13 @@ def _edge_snap_step(
 ) -> np.ndarray:
     """One subpixel step of each outline sample to the local Sobel maximum.
 
-    Mirrors momia v1 contour_optimization: sample the edge map at the current
-    position and +/- one step along the normal, keep the central sample when it
-    is the maximum (subpixel quadratic correction), otherwise move half a step
-    toward the better side. Weak edges (below cutoff) are left alone.
+    Mirrors momia v1 contour_optimization [2]: sample the edge map at the
+    current position and +/- one step along the normal, keep the central sample
+    when it is the maximum (subpixel quadratic correction), otherwise move half
+    a step toward the better side. Weak edges (below cutoff) are left alone.
+    The MicrobeJ high-precision mode [1] solves the same normal-line maximum
+    problem with a single full-profile pass (ContourRoi.getCorrectedContour in
+    MicrobeJ 5.13p).
     """
     pts = np.asarray(ring, dtype=np.float64).copy()
     h, w = edge.shape
