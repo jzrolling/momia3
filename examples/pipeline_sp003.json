@@ -8,52 +8,105 @@
       "params": {
         "path": "data/SP_003.tif",
         "pixel_microns": 0.04968,
-        "channels": ["phase", "ch1", "ch2"]
+        "channels": [
+          "phase",
+          "ch1",
+          "ch2"
+        ]
       },
       "inputs": {},
-      "outputs": {"experiment": "experiment.zarr"}
+      "outputs": {
+        "experiment": "experiment.zarr"
+      }
     },
     {
       "id": "segment",
       "op": "segment.threshold",
-      "params": {"channel": "phase", "method": "composite", "min_size": 50},
-      "inputs": {"experiment": "import.experiment"},
-      "outputs": {"experiment": "experiment.zarr"}
+      "params": {
+        "channel": "phase",
+        "method": "composite",
+        "min_size": 50
+      },
+      "inputs": {
+        "experiment": "import.experiment"
+      },
+      "outputs": {
+        "experiment": "experiment.zarr"
+      }
     },
     {
       "id": "declump",
       "op": "segment.declump_store",
-      "params": {"min_distance": 5, "threshold_abs": 2.0},
-      "inputs": {"experiment": "segment.experiment"},
-      "outputs": {"experiment": "experiment.zarr"}
+      "params": {
+        "min_distance": 5,
+        "threshold_abs": 2.0
+      },
+      "inputs": {
+        "experiment": "segment.experiment"
+      },
+      "outputs": {
+        "experiment": "experiment.zarr"
+      }
     },
     {
       "id": "cells",
       "op": "measure.cells",
-      "params": {"channel": "phase", "include_intensity": true},
-      "inputs": {"experiment": "declump.experiment"},
-      "outputs": {"cells": "tables/cells_raw.parquet"}
+      "params": {
+        "channel": "phase",
+        "include_intensity": true
+      },
+      "inputs": {
+        "experiment": "declump.experiment"
+      },
+      "outputs": {
+        "cells": "tables/cells_raw.parquet"
+      }
     },
     {
       "id": "outlines",
       "op": "outline.extract",
-      "params": {"n_points": 100, "sigma": 1.0},
-      "inputs": {"experiment": "declump.experiment", "cells": "cells.cells"},
-      "outputs": {"cells": "tables/cells_outlines.parquet"}
+      "params": {
+        "sigma": 1.0,
+        "refine_outline_iters": 1,
+        "refine_outline_mode": "edge+intensity"
+      },
+      "inputs": {
+        "experiment": "declump.experiment",
+        "cells": "cells.cells"
+      },
+      "outputs": {
+        "cells": "tables/cells_outlines.parquet"
+      }
     },
     {
       "id": "midlines",
       "op": "midline.extract",
-      "params": {"n_points": 32},
-      "inputs": {"experiment": "declump.experiment", "cells": "outlines.cells"},
-      "outputs": {"cells": "tables/cells.parquet"}
+      "params": {
+        "midline_method": "equidistant",
+        "equidistant_guard": true
+      },
+      "inputs": {
+        "experiment": "declump.experiment",
+        "cells": "outlines.cells"
+      },
+      "outputs": {
+        "cells": "tables/cells.parquet"
+      }
     },
     {
       "id": "efd",
       "op": "characterize.efd_shape_space",
-      "params": {"n_harmonics": 10, "n_components": 3},
-      "inputs": {"cells": "midlines.cells"},
-      "outputs": {"cells": "tables/cells_efd.parquet", "pca": "tables/efd_pca.json"}
+      "params": {
+        "n_harmonics": 10,
+        "n_components": 3
+      },
+      "inputs": {
+        "cells": "midlines.cells"
+      },
+      "outputs": {
+        "cells": "tables/cells_efd.parquet",
+        "pca": "tables/efd_pca.json"
+      }
     }
   ]
 }

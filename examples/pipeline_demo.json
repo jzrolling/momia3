@@ -7,7 +7,10 @@
       "op": "io.import_synth",
       "params": {
         "n_frames": 12,
-        "shape": [256, 256],
+        "shape": [
+          256,
+          256
+        ],
         "n_initial": 3,
         "pixel_microns": 0.065,
         "growth_rate_um_per_frame": 0.15,
@@ -26,8 +29,12 @@
     {
       "id": "drift",
       "op": "preprocess.drift",
-      "params": {"upsample_factor": 10},
-      "inputs": {"experiment": "import.experiment"},
+      "params": {
+        "upsample_factor": 10
+      },
+      "inputs": {
+        "experiment": "import.experiment"
+      },
       "outputs": {
         "experiment": "experiment_drift.zarr",
         "shifts": "drift_shifts.json"
@@ -36,36 +43,74 @@
     {
       "id": "segment",
       "op": "segment.threshold",
-      "params": {"method": "composite", "dark_foreground": true, "min_size": 20},
-      "inputs": {"experiment": "drift.experiment"},
-      "outputs": {"experiment": "experiment_drift.zarr"}
+      "params": {
+        "method": "composite",
+        "dark_foreground": true,
+        "min_size": 20
+      },
+      "inputs": {
+        "experiment": "drift.experiment"
+      },
+      "outputs": {
+        "experiment": "experiment_drift.zarr"
+      }
     },
     {
       "id": "cells",
       "op": "measure.cells",
-      "params": {"channel": "phase", "include_intensity": true},
-      "inputs": {"experiment": "segment.experiment"},
-      "outputs": {"cells": "tables/cells_raw.parquet"}
+      "params": {
+        "channel": "phase",
+        "include_intensity": true
+      },
+      "inputs": {
+        "experiment": "segment.experiment"
+      },
+      "outputs": {
+        "cells": "tables/cells_raw.parquet"
+      }
     },
     {
       "id": "outlines",
       "op": "outline.extract",
-      "params": {"n_points": 100, "sigma": 1.0},
-      "inputs": {"experiment": "segment.experiment", "cells": "cells.cells"},
-      "outputs": {"cells": "tables/cells_outlines.parquet"}
+      "params": {
+        "sigma": 1.0,
+        "refine_outline_iters": 1,
+        "refine_outline_mode": "edge+intensity"
+      },
+      "inputs": {
+        "experiment": "segment.experiment",
+        "cells": "cells.cells"
+      },
+      "outputs": {
+        "cells": "tables/cells_outlines.parquet"
+      }
     },
     {
       "id": "midlines",
       "op": "midline.extract",
-      "params": {"n_points": 32, "method": "zhang"},
-      "inputs": {"experiment": "segment.experiment", "cells": "outlines.cells"},
-      "outputs": {"cells": "tables/cells.parquet"}
+      "params": {
+        "midline_method": "equidistant",
+        "equidistant_guard": true
+      },
+      "inputs": {
+        "experiment": "segment.experiment",
+        "cells": "outlines.cells"
+      },
+      "outputs": {
+        "cells": "tables/cells.parquet"
+      }
     },
     {
       "id": "track",
       "op": "track.link",
-      "params": {"gap_close": 2, "gate_distance": 20.0},
-      "inputs": {"experiment": "segment.experiment", "cells": "midlines.cells"},
+      "params": {
+        "gap_close": 2,
+        "gate_distance": 20.0
+      },
+      "inputs": {
+        "experiment": "segment.experiment",
+        "cells": "midlines.cells"
+      },
       "outputs": {
         "edges": "tables/edges.parquet",
         "tracks": "tables/tracks.parquet"

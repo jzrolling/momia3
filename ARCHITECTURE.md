@@ -43,6 +43,7 @@ momia3/
 │   │   ├── measure.py             # regionprops/形态/强度/纹理
 │   │   ├── outline.py             # 亚像素轮廓 + 曲率
 │   │   ├── midline.py             # 中线/极点/宽度轮廓
+│   │   ├── polygon.py             # inside_polygon：numpy/PIL 双后端
 │   │   ├── characterize.py        # 坐标投影/生长动力学/群体结构
 │   │   └── track.py               # LAP 链接/间隙闭合/谱系/纠错
 │   ├── models/                    # AI 模型注册表（Omnipose/Cellpose-SAM/自训 U-Net-torch）
@@ -175,8 +176,16 @@ class Ops:                               # 需 GPU 的算子统一入口
 ### 4.3 measure.py
 - `regionprops`：skimage `regionprops_table` 一次算清，只取 schema 声明列；加权取向矩（momia2 已实现，移植）；`intensity_stats` 向量化（`ndimage.sum_labels` 等，禁逐细胞 Python 循环）；`texture.haralick`、`texture.lbp`（新增，对标 CellProfiler MeasureTexture）。
 
-### 4.4 outline.py（重点优化，详见 §5）
-### 4.5 midline.py（重点优化，详见 §5）
+### 4.4 outline.py（重点优化，详见 §5.1）
+- 亚像素轮廓：mask 高斯 σ=1 → marching squares(0.5) → 像素等距降采样（N = perimeter / downsample_factor，默认 2 px/点）→ 闭合 B 样条（s = smooth_scale·N）。
+- 默认开启一轮 edge+intensity 精化：Sobel 法向 subpixel 吸附（momia v1 风格）+ 强度阈值收腰（notch），逐轮轻轻平滑；参数 refine_outline_* / constriction_image_* 全部 opt-in 可调。
+- 曲率：窗口化 bend angle（移植 momia2）+ 椭圆傅里叶描述子 EFD；输出 schema 几何列与 curv_* 标量列。
+- 多边形包含测试/栅格化统一走 momia3.ops.polygon.inside_polygon（numpy Path + PIL 双后端）。
+
+### 4.5 midline.py（重点优化，详见 §5.2）
+- 默认仍为 pole-first 低自由度样条（spline）路线；优化路线 equidistant 为 opt-in（pipeline 可用 midline_method 选择）。
+- equidistant：outline-SDF / mask skeleton 轮廓切割 → 极点对、主干、分支 → 自适应重采样/平滑/Taubin → 贴边 clamp；近圆细胞走 degenerate 直轴 + 弦中点精修；guard 失败保留候选而非回退。
+- 另保留 energy 实验路线；宽度 profile、极点、分支、质量标志均写入 cells 表。
 ### 4.6 characterize.py
 - `projection.demographic`（中线弧长 l∈[0,1] × 横向 d 坐标投影，任意通道；Coli-Coords/BacStalk 式，升级 momia2 fish.create_canvas）、`growth.rates`（伸长速率/分裂间期/adder-sizer-timer 判别）、`division.septum`（中线曲率拐点 + 膜通道信号定位）、`poles.age`（跨帧新旧极继承）、`population.cording`（取向张量/局部取向熵/接触网络）、`fisher.puncta`（LoG + 亚像素，移植 fish.py 并去除字符串存储）。
 
@@ -191,21 +200,38 @@ class Ops:                               # 需 GPU 的算子统一入口
 ## 5. midline/outline 优化规格（对标 MicrobeJ/Oufti/BacStalk）
 
 ### 5.1 outline
-1. 生成：marching squares（level 参数化，修复 momia2 sigma 被忽略 bug）→ 可选 RDP 简化 → 闭合 B 样条平滑。
-2. 可选精化：snake/active contour（skimage `active_contour`）吸附到强度边缘（MicrobeJ 的高精度模式）。
-3. 曲率：窗口化 bend angle（保留 momia2）+ **椭圆傅里叶描述子 EFD**（新增，轻量形状空间，供聚类/异常检测）。
-4. 全部输出写入 schema 几何列与 `curv_*` 标量列。
+1. 生成：mask 高斯平滑（σ=1，修复 momia2 忽略 sigma 的 bug）→ marching squares（level=0.5）→ 可选 RDP 简化 → 像素等距降采样（N = perimeter / downsample_factor，默认 2.0）→ 闭合 B 样条平滑（s = 0.03·N）→ 输出 N 个约 2 px 间隔的点。
+2. 默认精化（refine_outline_iters=1，refine_outline_mode=edge+intensity）：
+   - edge 步：法向 ±0.5 px 采 Sobel 图，三点抛物线 subpixel，弱边（cutoff=0.2）不动，位移 cap 1.5 px，越界回滚；先外扩 0.3 px（momia v1 contour_optimization 语义）。
+   - intensity 步：阈值暗细胞体生成 refined ring，仅把比局部圆窗中位数更深（>0.2 px）的凹点向内移动，cap 3 px。
+   - 每轮轻样条平滑；0 关闭，可多轮。
+3. 兼容保留：snake/active_contour（opt-in）、mask-target constriction_iters（deprecated）。
+4. 曲率：窗口化 bend angle + 椭圆傅里叶描述子 EFD（Kuhl-Giardina 归一化）。
+5. 全部输出写入 schema 几何列与 curv_* 标量列。
 
 ### 5.2 midline（性能与精度双升级）
-- **性能**：所有"轮廓↔中线最近点/垂直求交"改用 `scipy.spatial.cKDTree`（O(n log m)，替代 momia2 四处重复的 O(n×m) 矩阵）；骨架邻域分类用 `convolve2d` 一次卷积完成（替代逐像素 numba 调用）。
-- **精度**：骨架（zhang/lee 可选）→ 图剪枝（短分支 < min_branch_length 去除）→ 迭代垂直求精（保留 momia2 核心思想，向量化）→ 极点沿端点切线延伸至轮廓（pole extension，MicrobeJ/Oufti 标配）→ 中线弧长参数化重采样（等距 n 点，供宽度/荧光 profile 对齐）。
-- **宽度**：沿重采样中线取法向，与轮廓求交得 width_profile（µm）；输出 5 数概括 + 全 profile。
-- 分枝细胞：多分支中线保留（list of branches），主分支 = 最长测地路径。
+- **路由**：midline_method 选择 spline（默认，pole-first 低自由度样条）/ energy（实验）/ equidistant（优化路线）。
+- **equidistant 路线**：
+  1. 简单形状门控：solidity ≥ 0.88 且 ellipse_dev ≤ 0.12 且 sagitta_ratio ≤ 0.08（或 AR < 1.25）→ degenerate：直主轴 + 1 轮横截面弦中点精修（末端 2 点只作样条约束），输出 32 点。
+  2. 其余：SDF skeleton（outline 以自适应 4× 栅格化；PIL 快速多边形填充）或长细胞（bbox > 400 px）改 mask skeleton；极点对、主干、分支阈值（max(px, μm/pixel_microns)）。
+  3. 自适应采样：axis/n_points 按 2 px 间距（上限 2048）；主干样条平滑 + Taubin；长细胞贴边点投影回主干；分支坐标作为 midline[1:]，分支末端平滑到顶点。
+  4. guard：候选偏离弦/过弯时拒绝并保留失败候选（不静默回退 spline），质量写 midline_quality。
+- **性能**：轮廓↔中线最近点/垂直求交全部 cKDTree；骨架邻域一次卷积；SDF 栅格化用 PIL（比 skimage.draw.polygon 快 50–100×）；Taubin 用 convolve1d。
+- **宽度/极点/分支**：沿重采样中线法向与轮廓求交得 width_profile（µm）；极点延伸至轮廓；多分支中线保留，主分支 = 最长测干。
+- **实测**（18 个全幅场，SDF-all + 4a88696 门控，ms/cell）：SP_003 2.69、murA 1.72、5I 1.78、PAO1 1.64、A22 2.05、PSVB 2.65、bthai 1.98、francisella 2.00、Serratia 2.89、vibrio 2.31、wiggins 2.33、dnaA 5.04、caulo 9.93、Hpylori 13.56、cex 10.73、ftsN 10.02、Az_branch 10.75、streptomyces 36.37。
 
 ### 5.3 验证标准（可用性测试的一部分）
 - 合成直杆菌：中线长度误差 < 2%，宽度中位误差 < 1 px；
 - 合成弯杆/分枝：中线位于掩码内比例 ≥ 99%，极点定位误差 < 2 px；
 - 与 momia2 输出对照回归（同一批真实数据，长度/宽度相关系数 > 0.99）。
+
+---
+
+### 5.4 参考文献
+[1] Ducret, A., Quardokus, E. M. & Brun, Y. V. MicrobeJ, a tool to automate high-content screening for bacterial cell biology. Nat. Microbiol. 1, 16209 (2016).
+[2] Zhu, J. MOMIA: Mycobacteria-Optimized Microscopy Image Analysis (PyPI, 2021); https://pypi.org/project/momia.
+[3] Zhu, J. momia2: Mycobacteria-optimized microscopy image analysis version 2 (PyPI, 2023); https://pypi.org/project/momia2.
+[4] Taubin, G. Curve and surface smoothing without shrinkage. In Proc. Fifth Int. Conf. Comput. Vis. 852–857 (IEEE, 1995).
 
 ---
 

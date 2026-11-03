@@ -441,8 +441,12 @@ def run_cells(
 
 
 class OutlineParams(BaseModel):
-    """Sub-pixel outline extraction parameters (``outline.extract`` step and
-    the raw ``outline.extract_outlines`` op)."""
+    """Sub-pixel outline extraction parameters (outline.extract step and the
+    raw outline.extract_outlines op).
+
+    Defaults mirror momia3.ops.outline._DEFAULT_PARAMS: pixel-equidistant
+    sampling plus one round of edge+intensity subpixel refinement.
+    """
 
     sigma: float = Field(1.0, ge=0, description="Mask Gaussian smoothing sigma (px)")
     level: float = Field(0.5, gt=0, lt=1, description="Marching-squares level")
@@ -450,7 +454,16 @@ class OutlineParams(BaseModel):
     tolerance: float = Field(0.75, ge=0, description="RDP tolerance (px)")
     smooth: float = Field(1.0, ge=0, description="Closed B-spline smoothing factor")
     n_points: int | None = Field(
-        100, ge=4, description="Uniform resample count; None keeps the natural count"
+        None,
+        ge=4,
+        description="Uniform resample count; None = perimeter / downsample_factor "
+        "(pixel-equidistant, the optimized default)",
+    )
+    downsample_factor: float = Field(
+        2.0, gt=0, description="Target pixel spacing of the resampled outline (px/point)"
+    )
+    smooth_scale: float = Field(
+        0.03, ge=0, description="B-spline stiffness as a fraction of the point count"
     )
     active_contour: bool = Field(
         False, description="Refine with an intensity-edge snake (needs channel)"
@@ -459,16 +472,63 @@ class OutlineParams(BaseModel):
     beta: float = Field(10.0, ge=0, description="Snake smoothness energy weight")
     gamma: float = Field(0.001, gt=0, description="Snake explicit time step")
     pad: int = Field(2, ge=0, description="Bounding-box padding (px)")
+    constriction_iters: int = Field(
+        0, ge=0, description="Deprecated mask-target constriction rounds (0 = off)"
+    )
+    constriction_strength: float = Field(0.6, ge=0, le=1)
+    constriction_smooth_scale: float = Field(0.01, ge=0)
+    constriction_image_iters: int = Field(
+        0, ge=0, description="Intensity-guided constriction rounds (0 = off)"
+    )
+    constriction_image_max_shift: float = Field(3.0, gt=0, description="Inward cap (px/round)")
+    constriction_image_strength: float = Field(0.8, ge=0, le=1)
+    constriction_image_threshold_frac: float = Field(0.55, gt=0, lt=1)
+    refine_outline_iters: int = Field(
+        1, ge=0, description="Combined edge+intensity refinement rounds (0 = off)"
+    )
+    refine_outline_mode: Literal["edge", "intensity", "edge+intensity"] = Field(
+        "edge+intensity", description="Which refinement kernels each round applies"
+    )
+    refine_edge_step: float = Field(0.5, gt=0, description="Normal sampling step (px)")
+    refine_edge_cutoff: float = Field(0.2, ge=0, description="Weak-edge cutoff")
+    refine_edge_max_shift: float = Field(1.5, gt=0, description="Move cap (px/round)")
+    refine_edge_max_round_shift: float = Field(
+        1.5, gt=0, description="Revert points moving farther than this per round (px)"
+    )
+    refine_edge_pre_expand: float = Field(
+        0.3, ge=0, description="Outward pre-expansion before the first round (px)"
+    )
+    advanced_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Escape hatch: raw momia3.ops.outline parameter overrides "
+        "(keys not listed above, e.g. future tuning knobs)",
+    )
 
 
 class OutlineRunParams(OutlineParams):
-    """``outline.extract`` step parameters (adds the intensity channel)."""
+    """outline.extract step parameters (adds the intensity channel)."""
 
     channel: str | None = Field(
         None,
-        description="Intensity channel for active-contour refinement; "
+        description="Intensity channel for edge/intensity refinement; "
         "None uses the first store channel",
     )
+
+
+def _merged_params(params: BaseModel, exclude: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Validated params dict for an ops function, with advanced_params merged.
+
+    Keys in exclude are dropped (e.g. the store channel or pixel_microns,
+    which are passed separately); advanced_params entries override the typed
+    fields, giving access to the full ops tuning surface without duplicating
+    every knob in the pydantic schema.
+    """
+    data = params.model_dump(mode="json")
+    advanced = dict(data.pop("advanced_params", {}) or {})
+    for key in exclude:
+        data.pop(key, None)
+    data.update(advanced)
+    return data
 
 
 def _outline_frame_shard(
@@ -503,9 +563,7 @@ def run_outline_extract(
     """Runner of ``outline.extract`` (see registry description)."""
     store_path = Path(inputs["experiment"])
     store = ExperimentStore.open(store_path, mode="r")
-    params_dict = {
-        k: v for k, v in params.model_dump(mode="json").items() if k != "channel"
-    }
+    params_dict = _merged_params(params, exclude=("channel",))
     items = [
         (str(store_path), fov_id, t, params.channel, params_dict)
         for fov_id in store.fov_ids
@@ -526,8 +584,15 @@ def run_outline_extract(
 
 
 class MidlineParams(BaseModel):
-    """Midline extraction parameters (``midline.extract`` step and the raw
-    ``midline.extract_midlines`` op)."""
+    """Midline extraction parameters (midline.extract step and the raw
+    midline.extract_midlines op).
+
+    The optimized route is midline_method="equidistant" (outline-SDF or
+    mask-skeleton contour-cut midline with guard + degenerate gate); the
+    default stays "spline" for backwards compatibility. Every key of
+    momia3.ops.midline._DEFAULT_PARAMS can be overridden through
+    advanced_params.
+    """
 
     method: Literal["zhang", "lee"] = Field("zhang", description="Skeletonization")
     min_branch_length_um: float = Field(
@@ -536,22 +601,81 @@ class MidlineParams(BaseModel):
     n_points: int = Field(32, ge=2, description="Resampled main-branch size")
     smooth: float = Field(1.0, ge=0, description="Open B-spline smoothing factor")
     refine_iterations: int = Field(
-        10, ge=0, description="Perpendicular refinement iterations"
+        10, ge=0, description="Legacy perpendicular refinement iterations (unused)"
     )
     refine_tolerance: float = Field(
-        0.1, gt=0, description="Refinement convergence tolerance (px)"
+        0.1, gt=0, description="Legacy refinement convergence tolerance (px, unused)"
     )
     refine_anchor: int = Field(
-        3, ge=0, description="End samples kept fixed during refinement"
+        3, ge=0, description="Legacy end samples kept fixed (unused)"
     )
     refine_max_step: float = Field(
-        1.5, gt=0, description="Per-iteration move cap (px)"
+        1.5, gt=0, description="Legacy per-iteration move cap (px, unused)"
     )
     pole_fit_points: int = Field(5, ge=2, description="End-tangent fit window")
     knn: int = Field(24, ge=1, description="Outline segment candidates per query")
     pad: int = Field(2, ge=0, description="Bounding-box padding (px)")
     pixel_microns: float | None = Field(
         None, gt=0, description="Physical pixel size; None reads the store attrs"
+    )
+    midline_method: Literal["spline", "energy", "equidistant"] = Field(
+        "spline",
+        description="Algorithm route: legacy spline, experimental energy, or the "
+        "optimized equidistant contour-cut method",
+    )
+    n_points_auto: bool = Field(
+        False, description="Spline route: n = arc_length / n_points_target_spacing_px"
+    )
+    n_points_target_spacing_px: float = Field(2.0, gt=0)
+    pole_endpoint: Literal["extended", "initial"] = Field(
+        "extended", description="Pole handling: legacy extended or outline pole pair"
+    )
+    degenerate_ar: float = Field(1.4, gt=0, description="Aspect-ratio gate for near-round cells")
+    degenerate_refine: bool = Field(
+        True, description="One chord-midpoint equidistant pass on the degenerate axis"
+    )
+    degenerate_refine_iters: int = Field(1, ge=0)
+    degenerate_refine_points: int = Field(12, ge=6)
+    degenerate_refine_anchor: int = Field(2, ge=0)
+    degenerate_refine_damp: float = Field(0.6, ge=0, le=1)
+    degenerate_refine_smooth: float = Field(0.03, ge=0)
+    degenerate_solidity_min: float = Field(0.85, gt=0, le=1)
+    degenerate_simple_solidity: float = Field(0.88, gt=0, le=1)
+    degenerate_simple_ellipse_dev: float = Field(0.12, ge=0)
+    degenerate_simple_sagitta: float = Field(0.08, ge=0)
+    equidistant_guard: bool = Field(
+        True, description="Guarded equidistant: reject candidates that leave the chord/outline"
+    )
+    equidistant_skeleton_from_outline: bool = Field(
+        True, description="Build the SDF skeleton from the smooth outline geometry"
+    )
+    equidistant_sdf_max_dim: int = Field(
+        400, ge=8, description="Use the mask-skeleton route above this bbox size (px)"
+    )
+    equidistant_sdf_max_pixels: float = Field(
+        4_000_000.0, gt=0, description="Supersampled SDF grid budget"
+    )
+    equidistant_n_points_auto: bool = Field(
+        True, description="n = arc_length / equidistant_n_points_spacing_px"
+    )
+    equidistant_n_points_spacing_px: float = Field(2.0, gt=0)
+    equidistant_inside_clamp: bool = Field(
+        True, description="Clamp interior samples inside the mask on long bends"
+    )
+    equidistant_branch_min_px: float = Field(3.0, ge=0)
+    equidistant_branch_min_um: float = Field(0.2, ge=0)
+    equidistant_fill_holes: bool = Field(True)
+    equidistant_opening_radius: float = Field(1.0, ge=0)
+    equidistant_outline_from_clean_mask: bool = Field(True)
+    equidistant_main_smooth_factor: float = Field(0.02, ge=0)
+    equidistant_main_smooth_max: float = Field(60.0, ge=0)
+    equidistant_guard_chord_solidity: float = Field(0.85, gt=0, le=1)
+    equidistant_guard_chord_dev_frac: float = Field(0.30, gt=0)
+    equidistant_guard_chord_dev_px: float = Field(1.5, gt=0)
+    advanced_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Escape hatch: raw momia3.ops.midline parameter overrides for "
+        "keys not listed above (e.g. equidistant axis sampling, Taubin smoothing)",
     )
 
 
@@ -589,11 +713,7 @@ def run_midline_extract(
     store_path = Path(inputs["experiment"])
     store = ExperimentStore.open(store_path, mode="r")
     pixel_microns = params.pixel_microns or store.pixel_microns
-    params_dict = {
-        k: v
-        for k, v in params.model_dump(mode="json").items()
-        if k != "pixel_microns"
-    }
+    params_dict = _merged_params(params, exclude=("pixel_microns",))
     cells = inputs["cells"]
     if not isinstance(cells, pa.Table):
         cells = cells.to_arrow()
@@ -1107,7 +1227,7 @@ def _raw_add_features(inputs: dict[str, Any], params: EmptyParams, ctx: StepCont
 def _raw_extract_outlines(inputs: dict[str, Any], params: OutlineParams, ctx: StepContext) -> dict[str, Any]:
     del ctx
     outlines = outline_ops.extract_outlines(
-        inputs["labels"], inputs.get("intensity"), params.model_dump(mode="json")
+        inputs["labels"], inputs.get("intensity"), _merged_params(params)
     )
     return {"outlines": _outlines_to_json(outlines)}
 
@@ -1181,9 +1301,7 @@ def _raw_fill_cells_geometry(inputs: dict[str, Any], params: EmptyParams, ctx: S
 def _raw_extract_midlines(inputs: dict[str, Any], params: MidlineParams, ctx: StepContext) -> dict[str, Any]:
     del ctx
     outlines = _outlines_from_json(inputs["outlines"]) if inputs.get("outlines") else None
-    params_dict = {
-        k: v for k, v in params.model_dump(mode="json").items() if k != "pixel_microns"
-    }
+    params_dict = _merged_params(params, exclude=("pixel_microns",))
     pixel_microns = params.pixel_microns if params.pixel_microns is not None else 0.065
     results = midline_ops.extract_midlines(
         inputs["labels"], outlines, params_dict, pixel_microns=pixel_microns

@@ -72,14 +72,14 @@ PIPELINE: dict = {
         {
             "id": "outlines",
             "op": "outline.extract",
-            "params": {"n_points": 100, "sigma": 1.0},
+            "params": {"sigma": 1.0, "refine_outline_iters": 1, "refine_outline_mode": "edge+intensity"},
             "inputs": {"experiment": "segment.experiment", "cells": "cells.cells"},
             "outputs": {"cells": "tables/cells_outlines.parquet"},
         },
         {
             "id": "midlines",
             "op": "midline.extract",
-            "params": {"n_points": 32, "method": "zhang"},
+            "params": {"midline_method": "equidistant", "equidistant_guard": True},
             "inputs": {"experiment": "segment.experiment", "cells": "outlines.cells"},
             "outputs": {"cells": "tables/cells.parquet"},
         },
