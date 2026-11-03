@@ -73,6 +73,7 @@ from skimage.graph import route_through_array
 
 from momia3 import keys as _keys
 from momia3 import schema as _schema
+from momia3.ops.outline import chord_sagitta_ratio, ellipse_deviation
 from momia3.ops.polygon import inside_polygon
 
 logger = logging.getLogger(__name__)
@@ -1347,95 +1348,6 @@ def _mask_solidity(crop: np.ndarray) -> float:
     return 1.0
 
 
-def _ellipse_deviation(
-    crop: np.ndarray,
-    outline_local: np.ndarray,
-    centroid_xy: np.ndarray,
-    axis_xy: np.ndarray,
-    aspect_ratio: float,
-) -> float:
-    """Mean relative deviation of the outline from a best-fit ellipse.
-
-    Simple (cocci / oval / straight-rod) masks are close to an ellipse;
-    curved, lobed or branched shapes deviate strongly. Cheap enough to run
-    before deciding whether the SDF skeleton is needed at all.
-    """
-    area = float(np.count_nonzero(crop))
-    if area < 8 or aspect_ratio <= 0:
-        return 1.0
-    a = float(np.sqrt(area * aspect_ratio / np.pi))
-    b = max(a / float(aspect_ratio), 1e-6)
-    rel = np.asarray(outline_local, dtype=np.float64) - np.asarray(centroid_xy, dtype=np.float64)[None, :]
-    axis = np.asarray(axis_xy, dtype=np.float64)
-    axis = axis / max(float(np.hypot(axis[0], axis[1])), 1e-12)
-    perp = np.array([-axis[1], axis[0]])
-    u = (rel @ axis) / max(a, 1e-6)
-    v = (rel @ perp) / max(b, 1e-6)
-    return float(np.mean(np.abs(np.hypot(u, v) - 1.0)))
-
-
-def _chord_sagitta_ratio(
-    outline_local: np.ndarray,
-    centroid_xy: np.ndarray,
-    axis_xy: np.ndarray,
-    n_samples: int = 9,
-) -> float:
-    """Max deviation of perpendicular-chord midpoints from the major axis.
-
-    A straight rod gives a small value even when its outline is slightly
-    asymmetric; a bent (banana) cell bows the chord midpoints away from the
-    axis. Normalized by the median chord width, so it is scale-free and needs
-    no skeleton/distance transform.
-    """
-    ring = np.asarray(outline_local, dtype=np.float64)
-    c = np.asarray(centroid_xy, dtype=np.float64)
-    if len(ring) < 8:
-        return 1.0
-    axis = np.asarray(axis_xy, dtype=np.float64)
-    nrm = float(np.hypot(axis[0], axis[1]))
-    if nrm <= 1e-12:
-        return 1.0
-    axis = axis / nrm
-    perp = np.array([-axis[1], axis[0]])
-    t = (ring - c[None, :]) @ axis
-    tmin, tmax = np.percentile(t, [2.0, 98.0])
-    if tmax - tmin < 2.0:
-        return 1.0
-    ts = np.linspace(tmin + 0.15 * (tmax - tmin), tmax - 0.15 * (tmax - tmin), n_samples)
-    a = ring
-    b = np.roll(ring, -1, axis=0)
-    e = b - a
-    p0 = c[None, :] + ts[:, None] * axis[None, :]          # (K, 2)
-    hits_fwd = np.full((len(ts), 2), np.nan)
-    hits_bwd = np.full((len(ts), 2), np.nan)
-    for slot, dvec in ((0, perp), (1, -perp)):
-        den = dvec[0] * (-e[:, 1]) - (-e[:, 0]) * dvec[1]    # (E,)
-        ok = np.abs(den) > 1e-12
-        rhs = a[None, :, :] - p0[:, None, :]                # (K, E, 2)
-        tpar = (rhs[..., 0] * (-e[None, :, 1]) - (-e[None, :, 0]) * rhs[..., 1]) / np.where(ok, den, 1.0)[None, :]
-        uu = (dvec[0] * rhs[..., 1] - dvec[1] * rhs[..., 0]) / np.where(ok, den, 1.0)[None, :]
-        valid = ok[None, :] & (uu >= -0.05) & (uu <= 1.05) & (tpar > 1e-6)
-        tpar = np.where(valid, tpar, np.inf)
-        sel = np.argmin(tpar, axis=1)
-        tval = tpar[np.arange(len(ts)), sel]
-        hit = p0 + tval[:, None] * np.asarray(dvec, dtype=np.float64)[None, :]
-        hit[~np.isfinite(tval)] = np.nan
-        if slot == 0:
-            hits_fwd = hit
-        else:
-            hits_bwd = hit
-    good = np.isfinite(hits_fwd[:, 0]) & np.isfinite(hits_bwd[:, 0])
-    if int(np.count_nonzero(good)) < 3:
-        return 1.0
-    mid = 0.5 * (hits_fwd[good] + hits_bwd[good])
-    devs = np.abs((mid - p0[good]) @ perp)
-    widths = np.linalg.norm(hits_fwd[good] - hits_bwd[good], axis=1)
-    width = float(np.median(widths))
-    if width <= 1e-6:
-        return 1.0
-    return float(np.max(devs)) / width
-
-
 def _chord_midpoints_vec(
     points: np.ndarray,
     ring: np.ndarray,
@@ -2675,14 +2587,18 @@ def _midline_single(
         centroid_xy, axis_xy, aspect_ratio = _mask_major_axis(crop)
         outline_local = np.asarray(outline, dtype=np.float64) - offset_xy
         solidity = _mask_solidity(crop)
-        ellipse_dev = _ellipse_deviation(
-            crop, outline_local, centroid_xy, axis_xy, aspect_ratio
+        ellipse_dev = ellipse_deviation(
+            outline_local,
+            centroid=centroid_xy,
+            axis=axis_xy,
+            aspect_ratio=aspect_ratio,
+            area=float(np.count_nonzero(crop)),
         )
 
         # Curvature-aware simple-shape gate (as of 4a88696): convex masks with
         # low ellipse residual and low chord-midpoint sagitta take the cheap
         # degenerate spine; everything else pays for the skeleton.
-        sagitta_ratio = _chord_sagitta_ratio(outline_local, centroid_xy, axis_xy)
+        sagitta_ratio = chord_sagitta_ratio(outline_local, centroid=centroid_xy, axis=axis_xy)
         simple_shape = (
             solidity >= float(params.get("degenerate_simple_solidity", 0.88))
             and ellipse_dev <= float(params.get("degenerate_simple_ellipse_dev", 0.12))

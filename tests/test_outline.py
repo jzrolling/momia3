@@ -16,10 +16,14 @@ from momia3 import schema
 from momia3.keys import encode_key
 from momia3.ops.outline import (
     CURVATURE_COLUMNS,
+    SHAPE_COLUMNS,
+    chord_sagitta_ratio,
     curvature_features,
+    ellipse_deviation,
     elliptic_fourier,
     extract_outlines,
     fill_cells_geometry,
+    shape_descriptors,
 )
 
 from synth import generate_timelapse
@@ -293,3 +297,45 @@ def test_synth_frame_outlines():
     for ring in outlines.values():
         stats = curvature_features(ring)
         assert all(np.isfinite(v) for v in stats.values())
+
+def _bent_ring(radius: float = 80.0, span: float = 1.4, width: float = 12.0, n: int = 80) -> np.ndarray:
+    """Analytic banana-shaped closed outline (arc centerline + normal offset)."""
+    t = np.linspace(-span / 2, span / 2, n)
+    cx = radius * np.sin(t)
+    cy = radius * (1.0 - np.cos(t))
+    nx, ny = -np.sin(t), np.cos(t)
+    left = np.column_stack([cx + nx * width / 2, cy + ny * width / 2])
+    right = np.column_stack([cx - nx * width / 2, cy - ny * width / 2])
+    return np.vstack([left, right[::-1]])
+
+
+def test_shape_descriptors_straight_vs_bent():
+    """Straight rods have low sagitta; bent cells raise both descriptors."""
+    labels = np.zeros((160, 200), dtype=np.uint32)
+    labels[capsule_mask((160, 200), 80, 60, 0.0, 90, 12)] = 1
+    straight = extract_outlines(labels)[1]
+    d_straight = shape_descriptors(straight)
+    d_bent = shape_descriptors(_bent_ring())
+    assert set(d_straight) == set(SHAPE_COLUMNS)
+    assert d_straight["sagitta_ratio"] < 0.05
+    assert d_bent["sagitta_ratio"] > 0.30
+    assert d_bent["ellipse_dev"] > d_straight["ellipse_dev"]
+    assert chord_sagitta_ratio(straight) == pytest.approx(d_straight["sagitta_ratio"])
+    assert ellipse_deviation(straight) == pytest.approx(d_straight["ellipse_dev"])
+
+
+def test_fill_cells_geometry_writes_shape_columns():
+    """ellipse_dev / sagitta_ratio become finite cells-table feature columns."""
+    labels = _two_cell_image()
+    outlines = extract_outlines(labels)
+    table = fill_cells_geometry(_base_cells_table(labels), outlines)
+    validated = schema.validate_cells(table)
+    for column in SHAPE_COLUMNS:
+        assert column in validated.column_names
+        values = validated.column(column).to_pylist()
+        assert all(v is not None and np.isfinite(v) for v in values)
+    # A straight capsule should have a much smaller sagitta than its ellipse residual.
+    sag = validated.column("sagitta_ratio").to_pylist()[0]
+    ell = validated.column("ellipse_dev").to_pylist()[0]
+    assert 0.0 <= sag < 0.1
+    assert 0.0 < ell < 1.0

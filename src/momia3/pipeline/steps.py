@@ -1260,6 +1260,51 @@ class EfdParams(BaseModel):
 
 
 @register(
+    "outline.ellipse_deviation",
+    params_model=EmptyParams,
+    inputs={"outline": "json"},
+    outputs={"value": "json"},
+    shard=None,
+    description="Mean relative deviation of one outline from its best-fit ellipse.",
+    func=outline_ops.ellipse_deviation,
+)
+def _raw_ellipse_deviation(inputs: dict[str, Any], params: EmptyParams, ctx: StepContext) -> dict[str, Any]:
+    del params, ctx
+    ring = np.column_stack([inputs["outline"]["x"], inputs["outline"]["y"]])
+    return {"value": float(outline_ops.ellipse_deviation(ring))}
+
+
+@register(
+    "outline.chord_sagitta_ratio",
+    params_model=EmptyParams,
+    inputs={"outline": "json"},
+    outputs={"value": "json"},
+    shard=None,
+    description="Max chord-midpoint sagitta of one outline, normalized by width.",
+    func=outline_ops.chord_sagitta_ratio,
+)
+def _raw_chord_sagitta_ratio(inputs: dict[str, Any], params: EmptyParams, ctx: StepContext) -> dict[str, Any]:
+    del params, ctx
+    ring = np.column_stack([inputs["outline"]["x"], inputs["outline"]["y"]])
+    return {"value": float(outline_ops.chord_sagitta_ratio(ring))}
+
+
+@register(
+    "outline.shape_descriptors",
+    params_model=EmptyParams,
+    inputs={"outline": "json"},
+    outputs={"shape": "json"},
+    shard=None,
+    description="Simple-shape descriptors (ellipse_dev, sagitta_ratio) of one outline.",
+    func=outline_ops.shape_descriptors,
+)
+def _raw_shape_descriptors(inputs: dict[str, Any], params: EmptyParams, ctx: StepContext) -> dict[str, Any]:
+    del params, ctx
+    ring = np.column_stack([inputs["outline"]["x"], inputs["outline"]["y"]])
+    return {"shape": outline_ops.shape_descriptors(ring)}
+
+
+@register(
     "outline.elliptic_fourier",
     params_model=EfdParams,
     inputs={"outline": "json"},

@@ -207,7 +207,7 @@ class Ops:                               # 需 GPU 的算子统一入口
    - 每轮轻样条平滑；0 关闭，可多轮。
 3. 兼容保留：snake/active_contour（opt-in）、mask-target constriction_iters（deprecated）。
 4. 曲率：窗口化 bend angle + 椭圆傅里叶描述子 EFD（Kuhl-Giardina 归一化）。
-5. 全部输出写入 schema 几何列与 curv_* 标量列。
+5. 全部输出写入 schema 几何列与 curv_*、ellipse_dev、sagitta_ratio 标量列；后两者即 degenerate/equidistant 路由门控所用的形状特征（fill_cells_geometry 统一计算）。
 
 ### 5.2 midline（性能与精度双升级）
 - **路由**：midline_method 选择 spline（默认，pole-first 低自由度样条）/ energy（实验）/ equidistant（优化路线）。

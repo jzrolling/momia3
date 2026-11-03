@@ -20,7 +20,7 @@ omni_lite 只放分割与评测脚本；outline/midline 的实现与默认参数
    - edge 步：Sobel 法向 ±0.5 px 三点采样，抛物线 subpixel；cutoff=0.2，单轮位移上限 1.5 px，超限回滚；先外扩 0.3 px。
    - intensity 步：阈值暗细胞体生成 refined ring，只把比局部圆窗中位数更深（>0.2 px）的凹点向内移动，上限 3 px。
    - 每轮轻样条平滑，可多轮。
-5. 曲率（窗口 bend angle）与 EFD 描述子一并输出。
+5. 曲率（窗口 bend angle）、EFD 描述子，以及简单形状特征 ellipse_dev 与 sagitta_ratio 一并输出；后两者复用 degenerate/equidistant 路由门控的同一公式，作为单细胞 feature 写入 cells 表（由 fill_cells_geometry 计算，schema 标量列 ellipse_dev、sagitta_ratio）。
 
 关键参数（pipeline OutlineParams，默认值与 ops 一致）：
 

@@ -52,6 +52,9 @@ __all__ = [
     "extract_outlines",
     "curvature_features",
     "elliptic_fourier",
+    "ellipse_deviation",
+    "chord_sagitta_ratio",
+    "shape_descriptors",
     "fill_cells_geometry",
 ]
 
@@ -63,6 +66,9 @@ CURVATURE_COLUMNS: tuple[str, ...] = (
     "curv_q3",
 )
 """Scalar curvature columns written by :func:`fill_cells_geometry`."""
+
+SHAPE_COLUMNS: tuple[str, ...] = ("ellipse_dev", "sagitta_ratio")
+"""Simple-shape descriptor columns written by fill_cells_geometry."""
 
 _DEFAULT_PARAMS: dict[str, Any] = {
     "sigma": 1.0,
@@ -680,6 +686,177 @@ def curvature_features(outline: np.ndarray, window: int = 3) -> dict[str, float]
 # ---------------------------------------------------------------------------
 
 
+def _outline_principals(
+    ring: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Centroid, unit major axis, aspect ratio and polygon area of an outline.
+
+    The major axis and aspect ratio come from the covariance of the outline
+    vertices (equivalent to the second-moment ratio for a closed curve); the
+    centroid/area use the shoelace formula. Used only to fill optional
+    arguments when the caller does not pass mask-derived values.
+    """
+    r = np.asarray(ring, dtype=np.float64)
+    x, y = r[:, 0], r[:, 1]
+    cross = x * np.roll(y, -1) - np.roll(x, -1) * y
+    signed = float(cross.sum())
+    area = abs(signed) / 2.0
+    if area > 1e-9:
+        cx = float(((x + np.roll(x, -1)) * cross).sum() / (3.0 * signed))
+        cy = float(((y + np.roll(y, -1)) * cross).sum() / (3.0 * signed))
+    else:
+        cx, cy = float(x.mean()), float(y.mean())
+    d = r - np.array([cx, cy], dtype=np.float64)[None, :]
+    cov = (d.T @ d) / max(len(r), 1)
+    evals, evecs = np.linalg.eigh(cov)
+    order = np.argsort(evals)[::-1]
+    l1 = max(float(evals[order[0]]), 1e-12)
+    l2 = max(float(evals[order[1]]), 1e-12)
+    axis = np.asarray(evecs[:, order[0]], dtype=np.float64)
+    nrm = float(np.hypot(axis[0], axis[1]))
+    axis = np.array([1.0, 0.0]) if nrm <= 1e-12 else axis / nrm
+    return np.array([cx, cy], dtype=np.float64), axis, float(np.sqrt(l1 / l2)), area
+
+
+def ellipse_deviation(
+    outline: np.ndarray,
+    *,
+    centroid: np.ndarray | None = None,
+    axis: np.ndarray | None = None,
+    aspect_ratio: float | None = None,
+    area: float | None = None,
+) -> float:
+    """Mean relative deviation of an outline from its best-fit ellipse.
+
+    Simple cocci/oval/straight-rod masks are close to an ellipse (small
+    value); curved, lobed or branched shapes deviate strongly. This is the
+    cheap pre-gate used by the midline router; the same descriptor is written
+    as a per-cell feature (ellipse_dev) by fill_cells_geometry.
+
+    Parameters
+    ----------
+    outline : (N, 2) numpy.ndarray
+        Closed (x, y) outline in local crop coordinates.
+    centroid, axis, aspect_ratio, area : optional
+        Mask-derived context. When omitted they are estimated from the
+        outline (polygon area/centroid, second-moment major axis).
+    """
+    ring = np.asarray(outline, dtype=np.float64)
+    if len(ring) < 8:
+        return 1.0
+    c0, ax0, ar0, area0 = _outline_principals(ring)
+    c = c0 if centroid is None else np.asarray(centroid, dtype=np.float64)
+    ax = ax0 if axis is None else np.asarray(axis, dtype=np.float64)
+    ar = ar0 if aspect_ratio is None else float(aspect_ratio)
+    a_area = area0 if area is None else float(area)
+    if a_area < 8 or ar <= 0:
+        return 1.0
+    a = float(np.sqrt(a_area * ar / np.pi))
+    b = max(a / ar, 1e-6)
+    rel = ring - c[None, :]
+    nrm = float(np.hypot(ax[0], ax[1]))
+    if nrm <= 1e-12:
+        return 1.0
+    ax = ax / nrm
+    perp = np.array([-ax[1], ax[0]], dtype=np.float64)
+    u = (rel @ ax) / max(a, 1e-6)
+    v = (rel @ perp) / max(b, 1e-6)
+    return float(np.mean(np.abs(np.hypot(u, v) - 1.0)))
+
+
+def chord_sagitta_ratio(
+    outline: np.ndarray,
+    *,
+    centroid: np.ndarray | None = None,
+    axis: np.ndarray | None = None,
+    n_samples: int = 9,
+) -> float:
+    """Max chord-midpoint sagitta away from the major axis, normalized by width.
+
+    A straight rod gives a small value even when its outline is slightly
+    asymmetric; a bent (banana) cell bows the perpendicular chord midpoints
+    away from the axis. Scale-free; no skeleton/distance transform needed.
+    """
+    ring = np.asarray(outline, dtype=np.float64)
+    if len(ring) < 8:
+        return 1.0
+    c0, ax0, _, _ = _outline_principals(ring)
+    c = c0 if centroid is None else np.asarray(centroid, dtype=np.float64)
+    axis_v = ax0 if axis is None else np.asarray(axis, dtype=np.float64)
+    nrm = float(np.hypot(axis_v[0], axis_v[1]))
+    if nrm <= 1e-12:
+        return 1.0
+    axis_v = axis_v / nrm
+    perp = np.array([-axis_v[1], axis_v[0]], dtype=np.float64)
+    t = (ring - c[None, :]) @ axis_v
+    tmin, tmax = np.percentile(t, [2.0, 98.0])
+    if tmax - tmin < 2.0:
+        return 1.0
+    ts = np.linspace(tmin + 0.15 * (tmax - tmin), tmax - 0.15 * (tmax - tmin), n_samples)
+    a_pt = ring
+    b_pt = np.roll(ring, -1, axis=0)
+    e = b_pt - a_pt
+    p0 = c[None, :] + ts[:, None] * axis_v[None, :]
+    hits_fwd = np.full((len(ts), 2), np.nan)
+    hits_bwd = np.full((len(ts), 2), np.nan)
+    for slot, dvec in ((0, perp), (1, -perp)):
+        den = dvec[0] * (-e[:, 1]) - (-e[:, 0]) * dvec[1]
+        ok = np.abs(den) > 1e-12
+        rhs = a_pt[None, :, :] - p0[:, None, :]
+        tpar = (rhs[..., 0] * (-e[None, :, 1]) - (-e[None, :, 0]) * rhs[..., 1]) / np.where(ok, den, 1.0)[None, :]
+        uu = (dvec[0] * rhs[..., 1] - dvec[1] * rhs[..., 0]) / np.where(ok, den, 1.0)[None, :]
+        valid = ok[None, :] & (uu >= -0.05) & (uu <= 1.05) & (tpar > 1e-6)
+        tpar = np.where(valid, tpar, np.inf)
+        sel = np.argmin(tpar, axis=1)
+        tval = tpar[np.arange(len(ts)), sel]
+        hit = p0 + tval[:, None] * np.asarray(dvec, dtype=np.float64)[None, :]
+        hit[~np.isfinite(tval)] = np.nan
+        if slot == 0:
+            hits_fwd = hit
+        else:
+            hits_bwd = hit
+    good = np.isfinite(hits_fwd[:, 0]) & np.isfinite(hits_bwd[:, 0])
+    if int(np.count_nonzero(good)) < 3:
+        return 1.0
+    mid = 0.5 * (hits_fwd[good] + hits_bwd[good])
+    devs = np.abs((mid - p0[good]) @ perp)
+    widths = np.linalg.norm(hits_fwd[good] - hits_bwd[good], axis=1)
+    width = float(np.median(widths))
+    if width <= 1e-6:
+        return 1.0
+    return float(np.max(devs)) / width
+
+
+def shape_descriptors(
+    outline: np.ndarray,
+    *,
+    centroid: np.ndarray | None = None,
+    axis: np.ndarray | None = None,
+    aspect_ratio: float | None = None,
+    area: float | None = None,
+) -> dict[str, float]:
+    """Simple-shape descriptors of one outline (cells-table features).
+
+    Returns ellipse_dev and sagitta_ratio, the two curvature-aware gate
+    metrics of the degenerate/equidistant midline router, so downstream
+    analyses can use the same quantities as single-cell features.
+    """
+    ring = np.asarray(outline, dtype=np.float64)
+    c0, ax0, ar0, area0 = _outline_principals(ring)
+    kwargs = {
+        "centroid": c0 if centroid is None else np.asarray(centroid, dtype=np.float64),
+        "axis": ax0 if axis is None else np.asarray(axis, dtype=np.float64),
+        "aspect_ratio": ar0 if aspect_ratio is None else float(aspect_ratio),
+        "area": area0 if area is None else float(area),
+    }
+    return {
+        "ellipse_dev": ellipse_deviation(ring, **kwargs),
+        "sagitta_ratio": chord_sagitta_ratio(
+            ring, centroid=kwargs["centroid"], axis=kwargs["axis"]
+        ),
+    }
+
+
 def elliptic_fourier(outline: np.ndarray, n_harmonics: int = 10) -> np.ndarray:
     """Elliptic Fourier descriptors with Kuhl–Giardina normalization.
 
@@ -789,7 +966,7 @@ def fill_cells_geometry(
     ----------
     cells_table : pyarrow.Table or polars.DataFrame
         Cells table (schema §2.3). The ``outline`` struct column and the
-        ``curv_*`` scalar columns are replaced/created.
+        curv_* and shape descriptor scalar columns are replaced/created.
     outlines : mapping of int to numpy.ndarray
         ``label -> (N, 2)`` outline, or ``cell_key -> outline``. Keying
         is inferred: any key larger than
@@ -812,15 +989,19 @@ def fill_cells_geometry(
 
     if curvatures is None:
         curvatures = {k: curvature_features(v) for k, v in outlines.items()}
+    shapes = {k: shape_descriptors(v) for k, v in outlines.items()}
 
     outline_vals: list[dict[str, list[float]] | None] = []
     curv_vals: dict[str, list[float | None]] = {c: [] for c in CURVATURE_COLUMNS}
+    shape_vals: dict[str, list[float | None]] = {c: [] for c in SHAPE_COLUMNS}
     for rid in row_ids:
         ring = outlines.get(rid)
         if ring is None:
             outline_vals.append(None)
             for c in CURVATURE_COLUMNS:
                 curv_vals[c].append(None)
+            for c in SHAPE_COLUMNS:
+                shape_vals[c].append(None)
             continue
         arr = np.asarray(ring, dtype=np.float64)
         outline_vals.append(
@@ -831,8 +1012,14 @@ def fill_cells_geometry(
         for c in CURVATURE_COLUMNS:
             value = stats.get(c)
             curv_vals[c].append(None if value is None else float(value))
+        desc = shapes.get(rid, {})
+        for c in SHAPE_COLUMNS:
+            value = desc.get(c)
+            shape_vals[c].append(None if value is None else float(value))
 
     table = _upsert_column(table, "outline", pa.array(outline_vals, type=_schema.OUTLINE_T))
     for c in CURVATURE_COLUMNS:
         table = _upsert_column(table, c, pa.array(curv_vals[c], type=pa.float32()))
+    for c in SHAPE_COLUMNS:
+        table = _upsert_column(table, c, pa.array(shape_vals[c], type=pa.float32()))
     return _back(table, cells_table)

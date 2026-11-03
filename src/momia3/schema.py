@@ -161,6 +161,8 @@ _SCALAR_MORPHOLOGY: tuple[tuple[str, str, str], ...] = (
     ("aspect_ratio", "1", "morphology.shape"),
     ("eccentricity", "1", "morphology.shape"),
     ("solidity", "1", "morphology.shape"),
+    ("ellipse_dev", "1", "morphology.shape"),
+    ("sagitta_ratio", "1", "morphology.shape"),
     ("extent", "1", "morphology.shape"),
     ("circularity", "1", "morphology.shape"),
     ("compactness", "1", "morphology.shape"),
