@@ -879,6 +879,21 @@ def _raw_normalize(inputs: dict[str, Any], params: BaseModel, ctx: StepContext) 
 
 
 @register(
+    "preprocess.background_correct",
+    params_model=preprocess_ops.BackgroundParams,
+    inputs={"image": "array"},
+    outputs={"image": "array"},
+    shard="frame",
+    description="Background/illumination suppression (rolling-ball, black top-hat, "
+    "block percentile or block median; optional mean restoration and light blur).",
+    func=preprocess_ops.background_correct,
+)
+def _raw_background_correct(inputs: dict[str, Any], params: BaseModel, ctx: StepContext) -> dict[str, Any]:
+    del ctx
+    return {"image": preprocess_ops.background_correct(inputs["image"], params)}
+
+
+@register(
     "preprocess.denoise",
     params_model=preprocess_ops.DenoiseParams,
     inputs={"image": "array"},

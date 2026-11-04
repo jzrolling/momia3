@@ -21,6 +21,10 @@ Pure functions on 2D/3D numpy arrays with pydantic v2 parameter models:
   is applied to every channel via a single Fourier-shift resampling per
   frame.
 - :func:`bleach_correct` — single/double exponential bleach correction.
+- background_correct - background/illumination suppression with selectable
+  estimators: FFT rolling ball, black top-hat, block percentile or block
+  median (each restores the image mean so the output keeps the
+  bright-background/dark-cell polarity expected by phase-contrast models).
 - :func:`normalize` — unified percentile/gamma normalization with an
   explicit output dtype.
 - :func:`denoise` — skimage wrappers (NLM / gaussian / bilateral).
@@ -52,6 +56,7 @@ __all__ = [
     "BleachParams",
     "NormalizeParams",
     "DenoiseParams",
+    "BackgroundParams",
     "illumination_correct",
     "rolling_ball_background_fft",
     "shrink_img_local_min",
@@ -59,6 +64,7 @@ __all__ = [
     "bleach_correct",
     "normalize",
     "denoise",
+    "background_correct",
 ]
 
 _EPS = 1e-12
@@ -149,6 +155,49 @@ class NormalizeParams(BaseModel):
     gamma: float = Field(1.0, gt=0, description="Gamma applied after rescaling")
     dtype: Literal["uint8", "uint16", "float32"] = Field(
         "float32", description="Explicit output dtype"
+    )
+
+
+class BackgroundParams(BaseModel):
+    """Parameters of background_correct.
+
+    Four background estimators are available. All of them subtract an
+    estimated background and optionally restore the image mean, so the
+    output keeps the original bright-background/dark-object polarity:
+
+    - rolling_ball: FFT rolling-ball convolution (rolling_ball_background_fft).
+    - tophat: black top-hat background (grey closing, square structuring
+      element of radius radius), suited to dark cells on a bright field.
+    - tile_percentile: per-block percentile background, bilinearly upsampled.
+    - tile_median: per-block median background, bilinearly upsampled.
+
+    post_blur_sigma applies a light Gaussian after the correction (0 = off;
+    0.8-1.0 is useful before segmentation).
+    """
+
+    method: Literal["rolling_ball", "tophat", "tile_percentile", "tile_median"] = Field(
+        "rolling_ball", description="Background estimator"
+    )
+    radius: int = Field(
+        50, ge=1, description="Rolling-ball radius / top-hat structuring-element radius (px)"
+    )
+    kind: Literal["parabola", "ball"] = Field(
+        "ball", description="Rolling-ball kernel profile"
+    )
+    shrink_factor: int | None = Field(
+        4, ge=1, description="Rolling-ball shrink factor (None or 1 = exact)"
+    )
+    block_size: int = Field(
+        16, ge=2, description="Block size for tile_percentile/tile_median (px)"
+    )
+    percentile: float = Field(
+        20.0, ge=0, le=100, description="Percentile for tile_percentile"
+    )
+    post_blur_sigma: float = Field(
+        0.0, ge=0, description="Gaussian sigma applied after correction (0 = off)"
+    )
+    restore_mean: bool = Field(
+        True, description="Add back the image mean after background subtraction"
     )
 
 
@@ -684,6 +733,90 @@ def normalize(image: np.ndarray, params: NormalizeParams | None = None) -> np.nd
 # ---------------------------------------------------------------------------
 # Denoising
 # ---------------------------------------------------------------------------
+
+
+
+def _block_background(
+    image: np.ndarray, block_size: int, percentile: float | None
+) -> np.ndarray:
+    """Block-wise percentile/median background, bilinearly upsampled."""
+    h, w = image.shape
+    block = max(2, min(int(block_size), max(2, min(h, w) // 4)))
+    bh, bw = max(1, h // block), max(1, w // block)
+    hs, ws = bh * block, bw * block
+    blocks = (
+        image[:hs, :ws]
+        .reshape(bh, block, bw, block)
+        .transpose(0, 2, 1, 3)
+        .reshape(bh, bw, block * block)
+    )
+    if percentile is None:
+        small = np.median(blocks, axis=2).astype(np.float32)
+    else:
+        small = np.percentile(blocks, float(percentile), axis=2).astype(np.float32)
+    background = ndimage.zoom(small, (h / bh, w / bw), order=1)
+    return np.asarray(background[:h, :w], dtype=np.float32)
+
+
+def background_correct(
+    image: np.ndarray, params: BackgroundParams | None = None
+) -> np.ndarray:
+    """Background/illumination suppression with selectable estimators.
+
+    Estimates a smooth background and subtracts it; with
+    params.restore_mean the image mean is added back so the output keeps
+    the bright-background/dark-object polarity used by phase-contrast
+    segmentation models. A light Gaussian can be applied afterwards
+    (post_blur_sigma).
+
+    Parameters
+    ----------
+    image : numpy.ndarray
+        2D image or (t, y, x) stack (filtered per frame).
+    params : BackgroundParams, optional
+        Estimator selection and its parameters.
+
+    Returns
+    -------
+    numpy.ndarray
+        Corrected image, float32, same shape as the input.
+    """
+    params = params or BackgroundParams()
+    work = np.asarray(image, dtype=np.float32)
+    if work.ndim == 3:
+        return np.stack([background_correct(plane, params) for plane in work])
+    if work.ndim != 2:
+        raise ValueError(f"background_correct expects 2D or (t, y, x), got {work.shape}")
+
+    method = str(params.method)
+    if method == "rolling_ball":
+        residual = rolling_ball_background_fft(
+            work,
+            RollingBallParams(
+                radius=int(params.radius),
+                kind=params.kind,
+                shrink_factor=params.shrink_factor,
+            ),
+        )
+    elif method == "tophat":
+        size = 2 * int(params.radius) + 1
+        background = ndimage.grey_closing(work, size=(size, size))
+        residual = work - background
+    elif method == "tile_percentile":
+        background = _block_background(
+            work, int(params.block_size), float(params.percentile)
+        )
+        residual = work - background
+    elif method == "tile_median":
+        background = _block_background(work, int(params.block_size), None)
+        residual = work - background
+    else:  # pragma: no cover - Literal validation guards this
+        raise ValueError(f"unknown background method: {method}")
+
+    corrected = residual + (float(work.mean()) if params.restore_mean else 0.0)
+    if params.post_blur_sigma > 0:
+        corrected = ndimage.gaussian_filter(corrected, float(params.post_blur_sigma))
+    return corrected.astype(np.float32, copy=False)
 
 
 def denoise(image: np.ndarray, params: DenoiseParams | None = None) -> np.ndarray:

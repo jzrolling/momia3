@@ -167,7 +167,7 @@ class Ops:                               # 需 GPU 的算子统一入口
 ## 4. 算法层规格（ops/）
 
 ### 4.1 preprocess.py
-- `illumination.basic`（BaSiC 平场/暗场校正）、`background.rolling_ball_fft`（torch FFT 近似，替代 momia2 逐像素版）、`denoise.n2v?`（可选 extras）、`drift.phase_corr`（**参考通道算一次 shift，全通道应用**；时序累积漂移 + 单次 Fourier-shift）、`bleach.exp_fit`、`normalize`（统一入口，显式 dtype 策略）。
+- `illumination.basic`（BaSiC 平场/暗场校正）、`background.rolling_ball_fft / background_correct (rolling-ball, black top-hat, block percentile/median)`（torch FFT 近似，替代 momia2 逐像素版）、`denoise.n2v?`（可选 extras）、`drift.phase_corr`（**参考通道算一次 shift，全通道应用**；时序累积漂移 + 单次 Fourier-shift）、`bleach.exp_fit`、`normalize`（统一入口，显式 dtype 策略）。
 
 ### 4.2 segment.py
 - 传统：`threshold.{isodata,sauvola,local,composite}`（移植 momia2，纯函数化）。

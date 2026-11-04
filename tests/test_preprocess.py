@@ -390,3 +390,51 @@ def test_denoise_methods_reduce_noise() -> None:
         assert float(np.abs(out - smooth).mean()) < float(
             np.abs(noisy - smooth).mean()
         ), method
+
+def _background_phantom() -> np.ndarray:
+    """Smooth illumination gradient + vignetting + one dark cell."""
+    y, x = np.mgrid[0:128, 0:128].astype(np.float32)
+    bg = 100.0 + 20.0 * np.exp(
+        -(((x - 64.0) ** 2 + (y - 64.0) ** 2) / (2.0 * 45.0 ** 2))
+    )
+    cell = 35.0 * np.exp(
+        -(((x - 40.0) ** 2) / (2.0 * 4.0 ** 2) + ((y - 64.0) ** 2) / (2.0 * 3.0 ** 2))
+    )
+    return (bg - cell).astype(np.float32)
+
+
+def test_background_correct_methods_suppress_gradient_and_keep_cell() -> None:
+    img = _background_phantom()
+    for method in ("rolling_ball", "tophat", "tile_percentile", "tile_median"):
+        out = pp.background_correct(
+            img,
+            pp.BackgroundParams(
+                method=method, radius=25, block_size=16, percentile=20.0
+            ),
+        )
+        assert out.shape == img.shape
+        assert out.dtype == np.float32
+        assert np.all(np.isfinite(out))
+        patch = (slice(20, 45), slice(85, 110))
+        assert out[patch].std() < 0.5 * img[patch].std() + 1.0
+        assert out[64, 40] < out[64, 110] - 5.0
+        assert out.mean() == pytest.approx(img.mean(), rel=0.15)
+
+
+def test_background_correct_stack_and_mean_flag() -> None:
+    img = _background_phantom()
+    stack = np.stack([img, img + 5.0])
+    out = pp.background_correct(
+        stack, pp.BackgroundParams(method="tophat", radius=15, post_blur_sigma=0.8)
+    )
+    assert out.shape == stack.shape
+    out_flat = pp.background_correct(
+        img, pp.BackgroundParams(method="tile_median", restore_mean=False)
+    )
+    assert abs(float(out_flat.mean())) < 20.0
+
+
+def test_background_correct_rejects_unknown_method() -> None:
+    with pytest.raises(Exception):
+        pp.BackgroundParams(method="not-a-method")
+
