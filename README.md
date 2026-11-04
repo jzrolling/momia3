@@ -18,6 +18,7 @@ Python >= 3.11. Core install needs no torch.
 ## Quick start
 
     momia3 run examples/pipeline_demo.json          # synthetic end-to-end demo
+    momia3 run examples/pipeline_sp003_omnipose.json # real data + Omnipose (weights required)
     momia3 list                                     # registered operations
 
 The pipeline DAG is plain JSON: preprocess -> segment -> measure -> outline ->

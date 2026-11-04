@@ -2,7 +2,7 @@
 
 Traditional threshold segmentation (ported from ``momia2/segment/mask.py``
 as pure functions with explicit pydantic parameters instead of
-``configparser``), AI-segmenter protocol/registry stubs, probability-map
+``configparser``), AI-segmenter protocol/registry and the Omnipose backend parameter model (implemented in momia3.models.omnipose_lite), probability-map
 post-processing (ported from ``momia2/segment/_helper.py``), normalized
 per-instance distance maps, weighted-window patch stitching (ported
 from momia2's ``Patchifier`` as pure functions), and distance-transform
@@ -39,6 +39,7 @@ def _remove_small(mask: np.ndarray, min_size: int) -> np.ndarray:
 
 __all__ = [
     "ThresholdParams",
+    "OmniposeParams",
     "ProbToLabelsParams",
     "DeclumpParams",
     "Segmenter",
@@ -96,6 +97,39 @@ class ThresholdParams(BaseModel):
         le=1.0,
         description="Minimum overlap fraction with the global mask (composite)",
     )
+
+
+class OmniposeParams(BaseModel):
+    """Parameters of the Omnipose segmentation backend (segment.omnipose).
+
+    The Omnipose network outputs flow/dist/boundary channels and is handled by
+    the label-producing adapter in momia3.models.omnipose_lite.segmenter; it
+    does not go through prob_to_labels.
+    """
+
+    weights_path: str | None = Field(
+        None,
+        description="Omnipose checkpoint; None resolves MOMIA3_OMNIPOSE_WEIGHTS "
+        "or ~/.cellpose/models/bact_phase_omnitorch_0",
+    )
+    device: str | None = Field(
+        None, description="torch device (cuda/mps/cpu); None picks the best available"
+    )
+    half: bool = Field(
+        False, description="CUDA bf16 autocast (fp16 overflows in CPnet)"
+    )
+    niter: int = Field(200, ge=1, description="Euler integration iterations")
+    mask_threshold: float = Field(
+        0.0, description="Cell-mask threshold on the distance channel"
+    )
+    diam_threshold: float = Field(
+        12.0, gt=0, description="Mask-reconstruction diameter threshold (px)"
+    )
+    min_size: int = Field(15, ge=0, description="Minimum instance size (px)")
+    max_size: int | None = Field(
+        None, ge=1, description="Maximum instance size (px); None disables"
+    )
+    hole_size: int = Field(3, ge=0, description="Fill holes up to this size (px)")
 
 
 def _binarize(image: np.ndarray, threshold: np.ndarray | float, dark: bool) -> np.ndarray:

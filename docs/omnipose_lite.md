@@ -35,6 +35,22 @@ momia3 核心安装不依赖 torch；只有导入该子模块时才需要。
 
     fast = FastOmnipose("/path/to/bact_phase_omnitorch_0", device="cuda", half=True)
 
+## Pipeline 用法
+
+    {
+      "id": "segment",
+      "op": "segment.omnipose",
+      "params": {"channel": "phase", "device": "mps", "niter": 200,
+                 "mask_threshold": 0.0, "min_size": 15},
+      "inputs": {"experiment": "import.experiment"},
+      "outputs": {"experiment": "experiment.zarr"}
+    }
+
+segment.omnipose 逐帧写回 store 的 labels；GPU 设备下会在主进程串行执行，
+避免每个 ProcessPool worker 复制一份模型。单帧处理可用 segment.omnipose_frame
+（输入 image array，输出 labels array）。权重缺失时 runner 会抛 FileNotFoundError
+并提示下载路径。
+
 ## 预处理建议
 
 明场/相差图像先做背景压制再送网络：momia3.ops.preprocess.background_correct

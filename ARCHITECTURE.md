@@ -172,7 +172,7 @@ class Ops:                               # 需 GPU 的算子统一入口
 
 ### 4.2 segment.py
 - 传统：`threshold.{isodata,sauvola,local,composite}`（移植 momia2，纯函数化）。
-- AI：模型注册表协议 `Segmenter.predict(image, params) -> prob (c,y,x)`；实现 `omnipose`、`cellpose_sam`、`unet_torch`（旧 AttResUNet 权重可转）；后处理 `prob_to_labels`（seed/foreground/分水，移植 prediction2seed/foreground）。
+- AI：模型注册表协议 `Segmenter.predict(image, params) -> prob (c,y,x)`；实现 `omnipose`、`cellpose_sam`、`unet_torch`（旧 AttResUNet 权重可转）；后处理 `prob_to_labels`（seed/foreground/分水，移植 prediction2seed/foreground）。 omnipose 已由 momia3.models.omnipose_lite 接入（segment.omnipose / segment.omnipose_frame）；cellpose_sam、unet_torch 待实现。
 
 ### 4.3 measure.py
 - `regionprops`：skimage `regionprops_table` 一次算清，只取 schema 声明列；加权取向矩（momia2 已实现，移植）；`intensity_stats` 向量化（`ndimage.sum_labels` 等，禁逐细胞 Python 循环）；`texture.haralick`、`texture.lbp`（新增，对标 CellProfiler MeasureTexture）。

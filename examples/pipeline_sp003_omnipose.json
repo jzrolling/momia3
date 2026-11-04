@@ -1,0 +1,101 @@
+{
+  "name": "sp003_e2e_omnipose",
+  "workspace": "data/sp003_workspace",
+  "steps": [
+    {
+      "id": "import",
+      "op": "io.import_tiff",
+      "params": {
+        "path": "data/SP_003.tif",
+        "pixel_microns": 0.04968,
+        "channels": [
+          "phase",
+          "ch1",
+          "ch2"
+        ]
+      },
+      "inputs": {},
+      "outputs": {
+        "experiment": "experiment.zarr"
+      }
+    },
+    {
+      "id": "segment",
+      "op": "segment.omnipose",
+      "params": {
+        "channel": "phase",
+        "device": "mps",
+        "niter": 200,
+        "mask_threshold": 0.0,
+        "diam_threshold": 12.0,
+        "min_size": 15
+      },
+      "inputs": {
+        "experiment": "import.experiment"
+      },
+      "outputs": {
+        "experiment": "experiment.zarr"
+      }
+    },
+    {
+      "id": "cells",
+      "op": "measure.cells",
+      "params": {
+        "channel": "phase",
+        "include_intensity": true
+      },
+      "inputs": {
+        "experiment": "segment.experiment"
+      },
+      "outputs": {
+        "cells": "tables/cells_raw.parquet"
+      }
+    },
+    {
+      "id": "outlines",
+      "op": "outline.extract",
+      "params": {
+        "sigma": 1.0,
+        "refine_outline_iters": 1,
+        "refine_outline_mode": "edge+intensity"
+      },
+      "inputs": {
+        "experiment": "declump.experiment",
+        "cells": "cells.cells"
+      },
+      "outputs": {
+        "cells": "tables/cells_outlines.parquet"
+      }
+    },
+    {
+      "id": "midlines",
+      "op": "midline.extract",
+      "params": {
+        "midline_method": "equidistant",
+        "equidistant_guard": true
+      },
+      "inputs": {
+        "experiment": "declump.experiment",
+        "cells": "outlines.cells"
+      },
+      "outputs": {
+        "cells": "tables/cells.parquet"
+      }
+    },
+    {
+      "id": "efd",
+      "op": "characterize.efd_shape_space",
+      "params": {
+        "n_harmonics": 10,
+        "n_components": 3
+      },
+      "inputs": {
+        "cells": "midlines.cells"
+      },
+      "outputs": {
+        "cells": "tables/cells_efd.parquet",
+        "pca": "tables/efd_pca.json"
+      }
+    }
+  ]
+}

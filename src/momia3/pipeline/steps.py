@@ -779,6 +779,103 @@ def run_track_link(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# chain step: segment.omnipose (shard = frame)
+# ---------------------------------------------------------------------------
+
+
+class OmniposeRunParams(segment_ops.OmniposeParams):
+    """segment.omnipose step parameters."""
+
+    channel: str | None = Field(
+        None, description="Channel to segment; None uses the first store channel"
+    )
+
+
+def _omnipose_frame_shard(args: tuple[str, int, int, str, dict[str, Any]]) -> int:
+    """Segment one frame with Omnipose and write its labels into the store."""
+    store_path, fov_id, t, channel, params_dict = args
+    store = ExperimentStore.open(store_path, mode="a")
+    image = store.get_frame(fov_id, channel, t)
+    from momia3.models.omnipose_lite.segmenter import omnipose_labels
+
+    labels = omnipose_labels(image, segment_ops.OmniposeParams(**params_dict))
+    store.set_labels_frame(fov_id, t, labels.astype(np.uint32))
+    return int(labels.max())
+
+
+@register(
+    "segment.omnipose",
+    params_model=OmniposeRunParams,
+    inputs={"experiment": "store"},
+    outputs={"experiment": "store"},
+    shard="frame",
+    description=(
+        "Omnipose (reference CPnet weights) segmentation of every (fov, frame) "
+        "shard of an experiment store; labels are written in place. Weights are "
+        "resolved externally (MOMIA3_OMNIPOSE_WEIGHTS or ~/.cellpose/models)."
+    ),
+    verify=("fov_*/labels",),
+    func=None,
+)
+def run_omnipose(
+    inputs: dict[str, Any], params: OmniposeRunParams, ctx: StepContext
+) -> dict[str, Any]:
+    """Runner of segment.omnipose (see registry description)."""
+    store_path = Path(inputs["experiment"])
+    store = ExperimentStore.open(store_path, mode="a")
+    channel = params.channel or store.channels[0]
+    seg_params = segment_ops.OmniposeParams(
+        **{k: v for k, v in params.model_dump(mode="json").items() if k != "channel"}
+    )
+    items: list[tuple[str, int, int, str, dict[str, Any]]] = []
+    for fov_id in store.fov_ids:
+        shape = store.shape(fov_id, channel)
+        store.write_labels(fov_id, np.zeros(shape, dtype=np.uint32))
+        items += [
+            (str(store_path), fov_id, t, channel, seg_params.model_dump(mode="json"))
+            for t in range(shape[0])
+        ]
+
+    from momia3.models.omnipose_lite.segmenter import resolve_device
+
+    device = resolve_device(seg_params.device)
+    if device == "cpu":
+        counts = ctx.map_shards(_omnipose_frame_shard, items)
+    else:
+        logger.warning(
+            "segment.omnipose: device %r -> serial parent execution so GPU model "
+            "is not duplicated across process workers",
+            device,
+        )
+        counts = [_omnipose_frame_shard(item) for item in items]
+    logger.info(
+        "segment.omnipose: %d shard(s), max %d instance(s)/frame (device=%s)",
+        len(counts),
+        max(counts, default=0),
+        device,
+    )
+    return {"experiment": store_path}
+
+
+@register(
+    "segment.omnipose_frame",
+    params_model=segment_ops.OmniposeParams,
+    inputs={"image": "array"},
+    outputs={"labels": "array"},
+    shard="frame",
+    description="Instance labels of one 2D image with the Omnipose CPnet backend.",
+    func=None,
+)
+def _raw_omnipose_frame(
+    inputs: dict[str, Any], params: segment_ops.OmniposeParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    from momia3.models.omnipose_lite.segmenter import omnipose_labels
+
+    return {"labels": omnipose_labels(inputs["image"], params)}
+
+
 # raw-op registrations ("<module>.<function>") — preprocess
 # ---------------------------------------------------------------------------
 
