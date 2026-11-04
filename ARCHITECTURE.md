@@ -46,7 +46,8 @@ momia3/
 │   │   ├── polygon.py             # inside_polygon：numpy/PIL 双后端
 │   │   ├── characterize.py        # 坐标投影/生长动力学/群体结构
 │   │   └── track.py               # LAP 链接/间隙闭合/谱系/纠错
-│   ├── models/                    # AI 模型注册表（Omnipose/Cellpose-SAM/自训 U-Net-torch）
+│   ├── models/                    # 可选 AI 模型后端（torch 为可选依赖）
+│   │   └── omnipose_lite/         # FastOmnipose：参考 CPnet 权重 + 轻量编排
 │   ├── pipeline/
 │   │   ├── registry.py            # 工具注册表（pydantic schema → CLI/GUI/MCP）
 │   │   ├── engine.py              # JSON DAG 执行器（分片/并行/缓存/失效）
@@ -196,6 +197,11 @@ class Ops:                               # 需 GPU 的算子统一入口
 - V-snapping：显式分裂候选事件（短轴取向突变 + 面积守恒检验）。
 
 ---
+
+### 4.8 models/omnipose_lite
+- 参考 Omnipose CPnet 权重的轻量推理层（不做流可视化/boundary error 后处理；Euler 积分 torch 化），从 omni_lite 迁入。
+- 权重不随仓库分发：resolve_omnipose_weights 按显式路径 → MOMIA3_OMNIPOSE_WEIGHTS → ~/.cellpose/models 解析。
+- torch/cellpose_omni 为可选依赖（pyproject extra: inference）；momia3 核心导入不加载 torch。
 
 ## 5. midline/outline 优化规格（对标 MicrobeJ/Oufti/BacStalk）
 

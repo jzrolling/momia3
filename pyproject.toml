@@ -23,6 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["torch>=2.2"]
+inference = ["torch>=2.2", "omnipose>=1.1.4", "fastremap>=1.13"]
 io = ["nd2>=0.10"]
 distributed = ["dask[distributed]>=2024.1"]
 query = ["duckdb>=1.0"]
