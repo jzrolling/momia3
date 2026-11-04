@@ -894,6 +894,21 @@ def _raw_background_correct(inputs: dict[str, Any], params: BaseModel, ctx: Step
 
 
 @register(
+    "preprocess.dual_bandpass",
+    params_model=preprocess_ops.DualBandpassParams,
+    inputs={"image": "array"},
+    outputs={"image": "array"},
+    shard="frame",
+    description="FFT dual-bandpass filter (keeps structures between min and max "
+    "structure size; suppresses larger illumination background and smaller dust).",
+    func=preprocess_ops.dual_bandpass,
+)
+def _raw_dual_bandpass(inputs: dict[str, Any], params: BaseModel, ctx: StepContext) -> dict[str, Any]:
+    del ctx
+    return {"image": preprocess_ops.dual_bandpass(inputs["image"], params)}
+
+
+@register(
     "preprocess.denoise",
     params_model=preprocess_ops.DenoiseParams,
     inputs={"image": "array"},

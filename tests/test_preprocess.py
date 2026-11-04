@@ -438,3 +438,56 @@ def test_background_correct_rejects_unknown_method() -> None:
     with pytest.raises(Exception):
         pp.BackgroundParams(method="not-a-method")
 
+def _band_phantom() -> np.ndarray:
+    """Large-scale illumination + one cell-scale dark blob + sub-px dust."""
+    rng = np.random.default_rng(3)
+    y, x = np.mgrid[0:192, 0:192].astype(np.float32)
+    bg = 100.0 + 0.20 * x + 0.10 * y
+    cell = 40.0 * np.exp(
+        -(((x - 90.0) ** 2) / (2.0 * 6.0 ** 2) + ((y - 90.0) ** 2) / (2.0 * 3.0 ** 2))
+    )
+    dust = 25.0 * np.exp(
+        -(((x - 150.0) ** 2 + (y - 40.0) ** 2) / (2.0 * 0.7 ** 2))
+    )
+    return (bg - cell + dust + rng.normal(0, 0.2, bg.shape)).astype(np.float32)
+
+
+def test_dual_bandpass_suppresses_gradient_and_keeps_cell() -> None:
+    img = _band_phantom()
+    out = pp.dual_bandpass(
+        img, pp.DualBandpassParams(min_structure_px=2.0, max_structure_px=100.0)
+    )
+    assert out.shape == img.shape
+    assert out.dtype == np.float32
+    assert np.all(np.isfinite(out))
+    patch = (slice(120, 140), slice(40, 60))
+    assert out[patch].std() < 0.4 * img[patch].std() + 1.0
+    # the cell-scale dark blob is still darker than its neighbourhood
+    assert out[90, 90] < out[90, 130] - 5.0
+
+
+def test_dual_bandpass_validation_and_stack() -> None:
+    img = _band_phantom()
+    with pytest.raises(ValueError):
+        pp.dual_bandpass(img, pp.DualBandpassParams(min_structure_px=100.0, max_structure_px=2.0))
+    stack = np.stack([img, img * 0.5])
+    out = pp.dual_bandpass(
+        stack, pp.DualBandpassParams(min_structure_px=2.0, max_structure_px=100.0)
+    )
+    assert out.shape == stack.shape
+
+
+def test_background_correct_dual_bandpass_method() -> None:
+    img = _band_phantom()
+    out = pp.background_correct(
+        img,
+        pp.BackgroundParams(
+            method="dual_bandpass",
+            min_structure_px=2.0,
+            max_structure_px=100.0,
+            post_blur_sigma=0.8,
+        ),
+    )
+    assert out.shape == img.shape
+    assert np.all(np.isfinite(out))
+

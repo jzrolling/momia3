@@ -25,6 +25,9 @@ Pure functions on 2D/3D numpy arrays with pydantic v2 parameter models:
   estimators: FFT rolling ball, black top-hat, block percentile or block
   median (each restores the image mean so the output keeps the
   bright-background/dark-cell polarity expected by phase-contrast models).
+- dual_bandpass - FFT dual-bandpass filter (momia2 port): keeps
+  structures between min_structure_px and max_structure_px, removes
+  larger illumination background and smaller dust/noise.
 - :func:`normalize` — unified percentile/gamma normalization with an
   explicit output dtype.
 - :func:`denoise` — skimage wrappers (NLM / gaussian / bilateral).
@@ -57,6 +60,7 @@ __all__ = [
     "NormalizeParams",
     "DenoiseParams",
     "BackgroundParams",
+    "DualBandpassParams",
     "illumination_correct",
     "rolling_ball_background_fft",
     "shrink_img_local_min",
@@ -65,6 +69,7 @@ __all__ = [
     "normalize",
     "denoise",
     "background_correct",
+    "dual_bandpass",
 ]
 
 _EPS = 1e-12
@@ -170,14 +175,17 @@ class BackgroundParams(BaseModel):
       element of radius radius), suited to dark cells on a bright field.
     - tile_percentile: per-block percentile background, bilinearly upsampled.
     - tile_median: per-block median background, bilinearly upsampled.
+    - dual_bandpass: FFT band-pass filter (momia2 port), keeps structures
+      between min_structure_px and max_structure_px; restore_mean is not
+      applied in this mode.
 
     post_blur_sigma applies a light Gaussian after the correction (0 = off;
     0.8-1.0 is useful before segmentation).
     """
 
-    method: Literal["rolling_ball", "tophat", "tile_percentile", "tile_median"] = Field(
-        "rolling_ball", description="Background estimator"
-    )
+    method: Literal[
+        "rolling_ball", "tophat", "tile_percentile", "tile_median", "dual_bandpass"
+    ] = Field("rolling_ball", description="Background estimator")
     radius: int = Field(
         50, ge=1, description="Rolling-ball radius / top-hat structuring-element radius (px)"
     )
@@ -193,12 +201,37 @@ class BackgroundParams(BaseModel):
     percentile: float = Field(
         20.0, ge=0, le=100, description="Percentile for tile_percentile"
     )
+    min_structure_px: float = Field(
+        2.0, gt=0, description="dual_bandpass smallest kept structure (px)"
+    )
+    max_structure_px: float = Field(
+        100.0, gt=0, description="dual_bandpass largest kept structure (px)"
+    )
     post_blur_sigma: float = Field(
         0.0, ge=0, description="Gaussian sigma applied after correction (0 = off)"
     )
     restore_mean: bool = Field(
         True, description="Add back the image mean after background subtraction"
     )
+
+
+class DualBandpassParams(BaseModel):
+    """Parameters of dual_bandpass (momia2 dual-bandpass port).
+
+    The FFT is multiplied by a Gaussian high-pass and low-pass mask: the
+    result keeps structures with sizes between min_structure_px and
+    max_structure_px, suppressing larger illumination background and
+    smaller dust/noise. pixel_microns converts pixels to the filter
+    frequency scale (1.0 keeps the units in pixels).
+    """
+
+    min_structure_px: float = Field(
+        2.0, gt=0, description="Smallest structure kept (px)"
+    )
+    max_structure_px: float = Field(
+        100.0, gt=0, description="Largest structure kept (px)"
+    )
+    pixel_microns: float = Field(1.0, gt=0, description="Pixel size in microns")
 
 
 class DenoiseParams(BaseModel):
@@ -758,6 +791,65 @@ def _block_background(
     return np.asarray(background[:h, :w], dtype=np.float32)
 
 
+
+def _dual_bandpass_2d(
+    image: np.ndarray, min_structure_px: float, max_structure_px: float, pixel_microns: float
+) -> np.ndarray:
+    h, w = image.shape
+    u_max = round(1.0 / float(pixel_microns), 3) / 2.0
+    u_axis = np.linspace(-u_max / 2.0, u_max / 2.0, w)
+    v_axis = np.linspace(-u_max / 2.0, u_max / 2.0, h)
+    u_mat, v_mat = np.meshgrid(u_axis, v_axis)
+    freq = np.sqrt(u_mat ** 2 + v_mat ** 2)
+    min_scale = float(min_structure_px) * float(pixel_microns)
+    max_scale = float(max_structure_px) * float(pixel_microns)
+    highpass = np.exp(-((freq * min_scale) ** 2))
+    lowpass = 1.0 - np.exp(-((freq * max_scale) ** 2))
+    spectrum = np.fft.fftshift(np.fft.fft2(image - np.mean(image)))
+    filtered = np.fft.ifft2(np.fft.ifftshift(spectrum * highpass * lowpass)).real
+    filtered = filtered - filtered.min()
+    return filtered.astype(np.float32)
+
+
+def dual_bandpass(
+    image: np.ndarray, params: DualBandpassParams | None = None
+) -> np.ndarray:
+    """FFT dual-bandpass filter (momia2 port).
+
+    Keeps structures between params.min_structure_px and
+    params.max_structure_px: larger-scale illumination and smaller-scale
+    noise/dust are suppressed. The result is shifted to non-negative values
+    (float32) and keeps the original image polarity, so it can be chained
+    into normalize or used directly for visualisation/feature extraction.
+
+    Parameters
+    ----------
+    image : numpy.ndarray
+        2D image or (t, y, x) stack (filtered per frame).
+    params : DualBandpassParams, optional
+        Structure-size limits and pixel size.
+
+    Returns
+    -------
+    numpy.ndarray
+        Filtered image, float32, same shape as the input.
+    """
+    params = params or DualBandpassParams()
+    if params.min_structure_px >= params.max_structure_px:
+        raise ValueError("min_structure_px must be smaller than max_structure_px")
+    work = np.asarray(image, dtype=np.float32)
+    if work.ndim == 3:
+        return np.stack([dual_bandpass(plane, params) for plane in work])
+    if work.ndim != 2:
+        raise ValueError(f"dual_bandpass expects 2D or (t, y, x), got {work.shape}")
+    return _dual_bandpass_2d(
+        work,
+        float(params.min_structure_px),
+        float(params.max_structure_px),
+        float(params.pixel_microns),
+    )
+
+
 def background_correct(
     image: np.ndarray, params: BackgroundParams | None = None
 ) -> np.ndarray:
@@ -789,6 +881,19 @@ def background_correct(
         raise ValueError(f"background_correct expects 2D or (t, y, x), got {work.shape}")
 
     method = str(params.method)
+    if method == "dual_bandpass":
+        corrected = dual_bandpass(
+            work,
+            DualBandpassParams(
+                min_structure_px=float(params.min_structure_px),
+                max_structure_px=float(params.max_structure_px),
+            ),
+        )
+        if params.post_blur_sigma > 0:
+            corrected = ndimage.gaussian_filter(
+                corrected, float(params.post_blur_sigma)
+            )
+        return corrected.astype(np.float32, copy=False)
     if method == "rolling_ball":
         residual = rolling_ball_background_fft(
             work,
