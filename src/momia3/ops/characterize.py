@@ -218,6 +218,16 @@ def demographic_projection(
     l_targets = np.linspace(0.0, 1.0, n_l)
     d_targets = np.linspace(-1.0, 1.0, n_d)
     out: dict[int, np.ndarray] = {}
+    # Spline coefficients are image-global: prefilter once instead of letting
+    # every map_coordinates call re-filter the full frame (the dominant cost).
+    # Reproduce scipy's map_coordinates(mode='nearest') prepadding exactly:
+    # it pads the input by 12 px with edge values, filters with mode='mirror',
+    # then samples at coordinates shifted by that padding.
+    npad = 12
+    coeffs = ndimage.spline_filter(np.pad(image, npad, mode="edge"), order=3)
+    coords_parts: list[np.ndarray] = []
+    keys: list[int] = []
+    sizes: list[int] = []
 
     for row in table.select(["cell_key", "frame", "label", "midline", "outline"]).to_pylist():
         if unique_frames.size > 1 and int(row["frame"]) != target_frame:
@@ -252,10 +262,24 @@ def demographic_projection(
         # Sample grid: d = -1 -> -normal side boundary, d = +1 -> +normal.
         grid_x = xs[:, None] + (d_targets[None, :] * half_width[:, None]) * nx_[:, None]
         grid_y = ys[:, None] + (d_targets[None, :] * half_width[:, None]) * ny_[:, None]
+        coords_parts.append(np.stack([grid_y.ravel(), grid_x.ravel()]))
+        keys.append(int(row["cell_key"]))
+        sizes.append(int(grid_x.size))
+
+    if coords_parts:
+        # One batched cubic-spline sample for all cells (prefilter=False reuses
+        # the global coefficients computed above).
         values = ndimage.map_coordinates(
-            image, [grid_y.ravel(), grid_x.ravel()], order=3, mode="nearest"
-        ).reshape(n_l, n_d)
-        out[int(row["cell_key"])] = values.astype(np.float32)
+            coeffs,
+            np.concatenate(coords_parts, axis=1) + npad,
+            order=3,
+            mode="nearest",
+            prefilter=False,
+        )
+        start = 0
+        for key, size in zip(keys, sizes):
+            out[key] = values[start : start + size].reshape(n_l, n_d).astype(np.float32)
+            start += size
 
     logger.debug("demographic_projection: %d cells projected", len(out))
     return out
