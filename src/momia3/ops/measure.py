@@ -273,25 +273,24 @@ def intensity_stats(
 ) -> dict[str, np.ndarray]:
     """Per-cell intensity statistics of one channel (vectorized).
 
-    Uses :func:`scipy.ndimage.sum_labels` / ``maximum`` / ``minimum`` /
-    ``standard_deviation`` for the vectorized statistics; the p25/p75
-    percentiles loop over labels (no vectorized ndimage primitive exists).
+    Uses scipy.ndimage.find_objects bounding boxes and computes all
+    statistics on the cropped instance pixels; this avoids scanning the full
+    frame once per label (the previous percentile loop did exactly that).
 
     Parameters
     ----------
     labels_2d : numpy.ndarray
         2D instance label image; 0 is background.
     channel_image : numpy.ndarray
-        2D intensity image, same shape as ``labels_2d``.
+        2D intensity image, same shape as labels_2d.
     prefix : str
-        Channel name; output keys are ``{prefix}_mean``, ``{prefix}_max``,
-        ``{prefix}_min``, ``{prefix}_std``, ``{prefix}_p25``,
-        ``{prefix}_p75``, ``{prefix}_integrated``.
+        Channel name; output keys are prefix_mean, prefix_max, prefix_min,
+        prefix_std, prefix_p25, prefix_p75, prefix_integrated.
 
     Returns
     -------
     dict of str to numpy.ndarray
-        Float32 arrays of length ``n_instances``, ascending label order.
+        Float32 arrays of length n_instances, ascending label order.
     """
     labels = np.asarray(labels_2d)
     image = np.asarray(channel_image, dtype=np.float64)
@@ -301,35 +300,49 @@ def intensity_stats(
         )
     label_ids = np.unique(labels)
     label_ids = label_ids[label_ids > 0]
-    if label_ids.size == 0:
-        return {
-            f"{prefix}_{stat}": np.empty(0, dtype=np.float32)
-            for stat in _schema.INTENSITY_STATS
-        }
-
-    index = label_ids.astype(np.int64)
-    sums = ndimage.sum_labels(image, labels, index=index)
-    counts = np.bincount(labels.ravel().astype(np.int64))[index].astype(np.float64)
-    means = sums / np.maximum(counts, 1.0)
-    maxs = ndimage.maximum(image, labels, index=index)
-    mins = ndimage.minimum(image, labels, index=index)
-    stds = ndimage.standard_deviation(image, labels, index=index)
-    flat_labels = labels.ravel()
-    flat_image = image.ravel()
-    p25 = np.empty(label_ids.size, dtype=np.float64)
-    p75 = np.empty(label_ids.size, dtype=np.float64)
-    for i, label_id in enumerate(label_ids):
-        pixels = flat_image[flat_labels == label_id]
-        p25[i], p75[i] = np.percentile(pixels, [25.0, 75.0])
+    stats = {
+        "mean": np.empty(label_ids.size, dtype=np.float64),
+        "max": np.empty(label_ids.size, dtype=np.float64),
+        "min": np.empty(label_ids.size, dtype=np.float64),
+        "std": np.empty(label_ids.size, dtype=np.float64),
+        "p25": np.empty(label_ids.size, dtype=np.float64),
+        "p75": np.empty(label_ids.size, dtype=np.float64),
+        "integrated": np.empty(label_ids.size, dtype=np.float64),
+    }
+    if label_ids.size:
+        slices = ndimage.find_objects(labels)
+        for i, label_id in enumerate(label_ids):
+            idx = int(label_id) - 1
+            sl = slices[idx] if idx < len(slices) else None
+            if sl is None:
+                for key in ("mean", "max", "min", "std", "p25", "p75"):
+                    stats[key][i] = np.nan
+                stats["integrated"][i] = 0.0
+                continue
+            sub_labels = labels[sl]
+            values = image[sl][sub_labels == label_id]
+            if values.size == 0:
+                for key in ("mean", "max", "min", "std", "p25", "p75"):
+                    stats[key][i] = np.nan
+                stats["integrated"][i] = 0.0
+                continue
+            stats["mean"][i] = values.mean()
+            stats["max"][i] = values.max()
+            stats["min"][i] = values.min()
+            stats["std"][i] = values.std()
+            p25, p75 = np.percentile(values, [25.0, 75.0])
+            stats["p25"][i] = p25
+            stats["p75"][i] = p75
+            stats["integrated"][i] = values.sum()
 
     return {
-        f"{prefix}_mean": means.astype(np.float32),
-        f"{prefix}_max": np.asarray(maxs, dtype=np.float32),
-        f"{prefix}_min": np.asarray(mins, dtype=np.float32),
-        f"{prefix}_std": np.asarray(stds, dtype=np.float32),
-        f"{prefix}_p25": p25.astype(np.float32),
-        f"{prefix}_p75": p75.astype(np.float32),
-        f"{prefix}_integrated": sums.astype(np.float32),
+        f"{prefix}_mean": stats["mean"].astype(np.float32),
+        f"{prefix}_max": stats["max"].astype(np.float32),
+        f"{prefix}_min": stats["min"].astype(np.float32),
+        f"{prefix}_std": stats["std"].astype(np.float32),
+        f"{prefix}_p25": stats["p25"].astype(np.float32),
+        f"{prefix}_p75": stats["p75"].astype(np.float32),
+        f"{prefix}_integrated": stats["integrated"].astype(np.float32),
     }
 
 

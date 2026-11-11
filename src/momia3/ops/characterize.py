@@ -480,32 +480,44 @@ def detect_septum(
 def _cell_angles(
     labels_2d: np.ndarray, table: pa.Table
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-cell ``(label, angle_rad, centroid[yx])`` of the major axis.
+    """Per-cell (label, angle_rad, centroid[yx]) of the major axis.
 
-    Angles are axis orientations in ``[0, pi)`` measured from the +x axis
-    in the image plane, derived from the binary-mask inertia tensor.
+    Angles are axis orientations in [0, pi) measured from the +x axis in the
+    image plane, derived from the binary-mask inertia tensor.
+
+    Vectorized over label pixels: one pass over all instance pixels computes
+    the per-label sums and second moments, instead of scanning the full frame
+    once per cell (the previous implementation was O(n_cells * frame_pixels)).
     """
     labels = np.asarray(labels_2d)
+    ys, xs = np.nonzero(labels)
+    if ys.size == 0:
+        empty_f = np.empty(0, dtype=np.float64)
+        return np.empty(0, dtype=np.int64), empty_f, empty_f.reshape(0, 2)
+    labs = labels[ys, xs].astype(np.int64)
+    counts = np.bincount(labs).astype(np.float64)
+    sum_x = np.bincount(labs, weights=xs.astype(np.float64))
+    sum_y = np.bincount(labs, weights=ys.astype(np.float64))
+    mean_x = sum_x / np.maximum(counts, 1.0)
+    mean_y = sum_y / np.maximum(counts, 1.0)
+    dx = xs.astype(np.float64) - mean_x[labs]
+    dy = ys.astype(np.float64) - mean_y[labs]
+    mu20 = np.bincount(labs, weights=dx * dx) / np.maximum(counts, 1.0)
+    mu02 = np.bincount(labs, weights=dy * dy) / np.maximum(counts, 1.0)
+    mu11 = np.bincount(labs, weights=dx * dy) / np.maximum(counts, 1.0)
+    theta_all = 0.5 * np.arctan2(2.0 * mu11, mu20 - mu02)
+    theta_all = np.mod(theta_all, np.pi)
+
     out_label: list[int] = []
     out_angle: list[float] = []
     out_yx: list[tuple[float, float]] = []
     for row in table.select(["label", "centroid"]).to_pylist():
         lab = int(row["label"])
-        mask = labels == lab
-        if not mask.any():
+        if lab <= 0 or lab >= counts.size or counts[lab] < 3:
             continue
-        yy, xx = np.nonzero(mask)
-        if yy.size < 3:
-            continue
-        cy, cx = yy.mean(), xx.mean()
-        y, x = yy - cy, xx - cx
-        mu20 = float((x * x).mean())
-        mu02 = float((y * y).mean())
-        mu11 = float((x * y).mean())
-        theta = 0.5 * np.arctan2(2.0 * mu11, mu20 - mu02)  # from +x axis
         out_label.append(lab)
-        out_angle.append(float(theta % np.pi))
-        out_yx.append((float(cy), float(cx)))
+        out_angle.append(float(theta_all[lab]))
+        out_yx.append((float(mean_y[lab]), float(mean_x[lab])))
     return (
         np.asarray(out_label, dtype=np.int64),
         np.asarray(out_angle, dtype=np.float64),
