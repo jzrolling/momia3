@@ -150,6 +150,53 @@ def test_prob_to_labels_empty_when_no_seeds() -> None:
     assert labels.max() == 0
 
 
+def test_prob_to_result_matches_labels_and_exposes_qc() -> None:
+    gt = _clean_frame(seed=8)["labels"][0]
+    prob = _synthetic_prob(gt)
+    params = seg.ProbToLabelsParams(
+        fg_erosion_radius=0,
+        min_seed_size=5,
+        seed_opening_radius=0,
+        min_cell_size=20,
+    )
+    result = seg.prob_to_result(prob, params)
+    np.testing.assert_array_equal(result.labels, seg.prob_to_labels(prob, params))
+    assert result.foreground.shape == gt.shape
+    assert result.distance is None
+    assert result.qc["backend"] == "probability"
+    assert result.qc["n_instances"] == int(gt.max())
+    assert result.qc["n_seeds"] >= result.qc["n_instances"]
+
+
+def test_cleanup_labels_shared_by_reconstruction_backends() -> None:
+    labels = np.zeros((24, 24), dtype=np.uint32)
+    labels[2:7, 2:7] = 4
+    labels[12:19, 12:19] = 9
+    labels[15, 15] = 0
+
+    cleaned = seg.cleanup_labels(labels, min_size=10, hole_size=5)
+    assert cleaned.dtype == np.uint32
+    assert int(cleaned.max()) == 2
+    assert cleaned[15, 15] == 2
+    assert np.array_equal(np.unique(cleaned), [0, 1, 2])
+
+    filtered = seg.cleanup_labels(labels, min_size=0, max_size=30)
+    assert int(filtered.max()) == 1
+    assert int((filtered > 0).sum()) == 25
+
+
+def test_cleanup_labels_hole_threshold_and_exterior() -> None:
+    labels = np.zeros((12, 12), dtype=np.uint32)
+    labels[1:11, 1:11] = 1
+    labels[5:7, 5:7] = 0
+    retained = seg.cleanup_labels(labels, hole_size=3)
+    filled = seg.cleanup_labels(labels, hole_size=5)
+    assert int((retained[5:7, 5:7] == 0).sum()) == 4
+    assert np.all(filled[5:7, 5:7] == 1)
+    assert int((filled > 0).sum()) == 100
+    assert int(filled[0, 0]) == 0
+
+
 # ---------------------------------------------------------------------------
 # compute_dist
 # ---------------------------------------------------------------------------
@@ -314,6 +361,21 @@ def test_declump_accepts_precomputed_dist() -> None:
     assert _match_recall(gt, out) >= 0.85
     with pytest.raises(ValueError, match="does not match"):
         seg.declump(gt > 0, dist[:-2, :-2])
+
+
+def test_declump_result_preserves_distance_and_fallback_qc() -> None:
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[10:30, 12:28] = _capsule(mask.shape, 20, 20, 0.2, 24, 3.5)[10:30, 12:28]
+    params = seg.DeclumpParams(threshold_abs=1e6, min_cell_size=5)
+    result = seg.declump_result(mask, params=params)
+
+    np.testing.assert_array_equal(result.labels, seg.declump(mask, params=params))
+    assert result.distance is not None
+    assert result.distance.shape == mask.shape
+    assert result.qc["backend"] == "distance"
+    assert result.qc["reconstruction"] == "connected_components"
+    assert result.qc["n_peaks"] == 0
+    assert result.qc["n_instances"] == 1
 
 
 # ---------------------------------------------------------------------------

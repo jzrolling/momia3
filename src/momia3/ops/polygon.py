@@ -27,7 +27,51 @@ __all__ = [
     "inside_polygon_numpy",
     "inside_polygon_pil",
     "polygon_grid_points",
+    "resample_closed_polygon",
+    "smooth_closed_polygon",
 ]
+
+
+def resample_closed_polygon(points: np.ndarray, n: int) -> np.ndarray:
+    """Resample a closed polygon to ``n`` points uniform in arc length."""
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2 or n < 2:
+        raise ValueError("expected (N, 2) polygon points with N >= 2 and n >= 2")
+    ring = np.vstack([points, points[:1]])
+    lengths = np.hypot(np.diff(ring[:, 0]), np.diff(ring[:, 1]))
+    distance = np.concatenate([[0.0], np.cumsum(lengths)])
+    if distance[-1] <= 0:
+        raise ValueError("polygon perimeter must be positive")
+    targets = np.linspace(0.0, distance[-1], int(n), endpoint=False)
+    x = np.interp(targets, distance, ring[:, 0])
+    y = np.interp(targets, distance, ring[:, 1])
+    return np.column_stack([x, y])
+
+
+def smooth_closed_polygon(
+    points: np.ndarray, smooth: float = 1.0, spacing: float = 1.0
+) -> np.ndarray:
+    """Smooth and arc-length resample a closed polygon with a cubic B-spline."""
+    points = np.asarray(points, dtype=np.float64)
+    if len(points) >= 2 and np.allclose(points[0], points[-1]):
+        points = points[:-1]
+    keep = np.concatenate([[True], np.any(np.diff(points, axis=0) != 0, axis=1)])
+    points = points[keep]
+    if len(points) < 3:
+        raise ValueError("at least three distinct polygon points are required")
+    perimeter = float(np.hypot(*np.diff(np.vstack([points, points[:1]]), axis=0).T).sum())
+    n = max(16, int(np.ceil(perimeter / spacing)))
+    points = resample_closed_polygon(points, n)
+    if smooth <= 0:
+        return points
+    from scipy import interpolate
+
+    tck, _ = interpolate.splprep(
+        [points[:, 0], points[:, 1]], s=float(smooth), per=1, k=3, quiet=1
+    )
+    u = np.linspace(0.0, 1.0, n, endpoint=False)
+    x, y = interpolate.splev(u, tck, der=0)
+    return np.column_stack([x, y])
 
 
 def inside_polygon_numpy(ring: np.ndarray, points: np.ndarray) -> np.ndarray:

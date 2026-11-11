@@ -1038,6 +1038,106 @@ def _raw_threshold_segment(inputs: dict[str, Any], params: BaseModel, ctx: StepC
     return {"mask": segment_ops.threshold_segment(inputs["image"], params)}
 
 
+class CleanupLabelsParams(BaseModel):
+    """Parameters of the shared ``segment.cleanup_labels`` op."""
+
+    min_size: int = Field(0, ge=0)
+    max_size: int | None = Field(None, ge=1)
+    hole_size: float = Field(0.0, ge=0.0, description="Hole limit as % of instance area")
+
+
+@register(
+    "segment.cleanup_labels",
+    params_model=CleanupLabelsParams,
+    inputs={"labels": "array"},
+    outputs={"labels": "array"},
+    shard="frame",
+    description="Filter, fill and sequentially renumber a 2D instance-label image.",
+    func=segment_ops.cleanup_labels,
+)
+def _raw_cleanup_labels(
+    inputs: dict[str, Any], params: CleanupLabelsParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    return {"labels": segment_ops.cleanup_labels(inputs["labels"], **params.model_dump())}
+
+
+class WatershedInstancesParams(BaseModel):
+    """Parameters of the shared ``segment.watershed_instances`` op."""
+
+    compactness: float = Field(0.0, ge=0.0)
+    watershed_line: bool = False
+    min_size: int = Field(0, ge=0)
+    max_size: int | None = Field(None, ge=1)
+
+
+@register(
+    "segment.watershed_instances",
+    params_model=WatershedInstancesParams,
+    inputs={"foreground": "array", "markers": "array", "elevation": "array"},
+    outputs={"labels": "array"},
+    shard="frame",
+    description="Shared marker-controlled watershed and instance cleanup.",
+    func=segment_ops.watershed_instances,
+)
+def _raw_watershed_instances(
+    inputs: dict[str, Any], params: WatershedInstancesParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    labels = segment_ops.watershed_instances(
+        inputs["foreground"],
+        inputs["markers"],
+        inputs["elevation"],
+        **params.model_dump(),
+    )
+    return {"labels": labels}
+
+
+@register(
+    "segment.prob_to_result",
+    params_model=segment_ops.ProbToLabelsParams,
+    inputs={"prob": "array"},
+    outputs={"labels": "array", "foreground": "array", "qc": "json"},
+    shard="frame",
+    description="Probability-map instance reconstruction with foreground and QC output.",
+    func=segment_ops.prob_to_result,
+)
+def _raw_prob_to_result(
+    inputs: dict[str, Any], params: BaseModel, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    result = segment_ops.prob_to_result(inputs["prob"], params)
+    return {
+        "labels": result.labels,
+        "foreground": result.foreground,
+        "qc": result.qc,
+    }
+
+
+@register(
+    "segment.declump_result",
+    params_model=segment_ops.DeclumpParams,
+    inputs={"mask": "array", "dist": "array?"},
+    outputs={"labels": "array", "foreground": "array", "distance": "array", "qc": "json"},
+    shard="frame",
+    description="Distance-watershed reconstruction with foreground, distance and QC output.",
+    func=segment_ops.declump_result,
+)
+def _raw_declump_result(
+    inputs: dict[str, Any], params: BaseModel, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    result = segment_ops.declump_result(
+        inputs["mask"], inputs.get("dist"), params=params
+    )
+    return {
+        "labels": result.labels,
+        "foreground": result.foreground,
+        "distance": result.distance,
+        "qc": result.qc,
+    }
+
+
 @register(
     "segment.prob_to_labels",
     params_model=segment_ops.ProbToLabelsParams,
@@ -1066,7 +1166,9 @@ def _raw_prob_to_labels(inputs: dict[str, Any], params: BaseModel, ctx: StepCont
 )
 def _raw_declump(inputs: dict[str, Any], params: BaseModel, ctx: StepContext) -> dict[str, Any]:
     del ctx
-    return {"labels": segment_ops.declump(inputs["mask"], inputs.get("dist"), params)}
+    return {
+        "labels": segment_ops.declump(inputs["mask"], inputs.get("dist"), params=params)
+    }
 
 
 class ComputeDistParams(BaseModel):

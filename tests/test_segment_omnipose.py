@@ -11,7 +11,7 @@ from momia3.pipeline import steps as pipeline_steps
 from momia3.pipeline.registry import StepContext
 from momia3.storage.zarr_store import ExperimentStore
 
-from momia3.ops.segment import OmniposeParams
+from momia3.ops.segment import OmniposeParams, SegmentationResult, Segmenter
 from momia3.pipeline.registry import REGISTRY
 from momia3.models.omnipose_lite import segmenter
 
@@ -21,7 +21,12 @@ def test_omnipose_params_defaults() -> None:
     assert params.weights_path is None
     assert params.device is None
     assert params.niter == 200
+    assert params.rescale == 1.0
+    assert params.resample is True
     assert params.mask_threshold == 0.0
+    assert params.flow_threshold == 0.0
+    assert params.return_flow is False
+    assert params.return_boundary is False
     assert params.diam_threshold == 12.0
     assert params.min_size == 15
     assert params.max_size is None
@@ -40,6 +45,44 @@ def test_segmenter_adapter_import_is_torch_free() -> None:
     # registry (params models) does not require the optional dependency.
     assert hasattr(segmenter, "omnipose_labels")
     assert callable(segmenter.resolve_device)
+
+
+def test_omnipose_adapter_uses_common_result(tmp_path) -> None:
+    weights = tmp_path / "weights"
+    weights.write_bytes(b"fake")
+
+    class FakeRunner:
+        def segment_result(self, image, **kwargs):
+            assert kwargs["niter"] == 7
+            assert kwargs["rescale"] == 0.5
+            assert kwargs["resample"] is False
+            assert kwargs["flow_threshold"] == 0.4
+            assert kwargs["return_flow"] is True
+            assert kwargs["return_boundary"] is True
+            labels = np.zeros(image.shape, dtype=np.uint32)
+            labels[4:8, 4:8] = 1
+            return SegmentationResult(
+                labels=labels,
+                foreground=labels > 0,
+                distance=np.ones(image.shape, dtype=np.float32),
+                qc={"backend": "omnipose", "n_instances": 1},
+            )
+
+    adapter = segmenter.OmniposeSegmenter(
+        OmniposeParams(
+            weights_path=str(weights), device="cpu", niter=7,
+            rescale=0.5, resample=False, flow_threshold=0.4,
+            return_flow=True, return_boundary=True,
+        )
+    )
+    adapter._runner = FakeRunner()
+    image = np.zeros((16, 16), dtype=np.float32)
+    result = adapter.predict(image)
+
+    assert isinstance(adapter, Segmenter)
+    assert isinstance(result, SegmentationResult)
+    assert result.qc["backend"] == "omnipose"
+    np.testing.assert_array_equal(adapter.predict_labels(image), result.labels)
 
 
 @pytest.mark.skipif(

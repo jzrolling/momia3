@@ -17,6 +17,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from momia3.models.omnipose_lite.weights import resolve_omnipose_weights
+from momia3.ops.segment import SegmentationResult
 
 __all__ = [
     "OmniposeSegmenter",
@@ -71,7 +72,12 @@ class OmniposeSegmenter:
         self.device = resolve_device(getattr(params, "device", None))
         self.half = bool(getattr(params, "half", False))
         self.niter = int(getattr(params, "niter", 200))
+        self.rescale = float(getattr(params, "rescale", 1.0))
+        self.resample = bool(getattr(params, "resample", True))
         self.mask_threshold = float(getattr(params, "mask_threshold", 0.0))
+        self.flow_threshold = float(getattr(params, "flow_threshold", 0.0))
+        self.return_flow = bool(getattr(params, "return_flow", False))
+        self.return_boundary = bool(getattr(params, "return_boundary", False))
         self.diam_threshold = float(getattr(params, "diam_threshold", 12.0))
         self.min_size = int(getattr(params, "min_size", 15))
         self.max_size = getattr(params, "max_size", None)
@@ -83,18 +89,31 @@ class OmniposeSegmenter:
             self._runner = _get_runner(self.weights_path, self.device, self.half)
         return self._runner
 
-    def predict_labels(self, image: np.ndarray) -> np.ndarray:
-        """Segment one 2D image and return uint32 instance labels."""
+    def predict(
+        self, image: np.ndarray, params: Any | None = None
+    ) -> SegmentationResult:
+        """Reconstruct one 2D image into the common segmentation result."""
+        if params is not None:
+            return OmniposeSegmenter(params).predict(image)
         runner = self._ensure_runner()
-        return runner.segment(
+        return runner.segment_result(
             np.asarray(image),
             niter=self.niter,
+            rescale=self.rescale,
+            resample=self.resample,
             mask_threshold=self.mask_threshold,
+            flow_threshold=self.flow_threshold,
+            return_flow=self.return_flow,
+            return_boundary=self.return_boundary,
             diam_threshold=self.diam_threshold,
             min_size=self.min_size,
             max_size=self.max_size,
             hole_size=self.hole_size,
         )
+
+    def predict_labels(self, image: np.ndarray) -> np.ndarray:
+        """Segment one 2D image and return uint32 instance labels."""
+        return self.predict(image).labels
 
 def omnipose_labels(image: np.ndarray, params: Any) -> np.ndarray:
     """One-shot segmentation: build/reuse the adapter and return labels."""

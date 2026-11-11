@@ -1,6 +1,6 @@
 # MOMIA3 架构规格文档
 
-**版本**：v0.1 · 2026-07-16
+**版本**：v0.1 · 2026-11-11
 **定位**：单细菌显微图像表征与谱系追踪平台 —— AI-ready、agent-native、GPU（PyTorch）加速
 **前身**：MOMIA2（`/Users/jzrolling/Desktop/Projects/Playground_kimi/momia2`，保留为只读参考实现，不再修改）
 **对标**：CellProfiler 4（模块协议/测量算子集）、MicrobeJ（细菌表征算子）、TrackMate/Mastodon（追踪与谱系图）、napari（GUI 生态）、OME-NGFF/Arrow（数据标准）
@@ -47,7 +47,8 @@ momia3/
 │   │   ├── characterize.py        # 坐标投影/生长动力学/群体结构
 │   │   └── track.py               # LAP 链接/间隙闭合/谱系/纠错
 │   ├── models/                    # 可选 AI 模型后端（torch 为可选依赖）
-│   │   └── omnipose_lite/         # FastOmnipose：参考 CPnet 权重 + 轻量编排
+│   │   ├── omnipose_lite/         # FastOmnipose：参考 CPnet 权重 + 轻量编排
+│   │   └── probability/           # U-Net/AttResUNet/CPnet 训练、ROI 数据与 DINOv3 实验
 │   ├── pipeline/
 │   │   ├── registry.py            # 工具注册表（pydantic schema → CLI/GUI/MCP）
 │   │   ├── engine.py              # JSON DAG 执行器（分片/并行/缓存/失效）
@@ -172,7 +173,7 @@ class Ops:                               # 需 GPU 的算子统一入口
 
 ### 4.2 segment.py
 - 传统：`threshold.{isodata,sauvola,local,composite}`（移植 momia2，纯函数化）。
-- AI：模型注册表协议 `Segmenter.predict(image, params) -> prob (c,y,x)`；实现 `omnipose`、`cellpose_sam`、`unet_torch`（旧 AttResUNet 权重可转）；后处理 `prob_to_labels`（seed/foreground/分水，移植 prediction2seed/foreground）。 omnipose 已由 momia3.models.omnipose_lite 接入（segment.omnipose / segment.omnipose_frame）；cellpose_sam、unet_torch 待实现。
+- AI：模型注册表协议 `Segmenter.predict(image, params) -> SegmentationResult(labels, foreground, distance, qc, flow?, boundary?)`；概率模型经 `prob_to_result` 重建，Omnipose 保留流场重建并返回同一结果类型。`watershed_instances` 与 `cleanup_labels` 是概率图、距离图和 Omnipose 的公共后处理；`prob_to_labels`、`declump` 保留仅返回标签的兼容接口。omnipose 已由 momia3.models.omnipose_lite 接入（segment.omnipose / segment.omnipose_frame）；momia3.models.probability 提供可训练的 U-Net / AttResUNet / 三通道 CPnet（支持官方权重兼容张量迁移）、OmniPose 掩码三通道目标生成、分组数据划分、同步增强、训练与验证评估，并通过 ProbabilitySegmenter 返回统一结果；另提供 ImageJ polygon ROI 转换/QC，以及 AttResUNet/CPnet 四通道 OmniPose 流场训练（官方目标生成、向量安全增强、4000 epoch）与 OmniPoseModelSegmenter；DINOv3 稠密特征与层级 decoder 为实验模块；cellpose_sam 待实现。
 
 ### 4.3 measure.py
 - `regionprops`：skimage `regionprops_table` 一次算清，只取 schema 声明列；加权取向矩（momia2 已实现，移植）；`intensity_stats` 向量化（`ndimage.sum_labels` 等，禁逐细胞 Python 循环）；`texture.haralick`、`texture.lbp`（新增，对标 CellProfiler MeasureTexture）。
@@ -199,7 +200,9 @@ class Ops:                               # 需 GPU 的算子统一入口
 ---
 
 ### 4.8 models/omnipose_lite
-- 参考 Omnipose CPnet 权重的轻量推理层（不做流可视化/boundary error 后处理；Euler 积分 torch 化），从 omni_lite 迁入。
+- 参考 Omnipose CPnet 权重的轻量推理层（不做 RGB 流可视化；Euler 积分 torch 化），从 omni_lite 迁入；CUDA 默认 BF16，保留 FP32 选项。
+- `rescale/resample` 支持原版尺度语义，输入缩放严格使用 SciPy 三次样条；`flow_threshold` 可选启用原版 flow-error QC，默认 0 关闭；`return_flow/return_boundary` 控制原始网络场输出。
+- 默认采用整图推理。原版 tiling/overlap 对照在当前 2048² 密集图像上无质量收益且增加耗时，因此不启用默认 tiling。
 - 权重不随仓库分发：resolve_omnipose_weights 按显式路径 → MOMIA3_OMNIPOSE_WEIGHTS → ~/.cellpose/models 解析。
 - torch/cellpose_omni 为可选依赖（pyproject extra: inference）；momia3 核心导入不加载 torch。
 

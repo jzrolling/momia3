@@ -1,7 +1,7 @@
 """Fast Omnipose inference pipeline (momia3.models.omnipose_lite).
 
 Lightweight orchestration around the reference Omnipose CPnet weights: no RGB
-flow rendering, no boundary/flow-error passes, torch-native Euler integration.
+flow rendering, optional upstream flow-error QC, torch-native Euler integration.
 The checkpoint is downloaded separately and resolved by
 momia3.models.omnipose_lite.weights.resolve_omnipose_weights; the model never
 ships inside this repository.
@@ -17,11 +17,10 @@ import torch.nn.functional as F
 from scipy import ndimage as ndi
 from skimage import measure
 
-import fastremap
-
 from cellpose_omni import resnet_torch
 
 from momia3.models.omnipose_lite.weights import resolve_omnipose_weights
+from momia3.ops.segment import SegmentationResult
 
 _CROSS4 = ndi.generate_binary_structure(2, 1)
 _SQUARE8 = ndi.generate_binary_structure(2, 2)
@@ -182,11 +181,21 @@ def border_band(shape):
     return band
 
 
+def _connected_components(mask: np.ndarray, connectivity: int):
+    try:
+        import cv2
+    except ImportError:
+        structure = _CROSS4 if connectivity == 4 else _SQUARE8
+        return ndi.label(mask, structure=structure)
+    n, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=connectivity)
+    return labels, n - 1
+
+
 def hysteresis_fast(dist: np.ndarray, low: float, high: float) -> np.ndarray:
     """Equivalent to skimage.filters.apply_hysteresis_threshold(dist, low, high)."""
     lowmask = dist >= low
     highmask = dist >= high
-    lab, n = ndi.label(lowmask, structure=ndi.generate_binary_structure(2, 1))
+    lab, n = _connected_components(lowmask, 4)
     keep = np.zeros(n + 1, dtype=bool)
     keep[lab[highmask]] = True
     return keep[lab]
@@ -234,61 +243,20 @@ def get_masks_fast(p, bd, dist, mask, inds, nclasses=4, cluster=False,
         if nclasses == mask.ndim + 2:
             border_px = border_px & ~(bd > -1)
         skelmask[band] = border_px[band]
-        labels = ndi.label(skelmask, structure=_SQUARE8)[0]
+        labels = _connected_components(skelmask, 8)[0]
         out[cell_px] = labels[new_px]
     return out
 
 
-def _fill_small_holes(msk: np.ndarray, hsz: float) -> np.ndarray:
-    """Exact port of skimage.morphology.remove_small_holes(msk, area_threshold=hsz).
-
-    skimage's implementation labels the complement (padded so the outside is one
-    large component), removes complement components with area < area_threshold,
-    and inverts back.
-    """
-    pad = np.pad(msk, 1, mode="constant")
-    holes = ~pad
-    lab, n = ndi.label(holes, structure=ndi.generate_binary_structure(2, 1))
-    sizes = np.bincount(lab.ravel(), minlength=n + 1)
-    # deprecated area_threshold -> new max_size = area_threshold - 1 (size <= max_size removed)
-    fill = sizes <= (hsz - 1)
-    fill[0] = False
-    out = pad | fill[lab]
-    return out[1:-1, 1:-1]
-
-
 def cleanup_fast(labels, min_size=15, max_size=None, hole_size=3, dim=2):
-    """Port of omnipose.core.fill_holes_and_remove_small_masks without ncolor."""
-    labels = np.asarray(labels)
-    if labels.dtype != np.int32:
-        labels = labels.astype(np.int32, copy=False)
-    out = np.zeros(labels.shape, dtype=np.int32)
-    ncomp = int(labels.max()) if labels.size else 0
-    if ncomp == 0:
-        return out, 0
-    areas = np.bincount(labels.ravel(), minlength=ncomp + 1)
-    slices = ndi.find_objects(labels)
-    j = 0
-    fill_holes = hole_size > 0
-    for i, slc in enumerate(slices):
-        if slc is None:
-            continue
-        npix = int(areas[i + 1])
-        if npix == 0:
-            continue
-        too_small = npix < min_size
-        too_big = False if max_size is None else npix > max_size
-        if (min_size > 0) and (too_small or too_big):
-            continue
-        sub = out[slc]
-        hsz = npix * hole_size / 100.0 if fill_holes else 0.0
-        if hsz >= 1.0:
-            msk = _fill_small_holes(labels[slc] == (i + 1), hsz)
-            sub[msk] = j + 1
-        else:
-            sub[labels[slc] == (i + 1)] = j + 1
-        j += 1
-    return out, j
+    """Compatibility wrapper around the shared instance cleanup operator."""
+    del dim
+    from momia3.ops.segment import cleanup_labels
+
+    out = cleanup_labels(
+        labels, min_size=min_size, max_size=max_size, hole_size=hole_size
+    )
+    return out.astype(np.int32, copy=False), int(out.max())
 
 
 @torch.no_grad()
@@ -315,10 +283,65 @@ class StageTimings:
         self.totals.clear()
 
 
+def _rescaled_shape(shape, rescale: float) -> tuple[int, int]:
+    if not np.isfinite(rescale) or rescale <= 0:
+        raise ValueError("rescale must be a positive finite number")
+    return tuple(max(1, int(round(int(size) * rescale))) for size in shape)
+
+
+def _resize_tensor(x: torch.Tensor, shape, mode: str) -> torch.Tensor:
+    kwargs = {"align_corners": True} if mode in {"bilinear", "bicubic"} else {}
+    return F.interpolate(x, size=shape, mode=mode, **kwargs)
+
+
+def _resize_array(x: np.ndarray, shape, mode: str) -> np.ndarray:
+    if x.shape[-2:] == tuple(shape):
+        return x
+    t = torch.from_numpy(np.ascontiguousarray(x)).reshape(1, -1, *x.shape[-2:])
+    if np.issubdtype(x.dtype, np.integer) or x.dtype == np.bool_:
+        t = t.float()
+    y = _resize_tensor(t, shape, mode)[0].numpy()
+    y = y.reshape(*x.shape[:-2], *shape)
+    return y.astype(x.dtype, copy=False)
+
+
+def _scale_input(ch0: torch.Tensor, rescale: float):
+    output_shape = tuple(ch0.shape)
+    prediction_shape = _rescaled_shape(output_shape, rescale)
+    if prediction_shape != output_shape:
+        scaled = ndi.zoom(ch0.detach().cpu().numpy(), rescale, order=3)
+        ch0 = torch.as_tensor(scaled, device=ch0.device, dtype=ch0.dtype)
+        prediction_shape = tuple(ch0.shape)
+    return ch0, output_shape, prediction_shape
+
+
+def _requested_outputs(dP, bd, output_shape, resample, return_flow, return_boundary):
+    flow = dP.float().cpu().numpy() if return_flow else None
+    boundary = bd.float().cpu().numpy() if return_boundary else None
+    if not resample:
+        if flow is not None:
+            flow = _resize_array(flow, output_shape, "bilinear")
+        if boundary is not None:
+            boundary = _resize_array(boundary, output_shape, "bilinear")
+    return flow, boundary
+
+
+def _apply_flow_threshold(labels, dP, coords, threshold, device):
+    from omnipose.core import remove_bad_flow_masks
+
+    before = int(np.count_nonzero(np.unique(labels)))
+    labels = remove_bad_flow_masks(
+        labels.copy(), dP, coords=coords, threshold=threshold,
+        use_gpu=device.type == "cuda", device=device, omni=True,
+    )
+    after = int(np.count_nonzero(np.unique(labels)))
+    return labels, before - after
+
+
 class FastOmnipose:
     """P1 pipeline: reference weights, GPU pre/post processing, no rendering."""
 
-    def __init__(self, weights_path=None, device="cuda", half: bool = False, runner=None):
+    def __init__(self, weights_path=None, device="cuda", half: bool = True, runner=None):
         self.device = torch.device(device)
         if runner is not None:
             self.runner = runner
@@ -333,42 +356,56 @@ class FastOmnipose:
         if self.device.type == "cuda":
             torch.cuda.synchronize()
 
-    def _gpu_stages(self, img, niter, mask_threshold, diam_threshold):
+    def _gpu_stages(self, img, niter, mask_threshold, rescale, resample,
+                    flow_threshold):
         """Preprocess + network + threshold + div/euler; returns CPU-ready state."""
         ch0 = img_to_gpu_channel(img, self.device)
+        ch0, output_shape, prediction_shape = _scale_input(ch0, rescale)
         y = self.runner.run_gpu(ch0)
+        if resample and prediction_shape != output_shape:
+            y = _resize_tensor(y[None], output_shape, "bilinear")[0]
         self._sync()
         dist = y[2]
         bd = y[3]
         dist_np = dist.float().cpu().numpy()
         iscell_np = hysteresis_fast(dist_np, mask_threshold - 1.0, mask_threshold)
         if not bool(np.any(iscell_np)):
-            return None, dist_np.shape
+            return None, output_shape
         coords = np.array(np.nonzero(iscell_np)).astype(np.int32)
         iscell_t = torch.from_numpy(iscell_np).to(self.device)
-        flow = div_rescale_gpu(y[:2], iscell_t)
+        flow = div_rescale_gpu(y[:2], iscell_t) / rescale
         yf, xf = euler_final_coords(flow, coords, niter=niter, suppress=True)
         bd_np = bd.float().cpu().numpy()
+        dP_np = y[:2].float().cpu().numpy() if flow_threshold > 0 else None
         newinds = np.stack([yf, xf], axis=1)
-        return (dist_np, iscell_np, coords, newinds, bd_np), dist_np.shape
+        state = (dist_np, iscell_np, coords, newinds, bd_np, dP_np)
+        return state, output_shape
 
     @staticmethod
-    def _cpu_finish(state, shape, nclasses, diam_threshold, min_size, max_size, hole_size):
+    def _cpu_finish(state, shape, nclasses, diam_threshold, min_size, max_size,
+                    hole_size, resample, flow_threshold, device):
         if state is None:
             return np.zeros(shape, dtype=np.uint32)
-        dist_np, iscell_np, coords, newinds, bd_np = state
+        dist_np, iscell_np, coords, newinds, bd_np, dP_np = state
         labels = get_masks_fast(None, bd_np, dist_np, iscell_np, coords, nclasses,
                                 cluster=False, diam_threshold=diam_threshold,
                                 newinds=newinds)
+        if flow_threshold > 0:
+            labels, _ = _apply_flow_threshold(
+                labels, dP_np, coords, flow_threshold, device
+            )
         labels, _n = cleanup_fast(labels, min_size=min_size, max_size=max_size,
                                   hole_size=hole_size, dim=2)
-        labels = (labels * iscell_np).astype(np.uint32)
-        fastremap.renumber(labels, in_place=True)
-        return labels.astype(np.uint32)
+        labels *= iscell_np
+        labels = labels.astype(np.uint32)
+        if not resample:
+            labels = _resize_array(labels, shape, "nearest")
+        return labels
 
     def segment_batch(self, images, niter: int = 40, mask_threshold: float = 0.0,
                       diam_threshold: float = 12.0, min_size: int = 15,
-                      max_size=None, hole_size: int = 3):
+                      max_size=None, hole_size: int = 3, rescale: float = 1.0,
+                      resample: bool = True, flow_threshold: float = 0.0):
         """Process many images, overlapping CPU post-processing with GPU work.
 
         GPU stages run on the calling thread; mask reconstruction / cleanup runs
@@ -380,14 +417,17 @@ class FastOmnipose:
         futs = []
         try:
             for img in images:
-                state, shape = self._gpu_stages(img, niter, mask_threshold, diam_threshold)
+                state, shape = self._gpu_stages(
+                    img, niter, mask_threshold, rescale, resample, flow_threshold
+                )
                 futs.append(ex.submit(self._cpu_finish, state, shape, self.nclasses,
-                                      diam_threshold, min_size, max_size, hole_size))
+                                      diam_threshold, min_size, max_size, hole_size,
+                                      resample, flow_threshold, self.device))
             return [f.result() for f in futs]
         finally:
             ex.shutdown()
 
-    def segment(
+    def segment_result(
         self,
         img: np.ndarray,
         niter: int = 200,
@@ -396,14 +436,23 @@ class FastOmnipose:
         min_size: int = 15,
         max_size=None,
         hole_size: int = 3,
-    ) -> np.ndarray:
+        rescale: float = 1.0,
+        resample: bool = True,
+        flow_threshold: float = 0.0,
+        return_flow: bool = False,
+        return_boundary: bool = False,
+    ) -> SegmentationResult:
+        """Run flow-field reconstruction and retain foreground/distance QC data."""
         T = self.timings
         t0 = time.perf_counter()
         ch0 = img_to_gpu_channel(img, self.device)
+        ch0, output_shape, prediction_shape = _scale_input(ch0, rescale)
         T.add("preprocess", time.perf_counter() - t0)
 
         t0 = time.perf_counter()
         y = self.runner.run_gpu(ch0)
+        if resample and prediction_shape != output_shape:
+            y = _resize_tensor(y[None], output_shape, "bilinear")[0]
         self._sync()
         T.add("network", time.perf_counter() - t0)
         dP = y[:2]
@@ -414,13 +463,35 @@ class FastOmnipose:
         dist_np = dist.float().cpu().numpy()
         iscell_np = hysteresis_fast(dist_np, mask_threshold - 1.0, mask_threshold)
         T.add("threshold", time.perf_counter() - t0)
+        qc = {
+            "backend": "omnipose",
+            "rescale": float(rescale),
+            "resample": bool(resample),
+            "flow_threshold": float(flow_threshold),
+            "prediction_shape": list(prediction_shape),
+        }
+        flow_out, boundary_out = _requested_outputs(
+            dP, bd, output_shape, resample, return_flow, return_boundary
+        )
         if not bool(np.any(iscell_np)):
-            return np.zeros(dist_np.shape, dtype=np.uint32)
+            foreground = iscell_np
+            if not resample:
+                foreground = _resize_array(foreground, output_shape, "nearest")
+                dist_np = _resize_array(dist_np, output_shape, "bilinear")
+            return SegmentationResult(
+                labels=np.zeros(output_shape, dtype=np.uint32),
+                foreground=foreground,
+                distance=dist_np,
+                flow=flow_out,
+                boundary=boundary_out,
+                qc={**qc, "foreground_pixels": int(foreground.sum()),
+                    "flow_rejected": 0, "n_instances": 0},
+            )
 
         t0 = time.perf_counter()
         coords = np.array(np.nonzero(iscell_np)).astype(np.int32)
         iscell_t = torch.from_numpy(iscell_np).to(self.device)
-        flow = div_rescale_gpu(dP, iscell_t)
+        flow = div_rescale_gpu(dP, iscell_t) / rescale
         T.add("div_rescale", time.perf_counter() - t0)
 
         t0 = time.perf_counter()
@@ -436,14 +507,61 @@ class FastOmnipose:
         )
         T.add("get_masks", time.perf_counter() - t0)
 
+        flow_rejected = 0
+        if flow_threshold > 0:
+            t0 = time.perf_counter()
+            labels, flow_rejected = _apply_flow_threshold(
+                labels, dP.float().cpu().numpy(), coords, flow_threshold, self.device
+            )
+            T.add("flow_qc", time.perf_counter() - t0)
+
         t0 = time.perf_counter()
         labels, _n = cleanup_fast(
             labels, min_size=min_size, max_size=max_size, hole_size=hole_size, dim=2
         )
-        labels = (labels * iscell_np).astype(np.uint32)
-        fastremap.renumber(labels, in_place=True)
+        labels *= iscell_np
+        foreground = iscell_np
+        if not resample:
+            labels = _resize_array(labels.astype(np.uint32), output_shape, "nearest")
+            foreground = _resize_array(foreground, output_shape, "nearest")
+            dist_np = _resize_array(dist_np, output_shape, "bilinear")
         T.add("cleanup", time.perf_counter() - t0)
-        return labels.astype(np.uint32)
+        return SegmentationResult(
+            labels=labels,
+            foreground=foreground,
+            distance=dist_np,
+            flow=flow_out,
+            boundary=boundary_out,
+            qc={**qc, "foreground_pixels": int(foreground.sum()),
+                "flow_rejected": flow_rejected, "n_instances": int(labels.max())},
+        )
+
+    def segment(
+        self,
+        img: np.ndarray,
+        niter: int = 200,
+        mask_threshold: float = 0.0,
+        diam_threshold: float = 12.0,
+        min_size: int = 15,
+        max_size=None,
+        hole_size: int = 3,
+        rescale: float = 1.0,
+        resample: bool = True,
+        flow_threshold: float = 0.0,
+    ) -> np.ndarray:
+        """Return only the labels of :meth:`segment_result` for compatibility."""
+        return self.segment_result(
+            img,
+            niter=niter,
+            mask_threshold=mask_threshold,
+            diam_threshold=diam_threshold,
+            min_size=min_size,
+            max_size=max_size,
+            hole_size=hole_size,
+            rescale=rescale,
+            resample=resample,
+            flow_threshold=flow_threshold,
+        ).labels
 
 
 # Preferred public name of the backend; FastOmnipose is kept as an alias.

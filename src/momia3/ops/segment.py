@@ -20,11 +20,65 @@ from dataclasses import dataclass, field
 from typing import Callable, Literal, Protocol, Union, runtime_checkable
 
 import numpy as np
+from numba import njit
 from pydantic import BaseModel, Field
 from scipy import ndimage
 from skimage import feature, filters, measure, morphology, segmentation
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SegmentationResult:
+    """Backend-independent instance reconstruction output.
+
+    ``foreground`` is the predicted foreground before instance cleanup, while
+    ``labels`` contains the final sequential instance IDs. ``distance`` is
+    populated by distance-based backends and is ``None`` for three-class
+    probability maps. Omnipose can additionally return raw ``flow`` and
+    ``boundary`` arrays. ``qc`` contains JSON-safe scalar diagnostics.
+    """
+
+    labels: np.ndarray
+    foreground: np.ndarray
+    distance: np.ndarray | None = None
+    qc: dict[str, str | int | float | bool] = field(default_factory=dict)
+    flow: np.ndarray | None = None
+    boundary: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        labels = np.asarray(self.labels)
+        foreground = np.asarray(self.foreground)
+        if labels.ndim != 2:
+            raise ValueError(f"labels must be 2D, got {labels.shape}")
+        if foreground.shape != labels.shape:
+            raise ValueError(
+                f"foreground shape {foreground.shape} does not match labels {labels.shape}"
+            )
+        self.labels = labels.astype(np.uint32, copy=False)
+        self.foreground = foreground.astype(bool, copy=False)
+        if self.distance is not None:
+            distance = np.asarray(self.distance)
+            if distance.shape != labels.shape:
+                raise ValueError(
+                    f"distance shape {distance.shape} does not match labels {labels.shape}"
+                )
+            self.distance = distance.astype(np.float32, copy=False)
+        if self.flow is not None:
+            flow = np.asarray(self.flow)
+            if flow.shape != (2, *labels.shape):
+                raise ValueError(
+                    f"flow shape {flow.shape} does not match labels {labels.shape}"
+                )
+            self.flow = flow.astype(np.float32, copy=False)
+        if self.boundary is not None:
+            boundary = np.asarray(self.boundary)
+            if boundary.shape != labels.shape:
+                raise ValueError(
+                    f"boundary shape {boundary.shape} does not match labels {labels.shape}"
+                )
+            self.boundary = boundary.astype(np.float32, copy=False)
+        self.qc = dict(self.qc)
 
 
 def _remove_small(mask: np.ndarray, min_size: int) -> np.ndarray:
@@ -42,12 +96,17 @@ __all__ = [
     "OmniposeParams",
     "ProbToLabelsParams",
     "DeclumpParams",
+    "SegmentationResult",
     "Segmenter",
     "SEGMENTERS",
     "PatchGrid",
     "threshold_segment",
+    "cleanup_labels",
+    "watershed_instances",
+    "prob_to_result",
     "prob_to_labels",
     "compute_dist",
+    "declump_result",
     "declump",
     "register_segmenter",
     "get_segmenter",
@@ -116,12 +175,23 @@ class OmniposeParams(BaseModel):
         None, description="torch device (cuda/mps/cpu); None picks the best available"
     )
     half: bool = Field(
-        False, description="CUDA bf16 autocast (fp16 overflows in CPnet)"
+        True, description="CUDA bf16 autocast (fp16 overflows in CPnet)"
     )
     niter: int = Field(200, ge=1, description="Euler integration iterations")
+    rescale: float = Field(
+        1.0, gt=0, description="Input scale; diam_mean / actual cell diameter"
+    )
+    resample: bool = Field(
+        True, description="Restore network outputs to native size before dynamics"
+    )
     mask_threshold: float = Field(
         0.0, description="Cell-mask threshold on the distance channel"
     )
+    flow_threshold: float = Field(
+        0.0, ge=0, description="Reject masks above this flow error; 0 disables QC"
+    )
+    return_flow: bool = Field(False, description="Return the raw two-channel network flow")
+    return_boundary: bool = Field(False, description="Return the raw network boundary")
     diam_threshold: float = Field(
         12.0, gt=0, description="Mask-reconstruction diameter threshold (px)"
     )
@@ -228,6 +298,170 @@ def threshold_segment(
 
 
 # ---------------------------------------------------------------------------
+# Shared instance reconstruction and cleanup
+# ---------------------------------------------------------------------------
+
+
+@njit(cache=True)
+def _fill_small_holes_compiled(mask: np.ndarray, hole_size: float) -> np.ndarray:
+    h, w = mask.shape
+    visited = mask.copy()
+    stack_y = np.empty(h * w, dtype=np.int32)
+    stack_x = np.empty(h * w, dtype=np.int32)
+    component_y = np.empty(h * w, dtype=np.int32)
+    component_x = np.empty(h * w, dtype=np.int32)
+    top = 0
+    for y in range(h):
+        for x in (0, w - 1):
+            if not visited[y, x]:
+                visited[y, x] = True
+                stack_y[top] = y
+                stack_x[top] = x
+                top += 1
+    for x in range(w):
+        for y in (0, h - 1):
+            if not visited[y, x]:
+                visited[y, x] = True
+                stack_y[top] = y
+                stack_x[top] = x
+                top += 1
+    while top:
+        top -= 1
+        y = stack_y[top]
+        x = stack_x[top]
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            yy = y + dy
+            xx = x + dx
+            if 0 <= yy < h and 0 <= xx < w and not visited[yy, xx]:
+                visited[yy, xx] = True
+                stack_y[top] = yy
+                stack_x[top] = xx
+                top += 1
+    filled = mask.copy()
+    for y in range(h):
+        for x in range(w):
+            if visited[y, x]:
+                continue
+            top = 0
+            count = 0
+            visited[y, x] = True
+            stack_y[top] = y
+            stack_x[top] = x
+            top += 1
+            while top:
+                top -= 1
+                yy = stack_y[top]
+                xx = stack_x[top]
+                component_y[count] = yy
+                component_x[count] = xx
+                count += 1
+                for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    yyy = yy + dy
+                    xxx = xx + dx
+                    if 0 <= yyy < h and 0 <= xxx < w and not visited[yyy, xxx]:
+                        visited[yyy, xxx] = True
+                        stack_y[top] = yyy
+                        stack_x[top] = xxx
+                        top += 1
+            if count < hole_size:
+                for index in range(count):
+                    filled[component_y[index], component_x[index]] = True
+    return filled
+
+
+def _fill_small_holes(mask: np.ndarray, hole_size: float) -> np.ndarray:
+    """Fill enclosed background components smaller than ``hole_size`` pixels."""
+    return _fill_small_holes_compiled(np.asarray(mask, dtype=bool), float(hole_size))
+
+
+def cleanup_labels(
+    labels: np.ndarray,
+    min_size: int = 0,
+    max_size: int | None = None,
+    hole_size: float = 0.0,
+) -> np.ndarray:
+    """Filter, fill and sequentially renumber a 2D instance-label image.
+
+    ``hole_size`` is a percentage of each instance's area, matching Omnipose;
+    zero disables hole filling. Size limits are expressed in pixels.
+    """
+    if min_size < 0:
+        raise ValueError("min_size must be >= 0")
+    if max_size is not None and max_size < 1:
+        raise ValueError("max_size must be >= 1 or None")
+    if hole_size < 0:
+        raise ValueError("hole_size must be >= 0")
+    source = np.asarray(labels)
+    if source.ndim != 2:
+        raise ValueError(f"cleanup_labels expects a 2D label image, got {source.shape}")
+    if np.any(source < 0):
+        raise ValueError("cleanup_labels expects non-negative labels")
+    source = source.astype(np.uint32, copy=False)
+    out = np.zeros(source.shape, dtype=np.uint32)
+    n_input = int(source.max()) if source.size else 0
+    if n_input == 0:
+        return out
+
+    areas = np.bincount(source.ravel(), minlength=n_input + 1)
+    if hole_size == 0 or float(areas.max()) * hole_size < 100.0:
+        keep = (areas >= min_size) & (areas > 0)
+        keep[0] = False
+        if max_size is not None:
+            keep &= areas <= max_size
+        mapping = np.cumsum(keep, dtype=np.uint32)
+        mapping[~keep] = 0
+        return mapping[source]
+    slices = ndimage.find_objects(source)
+    next_id = 0
+    for label_id, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        area = int(areas[label_id])
+        if area < min_size or (max_size is not None and area > max_size):
+            continue
+        mask = source[sl] == label_id
+        fill = area * hole_size / 100.0
+        if fill >= 1.0:
+            mask = _fill_small_holes(mask, fill)
+        next_id += 1
+        out[sl][mask] = next_id
+    return out
+
+
+def watershed_instances(
+    foreground: np.ndarray,
+    markers: np.ndarray,
+    elevation: np.ndarray,
+    *,
+    compactness: float = 0.0,
+    watershed_line: bool = False,
+    min_size: int = 0,
+    max_size: int | None = None,
+) -> np.ndarray:
+    """Shared marker-controlled watershed followed by instance cleanup."""
+    foreground = np.asarray(foreground, dtype=bool)
+    markers = np.asarray(markers)
+    elevation = np.asarray(elevation, dtype=np.float32)
+    if foreground.ndim != 2:
+        raise ValueError(f"foreground must be 2D, got {foreground.shape}")
+    if markers.shape != foreground.shape or elevation.shape != foreground.shape:
+        raise ValueError(
+            "foreground, markers and elevation must have identical shapes; got "
+            f"{foreground.shape}, {markers.shape}, {elevation.shape}"
+        )
+    if int(markers.max()) == 0:
+        return np.zeros(foreground.shape, dtype=np.uint32)
+    labels = segmentation.watershed(
+        elevation,
+        markers=markers,
+        mask=foreground,
+        compactness=compactness,
+        watershed_line=watershed_line,
+    )
+    return cleanup_labels(labels, min_size=min_size, max_size=max_size)
+
+
+# ---------------------------------------------------------------------------
 # Probability-map post-processing (ported from momia2/segment/_helper.py)
 # ---------------------------------------------------------------------------
 
@@ -294,40 +528,19 @@ def _extract_seeds(prob: np.ndarray, params: ProbToLabelsParams) -> np.ndarray:
     return markers
 
 
-def prob_to_labels(
+def prob_to_result(
     prob: np.ndarray, params: ProbToLabelsParams | None = None
-) -> np.ndarray:
-    """Instance labels from a 3-class probability map ``(c, y, x)``.
+) -> SegmentationResult:
+    """Reconstruct instances from a three-class probability map.
 
-    Ports momia2's ``prediction2foreground`` + ``prediction2seed`` +
-    marker-controlled watershed:
-
-    1. Foreground = background probability below ``fg_threshold``
-       (optionally eroded, as in ``prediction2foreground``).
-    2. Seeds = interior probability above a threshold ladder, excluding
-       high edge-probability pixels (as in ``prediction2seed``), with
-       opening and small-component removal.
-    3. Marker-controlled watershed on ``1 - interior probability`` inside
-       the foreground mask.
-    4. Instances smaller than ``min_cell_size`` are removed and labels are
-       relabeled sequentially.
-
-    Parameters
-    ----------
-    prob : numpy.ndarray
-        Probability map of shape ``(c, y, x)``, ``c >= 3``.
-    params : ProbToLabelsParams, optional
-        Thresholds and morphology parameters.
-
-    Returns
-    -------
-    numpy.ndarray
-        Instance labels, uint32, shape ``(y, x)``; 0 is background.
+    Foreground comes from the background channel, hierarchical interior seeds
+    exclude high-edge pixels, and shared watershed reconstruction grows the
+    seeds on ``1 - interior_probability`` inside the foreground mask.
     """
     params = params or ProbToLabelsParams()
     prob = np.asarray(prob, dtype=np.float32)
     if prob.ndim != 3:
-        raise ValueError(f"prob_to_labels expects (c, y, x), got {prob.shape}")
+        raise ValueError(f"prob_to_result expects (c, y, x), got {prob.shape}")
     n_channels = prob.shape[0]
     for name, ch in (
         ("bg_channel", params.bg_channel),
@@ -343,23 +556,41 @@ def prob_to_labels(
             foreground, morphology.disk(params.fg_erosion_radius)
         )
     markers = _extract_seeds(prob, params)
-    if int(markers.max()) == 0:
-        logger.warning("prob_to_labels: no seeds found; returning empty labels")
-        return np.zeros(prob.shape[1:], dtype=np.uint32)
+    n_seeds = int(markers.max())
+    qc = {
+        "backend": "probability",
+        "n_seeds": n_seeds,
+        "foreground_pixels": int(foreground.sum()),
+    }
+    if n_seeds == 0:
+        logger.warning("prob_to_result: no seeds found; returning empty labels")
+        return SegmentationResult(
+            labels=np.zeros(prob.shape[1:], dtype=np.uint32),
+            foreground=foreground,
+            qc={**qc, "n_instances": 0},
+        )
 
-    elevation = 1.0 - prob[params.seed_channel]
-    labels = segmentation.watershed(
-        elevation,
-        markers=markers,
-        mask=foreground,
+    labels = watershed_instances(
+        foreground,
+        markers,
+        1.0 - prob[params.seed_channel],
         compactness=params.compactness,
         watershed_line=params.watershed_line,
+        min_size=params.min_cell_size,
     )
-    if params.min_cell_size > 0:
-        labels = _remove_small(labels, params.min_cell_size)
-    labels, _, _ = segmentation.relabel_sequential(labels)
-    logger.debug("prob_to_labels: %d instance(s)", int(labels.max()))
-    return labels.astype(np.uint32)
+    logger.debug("prob_to_result: %d instance(s)", int(labels.max()))
+    return SegmentationResult(
+        labels=labels,
+        foreground=foreground,
+        qc={**qc, "n_instances": int(labels.max())},
+    )
+
+
+def prob_to_labels(
+    prob: np.ndarray, params: ProbToLabelsParams | None = None
+) -> np.ndarray:
+    """Return only the labels of :func:`prob_to_result` for compatibility."""
+    return prob_to_result(prob, params).labels
 
 
 # ---------------------------------------------------------------------------
@@ -476,66 +707,46 @@ class DeclumpParams(BaseModel):
     )
 
 
-def declump(
+def declump_result(
     mask: np.ndarray,
     dist: np.ndarray | None = None,
     *,
     params: DeclumpParams | None = None,
-) -> np.ndarray:
-    """Split merged foreground blobs into per-cell instances.
+) -> SegmentationResult:
+    """Split merged foreground blobs using distance-peak watershed.
 
-    Distance-transform declumping for crowded fields where plain connected
-    components fuse touching cells into one blob (recall collapse):
-
-    1. Distance map: Euclidean distance transform of the foreground, or
-       the caller-provided ``dist`` (e.g. an AI segmenter's distance head
-       or :func:`compute_dist` output).
-    2. Seeds: :func:`skimage.feature.peak_local_max` on the distance map
-       (``min_distance`` / ``threshold_abs`` / optional disk footprint).
-    3. Marker-controlled watershed on ``-dist``, restricted to the
-       foreground mask.
-    4. Instances smaller than ``min_cell_size`` are removed and labels are
-       relabeled sequentially.
-
-    Robustness fallback: if no seed peak survives the thresholds (e.g.
-    very small or flat objects), the foreground's plain connected
-    components are returned instead of an empty image, so declumping never
-    loses cells relative to connected-component labeling.
-
-    Parameters
-    ----------
-    mask : numpy.ndarray
-        2D boolean foreground mask, or a 2D label image (any nonzero pixel
-        counts as foreground; input labels are ignored — the point of
-        declumping is to re-split merged components).
-    dist : numpy.ndarray, optional
-        Precomputed 2D distance map aligned with ``mask``; when omitted,
-        the EDT of the foreground is computed internally.
-    params : DeclumpParams, optional
-        Seed and watershed parameters.
-
-    Returns
-    -------
-    numpy.ndarray
-        Instance labels, uint32, shape ``(y, x)``; 0 is background.
+    A caller-provided distance map is used unchanged; otherwise the Euclidean
+    distance transform of the foreground is computed. If no seed survives,
+    connected components provide the fallback instead of dropping the blob.
     """
     params = params or DeclumpParams()
     mask = np.asarray(mask)
     if mask.ndim != 2:
-        raise ValueError(f"declump expects a 2D mask/label image, got {mask.shape}")
+        raise ValueError(f"declump_result expects a 2D mask/label image, got {mask.shape}")
     foreground = mask > 0
-    if not bool(foreground.any()):
-        logger.warning("declump: empty foreground; returning empty labels")
-        return np.zeros(mask.shape, dtype=np.uint32)
-
     if dist is None:
-        dist = ndimage.distance_transform_edt(foreground)
+        distance = ndimage.distance_transform_edt(foreground).astype(np.float32)
     else:
-        dist = np.asarray(dist, dtype=np.float32)
-        if dist.shape != foreground.shape:
+        distance = np.asarray(dist, dtype=np.float32)
+        if distance.shape != foreground.shape:
             raise ValueError(
-                f"declump: dist shape {dist.shape} does not match mask {foreground.shape}"
+                f"declump_result: dist shape {distance.shape} does not match "
+                f"mask {foreground.shape}"
             )
+
+    qc = {
+        "backend": "distance",
+        "n_peaks": 0,
+        "foreground_pixels": int(foreground.sum()),
+    }
+    if not bool(foreground.any()):
+        logger.warning("declump_result: empty foreground; returning empty labels")
+        return SegmentationResult(
+            labels=np.zeros(mask.shape, dtype=np.uint32),
+            foreground=foreground,
+            distance=distance,
+            qc={**qc, "reconstruction": "empty", "n_instances": 0},
+        )
 
     footprint = (
         morphology.disk(params.footprint_radius)
@@ -543,14 +754,11 @@ def declump(
         else None
     )
     peak_map = (
-        ndimage.gaussian_filter(dist, params.smooth_sigma)
+        ndimage.gaussian_filter(distance, params.smooth_sigma)
         if params.smooth_sigma > 0
-        else dist
+        else distance
     )
     if params.h_maxima is not None and params.h_maxima > 0:
-        # h_maxima returns a binary mask of maxima with prominence >= h;
-        # gate the (smoothed) map with it so secondary ridge bumps never
-        # reach peak_local_max, while surviving maxima keep their heights.
         prominent = morphology.h_maxima(peak_map, params.h_maxima)
         peak_map = np.where(prominent, peak_map, 0.0)
     coords = feature.peak_local_max(
@@ -560,51 +768,71 @@ def declump(
         exclude_border=params.exclude_border,
         footprint=footprint,
     )
+    qc["n_peaks"] = int(coords.shape[0])
 
     if coords.shape[0] == 0:
         logger.warning(
-            "declump: no seed peaks (threshold_abs=%s); falling back to "
+            "declump_result: no seed peaks (threshold_abs=%s); falling back to "
             "connected components",
             params.threshold_abs,
         )
         labels = measure.label(foreground)
+        reconstruction = "connected_components"
     else:
         seed_mask = np.zeros(foreground.shape, dtype=bool)
         seed_mask[coords[:, 0], coords[:, 1]] = True
-        # Thicken single-pixel peaks to 3x3 crosses (merged when adjacent).
         seed_mask = morphology.dilation(seed_mask)
         markers = measure.label(seed_mask)
-        labels = segmentation.watershed(
-            -dist,
-            markers=markers,
-            mask=foreground,
+        labels = watershed_instances(
+            foreground,
+            markers,
+            -distance,
             compactness=params.compactness,
             watershed_line=params.watershed_line,
         )
+        reconstruction = "watershed"
 
-    if params.min_cell_size > 0:
-        labels = _remove_small(labels, params.min_cell_size)
-    labels, _, _ = segmentation.relabel_sequential(labels)
-    logger.debug("declump: %d instance(s)", int(labels.max()))
-    return labels.astype(np.uint32)
+    labels = cleanup_labels(labels, min_size=params.min_cell_size)
+    logger.debug("declump_result: %d instance(s)", int(labels.max()))
+    return SegmentationResult(
+        labels=labels,
+        foreground=foreground,
+        distance=distance,
+        qc={
+            **qc,
+            "reconstruction": reconstruction,
+            "n_instances": int(labels.max()),
+        },
+    )
+
+
+def declump(
+    mask: np.ndarray,
+    dist: np.ndarray | None = None,
+    *,
+    params: DeclumpParams | None = None,
+) -> np.ndarray:
+    """Return only the labels of :func:`declump_result` for compatibility."""
+    return declump_result(mask, dist, params=params).labels
 
 
 # ---------------------------------------------------------------------------
-# AI segmenter protocol and registry (Phase 3 stub)
+# AI segmenter protocol and registry
 # ---------------------------------------------------------------------------
 
 
 @runtime_checkable
 class Segmenter(Protocol):
-    """Protocol for AI segmentation backends (§4.2).
+    """Protocol for backends producing a common :class:`SegmentationResult`.
 
-    Implementations (``omnipose``, ``cellpose_sam``, ``unet_torch`` — to be
-    added under ``momia3.models``) turn a 2D image into a ``(c, y, x)``
-    probability map consumed by :func:`prob_to_labels`.
+    Probability-map models call :func:`prob_to_result`; Omnipose instead uses
+    its flow-field reconstruction and exposes the same result type.
     """
 
-    def predict(self, image: np.ndarray, params: BaseModel | None = None) -> np.ndarray:
-        """Predict a ``(c, y, x)`` probability map from a 2D image."""
+    def predict(
+        self, image: np.ndarray, params: BaseModel | None = None
+    ) -> SegmentationResult:
+        """Reconstruct instance labels and diagnostics from a 2D image."""
         ...
 
 
