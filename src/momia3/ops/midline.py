@@ -1684,13 +1684,20 @@ def _resample_closed(points: np.ndarray, n: int) -> np.ndarray:
 def _taubin_closed(points: np.ndarray, iters: int) -> np.ndarray:
     """Taubin (shrink-free) smoothing of a closed ring [4]."""
     pnt = np.asarray(points, dtype=np.float64).copy()
-    if len(pnt) < 3:
+    n = len(pnt)
+    if n < 3:
         return pnt
-    kernel = np.array([0.5, 0.0, 0.5])
+    # L = neighbour mean with the [0.5, 0, 0.5] wrap kernel; direct slices
+    # avoid two np.roll copies per Taubin pass.
     for _ in range(max(0, int(iters))):
-        lm = ndimage.convolve1d(pnt, kernel, axis=0, mode="wrap")
+        lm = np.empty_like(pnt)
+        lm[0] = 0.5 * (pnt[-1] + pnt[1])
+        lm[1:-1] = 0.5 * (pnt[:-2] + pnt[2:])
+        lm[-1] = 0.5 * (pnt[-2] + pnt[0])
         pnt += 0.5 * (lm - pnt)
-        lm = ndimage.convolve1d(pnt, kernel, axis=0, mode="wrap")
+        lm[0] = 0.5 * (pnt[-1] + pnt[1])
+        lm[1:-1] = 0.5 * (pnt[:-2] + pnt[2:])
+        lm[-1] = 0.5 * (pnt[-2] + pnt[0])
         pnt += -0.53 * (lm - pnt)
     return pnt
 
@@ -1700,13 +1707,14 @@ def _taubin_open_fixed(points: np.ndarray, iters: int) -> np.ndarray:
     pnt = np.asarray(points, dtype=np.float64).copy()
     if len(pnt) < 3:
         return pnt
-    kernel = np.array([0.5, 0.0, 0.5])
     for _ in range(max(0, int(iters))):
-        lm = ndimage.convolve1d(pnt, kernel, axis=0, mode="nearest")
+        lm = pnt.copy()
+        lm[1:-1] = 0.5 * (pnt[:-2] + pnt[2:])
         pnt[1:-1] += 0.5 * (lm[1:-1] - pnt[1:-1])
-        lm = ndimage.convolve1d(pnt, kernel, axis=0, mode="nearest")
+        lm[1:-1] = 0.5 * (pnt[:-2] + pnt[2:])
         pnt[1:-1] += -0.53 * (lm[1:-1] - pnt[1:-1])
     return pnt
+
 
 
 # ---------------------------------------------------------------------------

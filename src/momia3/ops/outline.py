@@ -744,7 +744,10 @@ def ellipse_deviation(
     ring = np.asarray(outline, dtype=np.float64)
     if len(ring) < 8:
         return 1.0
-    c0, ax0, ar0, area0 = _outline_principals(ring)
+    if centroid is None or axis is None or aspect_ratio is None or area is None:
+        c0, ax0, ar0, area0 = _outline_principals(ring)
+    else:
+        c0 = ax0 = ar0 = area0 = None
     c = c0 if centroid is None else np.asarray(centroid, dtype=np.float64)
     ax = ax0 if axis is None else np.asarray(axis, dtype=np.float64)
     ar = ar0 if aspect_ratio is None else float(aspect_ratio)
@@ -780,7 +783,10 @@ def chord_sagitta_ratio(
     ring = np.asarray(outline, dtype=np.float64)
     if len(ring) < 8:
         return 1.0
-    c0, ax0, _, _ = _outline_principals(ring)
+    if centroid is None or axis is None:
+        c0, ax0, _, _ = _outline_principals(ring)
+    else:
+        c0 = ax0 = None
     c = c0 if centroid is None else np.asarray(centroid, dtype=np.float64)
     axis_v = ax0 if axis is None else np.asarray(axis, dtype=np.float64)
     nrm = float(np.hypot(axis_v[0], axis_v[1]))
