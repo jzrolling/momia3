@@ -182,13 +182,14 @@ def border_band(shape):
 
 
 def _connected_components(mask: np.ndarray, connectivity: int):
-    try:
-        import cv2
-    except ImportError:
-        structure = _CROSS4 if connectivity == 4 else _SQUARE8
-        return ndi.label(mask, structure=structure)
-    n, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=connectivity)
-    return labels, n - 1
+    """Label a boolean mask; scikit-image is fast enough here (~10 ms vs
+    ~1.5 ms for OpenCV on 2048², both negligible next to the network) and is
+    already a momia3 dependency, so the threshold path does not depend on an
+    optional OpenCV install with a working connectedComponents binding."""
+    labels, n = measure.label(
+        mask, connectivity=1 if connectivity == 4 else 2, return_num=True
+    )
+    return labels, n
 
 
 def hysteresis_fast(dist: np.ndarray, low: float, high: float) -> np.ndarray:
