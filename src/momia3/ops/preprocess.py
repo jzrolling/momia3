@@ -62,6 +62,9 @@ __all__ = [
     "BackgroundParams",
     "DualBandpassParams",
     "illumination_correct",
+    "dark_correct",
+    "hot_pixel_correct",
+    "vignetting_correct",
     "rolling_ball_background_fft",
     "shrink_img_local_min",
     "drift_correct",
@@ -972,3 +975,213 @@ def denoise(image: np.ndarray, params: DenoiseParams | None = None) -> np.ndarra
         )
     logger.debug("denoise: method=%s", params.method)
     return np.asarray(out, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Camera-level corrections: dark/bias, hot/dead pixels, vignetting
+# ---------------------------------------------------------------------------
+
+
+class DarkCorrectionParams(BaseModel):
+    """Parameters of dark_correct."""
+
+    offset: float | None = Field(
+        None,
+        description="Explicit dark/bias offset; None estimates it from the border",
+    )
+    border_px: int = Field(
+        8, ge=1, description="Border width used for the robust offset estimate"
+    )
+    estimate_mode: Literal["border_median", "frame_min"] = Field(
+        "border_median", description="Offset estimator used when offset is None"
+    )
+    clip_min: float | None = Field(
+        0.0, description="Clip the corrected image at this lower bound; None disables"
+    )
+
+
+def _frames_of(image: np.ndarray) -> tuple[np.ndarray, bool]:
+    arr = np.asarray(image)
+    if arr.ndim == 2:
+        return arr[None, ...], True
+    if arr.ndim == 3:
+        return arr, False
+    raise ValueError(f"expected a 2-D image or a (t, y, x) stack, got {arr.shape}")
+
+
+def _estimate_frame_offset(frame: np.ndarray, params: DarkCorrectionParams) -> float:
+    h, w = frame.shape
+    bw = min(int(params.border_px), max(1, min(h, w) // 2))
+    if params.estimate_mode == "frame_min":
+        return float(np.min(frame))
+    border = np.concatenate(
+        [
+            frame[:bw, :].ravel(),
+            frame[-bw:, :].ravel(),
+            frame[:, :bw].ravel(),
+            frame[:, -bw:].ravel(),
+        ]
+    )
+    return float(np.median(border))
+
+
+def dark_correct(
+    image: np.ndarray,
+    params: DarkCorrectionParams | None = None,
+    dark: np.ndarray | None = None,
+) -> np.ndarray:
+    """Subtract a camera dark/bias frame or a per-frame estimated offset.
+
+    The correction is image - dark - offset. If dark is supplied it may be a
+    2-D frame or the same (t, y, x) stack; otherwise the offset is taken from
+    params.offset or estimated per frame from the image border (camera
+    overscan/border is normally free of sample signal).
+    """
+    params = params or DarkCorrectionParams()
+    frames, single = _frames_of(np.asarray(image))
+    work = frames.astype(np.float32, copy=True)
+    if dark is not None:
+        dark_arr = np.asarray(dark, dtype=np.float32)
+        if dark_arr.ndim == 2:
+            work -= dark_arr[None, ...]
+        elif dark_arr.ndim == 3:
+            if dark_arr.shape[0] != work.shape[0]:
+                raise ValueError(
+                    f"dark stack has {dark_arr.shape[0]} frames, image has {work.shape[0]}"
+                )
+            work -= dark_arr
+        else:
+            raise ValueError(f"dark must be 2-D or (t, y, x), got {dark_arr.shape}")
+    if params.offset is not None:
+        work -= np.float32(params.offset)
+    elif dark is None:
+        offsets = np.array(
+            [_estimate_frame_offset(frame, params) for frame in work],
+            dtype=np.float32,
+        )
+        work -= offsets[:, None, None]
+    if params.clip_min is not None:
+        np.maximum(work, np.float32(params.clip_min), out=work)
+    return work[0] if single else work
+
+
+class HotPixelParams(BaseModel):
+    """Parameters of hot_pixel_correct."""
+
+    kernel_size: int = Field(
+        3, ge=3, description="Odd local-median kernel size (px)"
+    )
+    threshold: float = Field(
+        5.0, gt=0.0, description="Detection threshold; units depend on mode"
+    )
+    mode: Literal["sigma", "absolute"] = Field(
+        "sigma",
+        description="sigma uses robust residual sigma; absolute uses raw intensity units",
+    )
+    polarity: Literal["both", "hot", "dead"] = Field(
+        "both", description="Correct positive hot pixels, negative dead pixels, or both"
+    )
+
+
+def _correct_hot_pixels_frame(frame: np.ndarray, params: HotPixelParams) -> np.ndarray:
+    k = int(params.kernel_size)
+    if k % 2 == 0:
+        raise ValueError(f"kernel_size must be odd, got {k}")
+    local = ndimage.median_filter(frame, size=k, mode="reflect")
+    residual = frame - local
+    if params.mode == "sigma":
+        med = float(np.median(residual))
+        mad = float(np.median(np.abs(residual - med)))
+        sigma = max(1.4826 * mad, _EPS)
+        threshold = float(params.threshold) * sigma
+    else:
+        threshold = float(params.threshold)
+    out = frame.copy()
+    bad = np.zeros(frame.shape, dtype=bool)
+    if params.polarity in ("both", "hot"):
+        bad |= residual > threshold
+    if params.polarity in ("both", "dead"):
+        bad |= residual < -threshold
+    out[bad] = local[bad]
+    return out
+
+
+def hot_pixel_correct(
+    image: np.ndarray, params: HotPixelParams | None = None
+) -> np.ndarray:
+    """Replace hot/dead pixels by their local median.
+
+    Pixels whose residual to a local median deviates by more than threshold
+    robust sigmas (or absolute units in absolute mode) are treated as camera
+    defects. Works on a 2-D image or a (t, y, x) stack, frame by frame.
+    """
+    params = params or HotPixelParams()
+    frames, single = _frames_of(np.asarray(image))
+    work = frames.astype(np.float32, copy=False)
+    out = np.stack([_correct_hot_pixels_frame(f, params) for f in work])
+    return out[0] if single else out
+
+
+class VignettingParams(BaseModel):
+    """Parameters of vignetting_correct."""
+
+    smooth_sigma: float = Field(
+        20.0, gt=0.0, description="Gaussian smoothing of the estimated gain surface (px)"
+    )
+    percentile: float = Field(
+        50.0, ge=0.0, le=100.0, description="Temporal percentile used for stack gain estimation"
+    )
+    gain_floor: float = Field(
+        0.05, gt=0.0, lt=1.0, description="Minimum gain to avoid amplifying dark corners"
+    )
+    estimate: Literal["stack", "single_smooth"] = Field(
+        "stack",
+        description="stack estimates a gain from the temporal percentile; single_smooth smooths the frame itself",
+    )
+
+
+def _normalize_gain(gain: np.ndarray, floor: float) -> np.ndarray:
+    g = np.asarray(gain, dtype=np.float32)
+    if g.ndim != 2:
+        raise ValueError(f"gain must be 2-D, got {g.shape}")
+    g = np.maximum(g, np.float32(floor))
+    mean = float(g.mean())
+    if mean <= _EPS:
+        raise ValueError("gain surface has zero mean")
+    return (g / mean).astype(np.float32, copy=False)
+
+
+def vignetting_correct(
+    image: np.ndarray,
+    params: VignettingParams | None = None,
+    gain: np.ndarray | None = None,
+) -> np.ndarray:
+    """Correct multiplicative vignetting with a smooth gain surface.
+
+    With gain supplied, the image is divided by it after normalizing the
+    surface to unit mean and clamping to gain_floor. Without gain, a gain is
+    estimated from the stack temporal percentile (estimate=stack) or from a
+    single smoothed frame (estimate=single_smooth). The latter is only an
+    approximation because the sample itself is not flat.
+    """
+    params = params or VignettingParams()
+    frames, single = _frames_of(np.asarray(image))
+    work = frames.astype(np.float32, copy=False)
+    if gain is None:
+        if params.estimate == "stack":
+            if single:
+                raise ValueError(
+                    "vignetting estimation from one frame is ambiguous; pass gain= "
+                    "or set estimate=single_smooth"
+                )
+            profile = np.percentile(work, params.percentile, axis=0)
+        elif params.estimate == "single_smooth":
+            profile = ndimage.gaussian_filter(work[0], sigma=params.smooth_sigma)
+        else:
+            raise ValueError(f"unknown vignetting estimate mode {params.estimate!r}")
+        profile = ndimage.gaussian_filter(profile, sigma=params.smooth_sigma)
+        g = _normalize_gain(profile, params.gain_floor)
+    else:
+        g = _normalize_gain(np.asarray(gain, dtype=np.float32), params.gain_floor)
+    out = work / g[None, ...]
+    return out.astype(np.float32, copy=False)[0] if single else out.astype(np.float32, copy=False)

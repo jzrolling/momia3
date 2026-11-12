@@ -2398,3 +2398,72 @@ def _raw_illumination_basicpy(
 ) -> dict[str, Any]:
     del ctx
     return {"stack": basic_ops.basicpy_correct(inputs["stack"], params)}
+
+
+@register(
+    "preprocess.dark_correct",
+    params_model=preprocess_ops.DarkCorrectionParams,
+    inputs={"image": "array", "dark": "array?"},
+    outputs={"image": "array"},
+    shard="frame",
+    description="Subtract a camera dark/bias frame or a robustly estimated offset.",
+    func=preprocess_ops.dark_correct,
+    provenance={
+        "algorithm": "camera dark/bias correction",
+        "sources": "standard camera calibration: dark-frame subtraction and border/overscan bias estimation",
+        "retrieved_at": "2026-11-13T00:00:00+08:00",
+        "implementation": "momia3 numpy/scipy",
+        "notes": "Dark frame may be 2-D or (t, y, x); otherwise offset is estimated per frame.",
+    },
+)
+def _raw_dark_correct(
+    inputs: dict[str, Any], params: preprocess_ops.DarkCorrectionParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    return {"image": preprocess_ops.dark_correct(inputs["image"], params, inputs.get("dark"))}
+
+
+@register(
+    "preprocess.hot_pixel_correct",
+    params_model=preprocess_ops.HotPixelParams,
+    inputs={"image": "array"},
+    outputs={"image": "array"},
+    shard="frame",
+    description="Replace hot and dead camera pixels with a local median.",
+    func=preprocess_ops.hot_pixel_correct,
+    provenance={
+        "algorithm": "hot/dead pixel detection by local median residual",
+        "sources": "standard camera defect correction; robust sigma from median absolute deviation",
+        "retrieved_at": "2026-11-13T00:00:00+08:00",
+        "implementation": "momia3 numpy/scipy",
+        "notes": "Supports hot, dead, or both polarities; absolute or robust-sigma thresholds.",
+    },
+)
+def _raw_hot_pixel_correct(
+    inputs: dict[str, Any], params: preprocess_ops.HotPixelParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    return {"image": preprocess_ops.hot_pixel_correct(inputs["image"], params)}
+
+
+@register(
+    "preprocess.vignetting_correct",
+    params_model=preprocess_ops.VignettingParams,
+    inputs={"image": "array", "gain": "array?"},
+    outputs={"image": "array"},
+    shard="frame",
+    description="Correct multiplicative vignetting with a smooth normalized gain surface.",
+    func=preprocess_ops.vignetting_correct,
+    provenance={
+        "algorithm": "flat-field / vignetting correction",
+        "sources": "BaSiC (Peng et al., Nat Commun 2017); CIDRE (Smith et al., Nat Methods 2015); standard flat-field calibration",
+        "retrieved_at": "2026-11-13T00:00:00+08:00",
+        "implementation": "momia3 numpy/scipy with optional supplied gain",
+        "notes": "Without a supplied gain, estimates from a stack percentile; single-frame estimation is approximate.",
+    },
+)
+def _raw_vignetting_correct(
+    inputs: dict[str, Any], params: preprocess_ops.VignettingParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    return {"image": preprocess_ops.vignetting_correct(inputs["image"], params, inputs.get("gain"))}
