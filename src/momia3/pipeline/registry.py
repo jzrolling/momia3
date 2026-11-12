@@ -110,6 +110,7 @@ class OpSpec:
     description: str = ""
     verify: tuple[str, ...] = ()
     func: Callable[..., Any] | None = None
+    provenance: Mapping[str, str] = field(default_factory=dict)
 
 
 REGISTRY: dict[str, OpSpec] = {}
@@ -127,6 +128,7 @@ def register(
     description: str = "",
     verify: Sequence[str] = (),
     func: Callable[..., Any] | None = None,
+    provenance: Mapping[str, str] | None = None,
     runner: Runner | None = None,
 ) -> Callable[[Runner], Runner] | Runner:
     """Register an operation in :data:`REGISTRY`.
@@ -158,6 +160,7 @@ def register(
             description=str(description),
             verify=tuple(verify),
             func=func if func is not None else fn,
+            provenance=dict(provenance or {}),
         )
 
     if runner is not None:
@@ -283,6 +286,7 @@ def describe(name: str) -> dict[str, Any]:
         "inputs": dict(spec.inputs),
         "outputs": dict(spec.outputs),
         "params": spec.params_model.model_json_schema(),
+        "provenance": dict(spec.provenance),
     }
 
 
@@ -333,7 +337,7 @@ def to_json() -> dict[str, Any]:
 
 def _register_builtins() -> None:
     """Import the built-in op modules so their ``@register`` hooks run."""
-    from momia3.pipeline import io_ops, steps  # noqa: F401
+    from momia3.pipeline import features, io_ops, steps  # noqa: F401
 
 
 _register_builtins()

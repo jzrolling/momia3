@@ -22,18 +22,22 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
-from scipy import ndimage
+from scipy import ndimage, stats
 from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
 from skimage.measure import regionprops_table
 
 from .. import keys as _keys
 from .. import schema as _schema
+from ._batch import FrameBatch
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "labels_to_cells",
     "intensity_stats",
+    "colocalization",
+    "INTENSITY_MOMENT_STATS",
+    "intensity_moments",
     "texture_haralick",
     "texture_lbp",
     "add_features",
@@ -343,6 +347,235 @@ def intensity_stats(
         f"{prefix}_p25": stats["p25"].astype(np.float32),
         f"{prefix}_p75": stats["p75"].astype(np.float32),
         f"{prefix}_integrated": stats["integrated"].astype(np.float32),
+    }
+
+
+INTENSITY_MOMENT_STATS: tuple[str, ...] = (
+    "median",
+    "cv",
+    "skewness",
+    "kurtosis",
+    "entropy",
+)
+"""Distribution moments computed by intensity_moments.
+
+entropy is the Shannon entropy (bits) of a 64-bin intensity histogram of
+the cell pixels. cv is std / mean; undefined values are NaN rather than
+silently dropped.
+"""
+
+
+def _intensity_moment(pixels: np.ndarray, stat: str) -> float:
+    """One distribution moment of a 1-D pixel vector (NaN when undefined)."""
+    values = np.asarray(pixels, dtype=np.float64)
+    if values.size == 0:
+        return float("nan")
+    mean = float(values.mean())
+    std = float(values.std())
+    if stat == "median":
+        return float(np.median(values))
+    if stat == "cv":
+        return float(std / mean) if abs(mean) > _EPS else float("nan")
+    if stat == "skewness":
+        return float(stats.skew(values)) if values.size > 2 and std > _EPS else float("nan")
+    if stat == "kurtosis":
+        return float(stats.kurtosis(values)) if values.size > 3 and std > _EPS else float("nan")
+    if stat == "entropy":
+        counts, _ = np.histogram(values, bins=64)
+        p = counts[counts > 0].astype(np.float64)
+        p /= p.sum()
+        return float(-np.sum(p * np.log2(p)))
+    raise ValueError(f"unknown intensity moment {stat!r}")
+
+
+def intensity_moments(
+    labels_2d: np.ndarray,
+    channel_image: np.ndarray,
+    prefix: str = "ch0",
+    stats: tuple[str, ...] = INTENSITY_MOMENT_STATS,
+) -> dict[str, np.ndarray]:
+    """Per-cell distribution moments of one channel.
+
+    Extends the canonical intensity_stats cluster with the moments used by
+    the legacy momia2 profiling workflows:
+
+    - median: median pixel intensity;
+    - cv: coefficient of variation std / mean;
+    - skewness: scipy stats.skew (biased);
+    - kurtosis: scipy stats.kurtosis (Fisher=True);
+    - entropy: Shannon entropy (bits) of a 64-bin histogram.
+
+    Parameters
+    ----------
+    labels_2d : numpy.ndarray
+        2D instance label image; 0 is background.
+    channel_image : numpy.ndarray
+        Intensity image with the same shape as labels_2d.
+    prefix : str
+        Output column prefix (normally the channel name).
+    stats : tuple of str
+        Subset of INTENSITY_MOMENT_STATS to compute. Unknown names raise
+        ValueError.
+
+    Returns
+    -------
+    dict of str to numpy.ndarray
+        {prefix}_{stat} -> float32 array in ascending label order. Empty
+        label images return zero-length arrays. Undefined moments are NaN.
+    """
+    labels = np.asarray(labels_2d)
+    image = np.asarray(channel_image, dtype=np.float64)
+    if labels.shape != image.shape:
+        raise ValueError(
+            f"labels shape {labels.shape} does not match image shape {image.shape}"
+        )
+    unknown = [s for s in stats if s not in INTENSITY_MOMENT_STATS]
+    if unknown:
+        raise ValueError(f"unknown intensity moments: {unknown}")
+    batch = FrameBatch(labels)
+    out = {
+        f"{prefix}_{stat}": np.empty(batch.n_labels, dtype=np.float32) for stat in stats
+    }
+    if batch.n_labels == 0:
+        return out
+    for i, label_id in enumerate(batch.label_ids):
+        pixels = batch.values(int(label_id), image)
+        for stat in stats:
+            out[f"{prefix}_{stat}"][i] = _intensity_moment(pixels, stat)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-cell colocalization
+# ---------------------------------------------------------------------------
+
+
+def colocalization(
+    labels_2d,
+    image_a,
+    image_b,
+    prefix_a="A",
+    prefix_b="B",
+    threshold_a=0.0,
+    threshold_b=0.0,
+    *,
+    batch: FrameBatch | None = None,
+):
+    """Per-cell Pearson/Spearman/Manders/overlap colocalization.
+
+    Pearson, Manders A/B and overlap are computed from per-label pixel
+    sums (:class:`~momia3.ops._batch.FrameBatch`, one label sort per
+    frame); Spearman ranks are computed per cell with
+    scipy.stats.rankdata. Pearson/Manders/overlap return NaN for
+    degenerate cells (empty, zero variance, zero denominator). Manders
+    coefficients are thresholded independently for each channel.
+
+    Parameters
+    ----------
+    labels_2d:
+        Instance label image, 0 is background.
+    image_a, image_b:
+        Two intensity images of the same shape.
+    prefix_a, prefix_b:
+        Output column prefixes.
+    threshold_a, threshold_b:
+        Channel thresholds for the Manders denominators.
+    batch:
+        Optional pre-built :class:`~momia3.ops._batch.FrameBatch` over
+        ``labels_2d``. Callers that already hold one (e.g. feature groups)
+        pass it in to avoid re-sorting the frame per channel pair; the
+        label set and pixel index map must match ``labels_2d``.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        Arrays in ascending label order: pearson, spearman, manders_a,
+        manders_b, overlap.
+    """
+    from scipy.stats import rankdata
+
+    labels = np.asarray(labels_2d)
+    a = np.asarray(image_a, dtype=np.float64)
+    b = np.asarray(image_b, dtype=np.float64)
+    if labels.shape != a.shape or labels.shape != b.shape:
+        raise ValueError("labels, image_a and image_b must share shape")
+    if batch is None:
+        batch = FrameBatch(labels)
+    elif batch.labels.shape != labels.shape:
+        raise ValueError("pre-built batch does not match labels shape")
+    n = batch.n_labels
+    keys = [
+        f"{prefix_a}_{prefix_b}_pearson",
+        f"{prefix_a}_{prefix_b}_spearman",
+        f"{prefix_a}_{prefix_b}_manders_a",
+        f"{prefix_a}_{prefix_b}_manders_b",
+        f"{prefix_a}_{prefix_b}_overlap",
+    ]
+    if n == 0:
+        return {key: np.empty(0, dtype=np.float32) for key in keys}
+
+    flat_a = a.reshape(-1)
+    flat_b = b.reshape(-1)
+    t_a = float(threshold_a)
+    t_b = float(threshold_b)
+    counts = np.empty(n, dtype=np.float64)
+    sum_a = np.empty(n, dtype=np.float64)
+    sum_b = np.empty(n, dtype=np.float64)
+    sum_aa = np.empty(n, dtype=np.float64)
+    sum_bb = np.empty(n, dtype=np.float64)
+    sum_ab = np.empty(n, dtype=np.float64)
+    manders_a_num = np.empty(n, dtype=np.float64)
+    manders_b_num = np.empty(n, dtype=np.float64)
+    spearman = np.full(n, np.nan)
+    for i, label_id in enumerate(batch.label_ids):
+        # Only the label's own pixels are touched: the frame is never
+        # rescanned once per label.
+        px = batch.pixels(int(label_id))
+        va = flat_a[px]
+        vb = flat_b[px]
+        counts[i] = float(px.size)
+        sum_a[i] = va.sum()
+        sum_b[i] = vb.sum()
+        sum_aa[i] = np.sum(va * va)
+        sum_bb[i] = np.sum(vb * vb)
+        sum_ab[i] = np.sum(va * vb)
+        manders_a_num[i] = np.sum(va[vb >= t_b])
+        manders_b_num[i] = np.sum(vb[va >= t_a])
+        if px.size < 2:
+            continue
+        ra = rankdata(va)
+        rb = rankdata(vb)
+        if ra.std() <= _EPS or rb.std() <= _EPS:
+            continue
+        spearman[i] = float(np.corrcoef(ra, rb)[0, 1])
+
+    mean_a = sum_a / np.maximum(counts, 1)
+    mean_b = sum_b / np.maximum(counts, 1)
+    cov = sum_ab / np.maximum(counts, 1) - mean_a * mean_b
+    var_a = sum_aa / np.maximum(counts, 1) - mean_a * mean_a
+    var_b = sum_bb / np.maximum(counts, 1) - mean_b * mean_b
+    denom = np.sqrt(np.maximum(var_a * var_b, 0.0))
+    pearson = np.full(n, np.nan)
+    valid = (denom > _EPS) & (counts > 1)
+    pearson[valid] = cov[valid] / denom[valid]
+
+    manders_a = np.full(n, np.nan)
+    manders_b = np.full(n, np.nan)
+    good_a = np.abs(sum_a) > _EPS
+    good_b = np.abs(sum_b) > _EPS
+    manders_a[good_a] = manders_a_num[good_a] / sum_a[good_a]
+    manders_b[good_b] = manders_b_num[good_b] / sum_b[good_b]
+    overlap = np.full(n, np.nan)
+    denom_overlap = np.sqrt(np.maximum(sum_aa * sum_bb, 0.0))
+    ok = denom_overlap > _EPS
+    overlap[ok] = sum_ab[ok] / denom_overlap[ok]
+
+    return {
+        keys[0]: pearson.astype(np.float32),
+        keys[1]: spearman.astype(np.float32),
+        keys[2]: manders_a.astype(np.float32),
+        keys[3]: manders_b.astype(np.float32),
+        keys[4]: overlap.astype(np.float32),
     }
 
 

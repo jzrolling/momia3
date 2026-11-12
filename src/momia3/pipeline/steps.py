@@ -173,6 +173,29 @@ def _normalize_cells_frame_table(table: pa.Table) -> pa.Table:
     return table
 
 
+def _row_index_by_cell_key(table: pa.Table) -> dict[int, int]:
+    """Map cell_key to row index in one pass (no pandas import)."""
+    keys = np.asarray(table.column("cell_key").to_pylist(), dtype=np.int64)
+    return {int(k): i for i, k in enumerate(keys)}
+
+
+def _rows_for_keys(row_of_key: Mapping[int, int], keys: np.ndarray) -> np.ndarray:
+    """Row indices of keys (-1 when a key is absent from the table)."""
+    return np.fromiter(
+        (row_of_key.get(int(k), -1) for k in keys),
+        dtype=np.int64,
+        count=len(keys),
+    )
+
+
+def _frame_pairs(table: pa.Table) -> list[tuple[int, int]]:
+    """Sorted unique (fov_id, frame) pairs of the cells table."""
+    fov = np.asarray(table.column("fov_id").to_pylist(), dtype=np.int64)
+    frame = np.asarray(table.column("frame").to_pylist(), dtype=np.int64)
+    pairs = np.unique(np.stack([fov, frame], axis=1), axis=0)
+    return [(int(f), int(t)) for f, t in pairs]
+
+
 # ---------------------------------------------------------------------------
 # chain step: preprocess.drift (shard = fov)
 # ---------------------------------------------------------------------------
@@ -1865,3 +1888,425 @@ def _raw_ctc_metrics(inputs: dict[str, Any], params: EmptyParams, ctx: StepConte
         inputs["truth_labels"],
     )
     return {"metrics": _jsonable(metrics)}
+
+
+# ---------------------------------------------------------------------------
+# chain step: measure.intensity_moments_append
+# ---------------------------------------------------------------------------
+
+
+class IntensityMomentsAppendParams(BaseModel):
+    """Parameters of the measure.intensity_moments_append step."""
+
+    channel: str | None = Field(
+        None, description="Intensity channel; None uses the first store channel"
+    )
+    stats: tuple[
+        Literal["median", "cv", "skewness", "kurtosis", "entropy"], ...
+    ] = ("median", "cv", "skewness", "kurtosis")
+
+
+@register(
+    "measure.intensity_moments_append",
+    params_model=IntensityMomentsAppendParams,
+    inputs={"experiment": "store", "cells": "table:cells"},
+    outputs={"cells": "table:cells"},
+    shard=None,
+    description=(
+        "Append per-cell median/CV/skewness/kurtosis/entropy columns to the "
+        "cells table (one channel at a time)."
+    ),
+    func=measure_ops.intensity_moments,
+)
+def run_intensity_moments_append(
+    inputs: dict[str, Any],
+    params: IntensityMomentsAppendParams,
+    ctx: StepContext,
+) -> dict[str, Any]:
+    """Runner of measure.intensity_moments_append.
+
+    Moments whose ``{channel}_{stat}`` column already exists (e.g. the
+    canonical ``cv``/``skewness``/``kurtosis`` cluster) are left untouched.
+    """
+    del ctx
+    store = ExperimentStore.open(Path(inputs["experiment"]), mode="r")
+    channel = params.channel or store.channels[0]
+    table = inputs["cells"]
+    if not isinstance(table, pa.Table):
+        table = table.to_arrow()
+    stats = tuple(params.stats)
+    existing = set(table.column_names)
+    stats = tuple(s for s in stats if f"{channel}_{s}" not in existing)
+    row_of_key = _row_index_by_cell_key(table)
+    features = {
+        f"{channel}_{stat}": np.full(table.num_rows, np.nan, dtype=np.float32)
+        for stat in stats
+    }
+    for fov_id, t in _frame_pairs(table):
+        labels = store.get_labels_frame(fov_id, t)
+        image = store.get_frame(fov_id, channel, t)
+        moments = measure_ops.intensity_moments(
+            labels, image, prefix=channel, stats=stats
+        )
+        label_ids = np.unique(labels)
+        label_ids = label_ids[label_ids > 0]
+        frame_keys = _keys.encode_keys(fov_id, t, label_ids.astype(np.int64))
+        rows = _rows_for_keys(row_of_key, frame_keys)
+        ok = rows >= 0
+        for stat in stats:
+            features[f"{channel}_{stat}"][rows[ok]] = moments[f"{channel}_{stat}"][ok]
+    return {"cells": measure_ops.add_features(table, features)}
+
+
+# ---------------------------------------------------------------------------
+# chain step: measure.colocalization_append
+# ---------------------------------------------------------------------------
+
+
+class ColocalizationAppendParams(BaseModel):
+    """Parameters of the measure.colocalization_append step."""
+
+    channel_a: str | None = Field(None, description="First intensity channel")
+    channel_b: str | None = Field(None, description="Second intensity channel")
+    threshold_a: float = Field(0.0, ge=0.0, description="Threshold for Manders A denominator")
+    threshold_b: float = Field(0.0, ge=0.0, description="Threshold for Manders B denominator")
+
+
+@register(
+    "measure.colocalization_append",
+    params_model=ColocalizationAppendParams,
+    inputs={"experiment": "store", "cells": "table:cells"},
+    outputs={"cells": "table:cells"},
+    shard=None,
+    description=(
+        "Append per-cell Pearson/Spearman/Manders/overlap columns for two "
+        "channels to the cells table."
+    ),
+    func=measure_ops.colocalization,
+)
+def run_colocalization_append(
+    inputs: dict[str, Any], params: ColocalizationAppendParams, ctx: StepContext
+) -> dict[str, Any]:
+    """Runner of measure.colocalization_append."""
+    del ctx
+    store = ExperimentStore.open(Path(inputs["experiment"]), mode="r")
+    channel_a = params.channel_a or store.channels[0]
+    channel_b = params.channel_b or store.channels[1]
+    table = inputs["cells"]
+    if not isinstance(table, pa.Table):
+        table = table.to_arrow()
+    row_of_key = _row_index_by_cell_key(table)
+    keys = [
+        f"{channel_a}_{channel_b}_pearson",
+        f"{channel_a}_{channel_b}_spearman",
+        f"{channel_a}_{channel_b}_manders_a",
+        f"{channel_a}_{channel_b}_manders_b",
+        f"{channel_a}_{channel_b}_overlap",
+    ]
+    features = {
+        key: np.full(table.num_rows, np.nan, dtype=np.float32) for key in keys
+    }
+    for fov_id, t in _frame_pairs(table):
+        labels = store.get_labels_frame(fov_id, t)
+        a = store.get_frame(fov_id, channel_a, t)
+        b = store.get_frame(fov_id, channel_b, t)
+        result = measure_ops.colocalization(
+            labels, a, b,
+            prefix_a=channel_a, prefix_b=channel_b,
+            threshold_a=params.threshold_a, threshold_b=params.threshold_b,
+        )
+        label_ids = np.unique(labels)
+        label_ids = label_ids[label_ids > 0]
+        frame_keys = _keys.encode_keys(fov_id, t, label_ids.astype(np.int64))
+        rows = _rows_for_keys(row_of_key, frame_keys)
+        ok = rows >= 0
+        for key in keys:
+            features[key][rows[ok]] = result[key][ok]
+    return {"cells": measure_ops.add_features(table, features)}
+
+
+class IntensityMomentsRawParams(BaseModel):
+    """Parameters of the raw measure.intensity_moments op."""
+
+    prefix: str = Field("ch0", description="Channel prefix of the output keys")
+    stats: tuple[
+        Literal["median", "cv", "skewness", "kurtosis", "entropy"], ...
+    ] = ("median", "cv", "skewness", "kurtosis")
+
+
+@register(
+    "measure.intensity_moments",
+    params_model=IntensityMomentsRawParams,
+    inputs={"labels": "array", "image": "array"},
+    outputs={"moments": "json"},
+    shard="frame",
+    description="Per-cell median/CV/skewness/kurtosis/entropy of one channel.",
+    func=measure_ops.intensity_moments,
+)
+def _raw_intensity_moments(
+    inputs: dict[str, Any], params: IntensityMomentsRawParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    moments = measure_ops.intensity_moments(
+        inputs["labels"], inputs["image"], prefix=params.prefix, stats=tuple(params.stats)
+    )
+    return {"moments": _jsonable(moments)}
+
+
+class ColocalizationRawParams(BaseModel):
+    """Parameters of the raw measure.colocalization op."""
+
+    prefix_a: str = Field("A", description="First channel prefix")
+    prefix_b: str = Field("B", description="Second channel prefix")
+    threshold_a: float = Field(0.0, ge=0.0, description="Channel A threshold for Manders")
+    threshold_b: float = Field(0.0, ge=0.0, description="Channel B threshold for Manders")
+
+
+@register(
+    "measure.colocalization",
+    params_model=ColocalizationRawParams,
+    inputs={"labels": "array", "image_a": "array", "image_b": "array"},
+    outputs={"colocalization": "json"},
+    shard="frame",
+    description="Per-cell Pearson/Spearman/Manders/overlap colocalization of two channels.",
+    func=measure_ops.colocalization,
+    provenance={
+        "algorithm": "per-cell colocalization coefficients",
+        "sources": "CellProfiler MeasureColocalization; Manders et al. 1993; Pearson/Spearman",
+        "retrieved_at": "2026-10-23T23:59:00+08:00",
+        "implementation": "momia3 vectorized label sums + bbox-local rankdata",
+        "notes": "Manders thresholds are independent per channel; degenerate cells return NaN.",
+    },
+)
+def _raw_colocalization(inputs: dict[str, Any], params: ColocalizationRawParams, ctx: StepContext) -> dict[str, Any]:
+    del ctx
+    result = measure_ops.colocalization(
+        inputs["labels"], inputs["image_a"], inputs["image_b"],
+        prefix_a=params.prefix_a, prefix_b=params.prefix_b,
+        threshold_a=params.threshold_a, threshold_b=params.threshold_b,
+    )
+    return {"colocalization": _jsonable(result)}
+
+
+class MidlineProfilesFillParams(BaseModel):
+    """Parameters of the characterize.midline_profiles step."""
+
+    channel: str | None = Field(
+        None, description="Intensity channel; None uses the first store channel"
+    )
+    n_points: int = Field(64, ge=2, description="Arc-length samples per profile")
+    mode: Literal["mean", "max"] = Field("mean", description="Lateral aggregation")
+    n_lateral: int = Field(5, ge=1, description="Samples across the cell width")
+
+
+@register(
+    "characterize.midline_profiles",
+    params_model=MidlineProfilesFillParams,
+    inputs={"experiment": "store", "cells": "table:cells"},
+    outputs={"cells": "table:cells"},
+    shard=None,
+    description=(
+        "Append one fixed-length fluorescence profile column per channel to "
+        "the cells table by sampling along each stored midline."
+    ),
+    func=characterize_ops.midline_profile,
+)
+def run_midline_profiles(
+    inputs: dict[str, Any],
+    params: MidlineProfilesFillParams,
+    ctx: StepContext,
+) -> dict[str, Any]:
+    """Runner of characterize.midline_profiles."""
+    del ctx
+    store = ExperimentStore.open(Path(inputs["experiment"]), mode="r")
+    channel = params.channel or store.channels[0]
+    table = inputs["cells"]
+    if not isinstance(table, pa.Table):
+        table = table.to_arrow()
+    column = f"{channel}_midline_profile"
+    if column in table.column_names:
+        raise ValueError(f"column {column!r} already exists in the cells table")
+    row_of_key = _row_index_by_cell_key(table)
+    keys_np = table.column("cell_key").to_numpy(zero_copy_only=False).astype(np.uint64)
+    fov_ids, frames, _labels = _keys.decode_keys(keys_np)
+    # Group rows by (fov, frame) once (O(N log N)); no per-frame full-table
+    # boolean mask is built.
+    group = (fov_ids.astype(np.int64) << 20) | frames.astype(np.int64)
+    order = np.argsort(group, kind="stable")
+    sorted_group = group[order]
+    profiles: dict[int, np.ndarray] = {}
+    for g in np.unique(sorted_group):
+        lo = int(np.searchsorted(sorted_group, g, side="left"))
+        hi = int(np.searchsorted(sorted_group, g, side="right"))
+        rows = order[lo:hi]
+        fov_id = int(fov_ids[rows[0]])
+        t = int(frames[rows[0]])
+        labels = store.get_labels_frame(fov_id, t)
+        image = store.get_frame(fov_id, channel, t)
+        subset = table.take(pa.array(rows.astype(np.int64)))
+        result = characterize_ops.midline_profile(
+            subset,
+            image,
+            labels,
+            n_points=params.n_points,
+            mode=params.mode,
+            n_lateral=params.n_lateral,
+            pixel_microns=store.pixel_microns,
+        )
+        profiles.update(result)
+    values: list[list[float] | None] = [None] * table.num_rows
+    for key, prof in profiles.items():
+        i = row_of_key.get(int(key))
+        if i is not None:
+            values[i] = np.asarray(prof, dtype=np.float32).tolist()
+    table = table.append_column(column, pa.array(values, type=pa.list_(pa.float32())))
+    return {"cells": table}
+
+
+# ---------------------------------------------------------------------------
+# chain step: characterize.demographic_maps
+# ---------------------------------------------------------------------------
+
+
+class MidlineProfileRawParams(BaseModel):
+    """Parameters of the raw characterize.midline_profile op."""
+
+    n_points: int = Field(64, ge=2, description="Arc-length samples per profile")
+    mode: Literal["mean", "max"] = Field("mean", description="Lateral aggregation")
+    n_lateral: int = Field(5, ge=1, description="Samples across the cell width")
+    pixel_microns: float = Field(1.0, gt=0, description="Pixel size for width conversion")
+
+
+@register(
+    "characterize.midline_profile",
+    params_model=MidlineProfileRawParams,
+    inputs={"cells": "table", "image": "array", "labels": "array"},
+    outputs={"profiles": "json"},
+    shard="frame",
+    description="Fixed-length fluorescence profiles sampled along cell midlines.",
+    func=characterize_ops.midline_profile,
+)
+def _raw_midline_profile(
+    inputs: dict[str, Any], params: MidlineProfileRawParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    profiles = characterize_ops.midline_profile(
+        inputs["cells"],
+        inputs["image"],
+        inputs["labels"],
+        n_points=params.n_points,
+        mode=params.mode,
+        n_lateral=params.n_lateral,
+        pixel_microns=params.pixel_microns,
+    )
+    return {"profiles": _jsonable(profiles)}
+
+
+class OutlineProfileRawParams(BaseModel):
+    """Parameters of the raw characterize.outline_profile op."""
+
+    n_points: int = Field(128, ge=8, description="Arc-length samples along the closed outline")
+    mode: Literal["mean", "max"] = Field("mean", description="Lateral band aggregation")
+    band_px: float = Field(1.0, ge=0.0, description="Symmetric sampling band around the outline (px)")
+    n_lateral: int = Field(5, ge=1, description="Samples across the outline band")
+    align_to: Literal["pole1", "pole2", "none"] = Field(
+        "pole1", description="Roll the closed ring so index 0 is nearest a midline endpoint"
+    )
+
+
+@register(
+    "characterize.outline_profile",
+    params_model=OutlineProfileRawParams,
+    inputs={"cells": "table", "image": "array", "labels": "array"},
+    outputs={"profiles": "json"},
+    shard="frame",
+    description="Fixed-length intensity profiles sampled along the closed membrane outline.",
+    func=characterize_ops.outline_profile,
+    provenance={
+        "algorithm": "closed-loop outline intensity profile",
+        "sources": (
+            "CellProfiler MeasureObjectIntensityDistribution; "
+            "MicrobeJ/Oufti membrane fluorescence profiles; "
+            "Fourier descriptor boundary sampling"
+        ),
+        "retrieved_at": "2026-10-23T23:59:00+08:00",
+        "implementation": "momia3 pure Python / NumPy / SciPy",
+        "notes": "By default the closed ring is rolled so profile index 0 is "
+                 "the outline point nearest pole1; align_to='pole2' or 'none' "
+                 "can be selected explicitly. Use boundary_fourier for phase-invariant harmonics.",
+    },
+)
+def _raw_outline_profile(
+    inputs: dict[str, Any], params: OutlineProfileRawParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    profiles = characterize_ops.outline_profile(
+        inputs["cells"],
+        inputs["image"],
+        inputs["labels"],
+        n_points=params.n_points,
+        mode=params.mode,
+        band_px=params.band_px,
+        n_lateral=params.n_lateral,
+        align_to=params.align_to,
+    )
+    return {"profiles": _jsonable(profiles)}
+
+
+class DemographMatrixParams(BaseModel):
+    """Parameters of the raw ``characterize.demograph_matrix`` op."""
+
+    channels: list[str] | None = Field(
+        None, description="Channel subset/order; None uses every demograph column"
+    )
+
+
+@register(
+    "characterize.demograph_matrix",
+    params_model=DemographMatrixParams,
+    inputs={"demograph": "table"},
+    outputs={"cell_keys": "array", "matrices": "array"},
+    shard=None,
+    description="Stack a demographic sidecar into (N, C, n_l, n_d) matrices.",
+    func=characterize_ops.demograph_matrix,
+)
+def _raw_demograph_matrix(inputs: dict[str, Any], params: DemographMatrixParams, ctx: StepContext) -> dict[str, Any]:
+    del ctx
+    keys, matrices = characterize_ops.demograph_matrix(
+        inputs["demograph"], channels=params.channels
+    )
+    return {"cell_keys": keys, "matrices": matrices}
+
+
+class DemographicMapsRawParams(BaseModel):
+    """Parameters of the raw characterize.demographic_maps op."""
+
+    n_l: int = Field(64, ge=2, description="Samples along the midline")
+    n_d: int = Field(16, ge=2, description="Samples across the cell width")
+    normalize: Literal["none", "zscore", "robust", "quantile"] = Field(
+        "none", description="Per-cell matrix normalization"
+    )
+
+
+@register(
+    "characterize.demographic_maps",
+    params_model=DemographicMapsRawParams,
+    inputs={"cells": "table:cells", "image": "array", "labels": "array"},
+    outputs={"maps": "json"},
+    shard="frame",
+    description="Resample one channel into shared normalized per-cell (l, d) matrices.",
+    func=characterize_ops.demographic_maps,
+)
+def _raw_demographic_maps(
+    inputs: dict[str, Any], params: DemographicMapsRawParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    maps = characterize_ops.demographic_maps(
+        inputs["cells"],
+        {"phase": inputs["image"]},
+        inputs["labels"],
+        n_l=params.n_l,
+        n_d=params.n_d,
+        normalize=params.normalize,
+    )
+    return {"maps": _jsonable(maps)}

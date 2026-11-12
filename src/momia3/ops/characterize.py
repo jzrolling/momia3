@@ -31,7 +31,8 @@ All functions are pure; tables are accepted as ``pyarrow.Table`` or
 from __future__ import annotations
 
 import logging
-from typing import Any
+from itertools import combinations
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import polars as pl
@@ -39,13 +40,19 @@ import pyarrow as pa
 from pydantic import BaseModel, Field
 from scipy import ndimage, signal
 from scipy.spatial import cKDTree
+from scipy.stats import rankdata
 from skimage.feature import peak_local_max
 
 from momia3.ops.outline import elliptic_fourier
+from momia3.ops.rod_frame import rod_frames, sample_line_profile as _line_profile_samples
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "outline_profile",
+    "midline_profile",
+    "demograph_matrix",
+    "demographic_maps",
     "PunctaParams",
     "demographic_projection",
     "growth_stats",
@@ -59,6 +66,12 @@ __all__ = [
 ]
 
 _EPS = 1e-12
+
+NORMALIZE_MODES: tuple[str, ...] = ("none", "zscore", "robust", "quantile")
+"""Per-cell matrix normalization modes of demographic_maps."""
+
+DEMOGRAPH_SUFFIX = "_demograph"
+"""Suffix of the fixed-size demographic matrix columns."""
 
 
 class PunctaParams(BaseModel):
@@ -282,6 +295,535 @@ def demographic_projection(
             start += size
 
     logger.debug("demographic_projection: %d cells projected", len(out))
+    return out
+
+
+def _cell_grid(
+    branch_xy: tuple[np.ndarray, np.ndarray],
+    ring_xy: tuple[np.ndarray, np.ndarray],
+    n_l: int,
+    n_d: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Sampling grid of one cell in normalized midline coordinates.
+
+    The main midline branch is resampled uniformly in arc length
+    (``l ∈ [0, 1]``); ``d ∈ [-1, 1]`` runs laterally between the two outline
+    boundaries found by the nearest-outline KDTree distance (the same
+    half-width convention as :func:`demographic_projection`).
+
+    Parameters
+    ----------
+    branch_xy : tuple of numpy.ndarray
+        ``(x, y)`` polyline of the main midline branch.
+    ring_xy : tuple of numpy.ndarray
+        ``(x, y)`` closed outline ring.
+    n_l, n_d : int
+        Grid size along the midline and across the width.
+
+    Returns
+    -------
+    tuple or None
+        ``(grid_y, grid_x, half_width)``, each with shape ``(n_l, n_d)``
+        for the coordinates and ``(n_l,)`` for the half width. ``None``
+        when the midline has zero arc length.
+    """
+    l_targets = np.linspace(0.0, 1.0, n_l)
+    d_targets = np.linspace(-1.0, 1.0, n_d)
+    mx, my = branch_xy
+    arc = _polyline_arclength(mx, my)
+    total = float(arc[-1])
+    if total <= _EPS:
+        return None
+    s = arc / total
+    # Resample the midline uniformly in arc length.
+    xs = np.interp(l_targets, s, mx)
+    ys = np.interp(l_targets, s, my)
+    # Tangents (central differences on the uniform samples).
+    tx = np.gradient(xs, l_targets, edge_order=2)
+    ty = np.gradient(ys, l_targets, edge_order=2)
+    tnorm = np.hypot(tx, ty)
+    tnorm[tnorm <= _EPS] = 1.0
+    nx_, ny_ = -ty / tnorm, tx / tnorm  # left normal (x, y)
+
+    ox, oy = ring_xy
+    tree = cKDTree(np.column_stack([ox, oy]))
+    # Distance from each midline sample to the outline (half width).
+    dist, _ = tree.query(np.column_stack([xs, ys]))
+    half_width = np.where(dist <= _EPS, 1.0, dist)
+
+    # Sample grid: d = -1 -> -normal side boundary, d = +1 -> +normal.
+    grid_x = xs[:, None] + (d_targets[None, :] * half_width[:, None]) * nx_[:, None]
+    grid_y = ys[:, None] + (d_targets[None, :] * half_width[:, None]) * ny_[:, None]
+    return grid_y, grid_x, half_width
+
+
+def _normalize_map(matrix: np.ndarray, mode: str) -> np.ndarray:
+    """Normalize one per-cell ``(n_l, n_d)`` matrix in place semantics.
+
+    ``none`` returns the input unchanged. The other modes are defined only
+    for at least two finite samples with non-zero range; a constant or
+    all-NaN matrix yields an all-NaN result (matching the all-NaN
+    convention of the intensity statistics). ``zscore`` subtracts the mean
+    and divides by the standard deviation, ``robust`` subtracts the
+    median and divides by the interquartile range, and ``quantile`` maps
+    finite values to average ranks in ``[0, 1]``.
+    """
+    if mode == "none":
+        return matrix
+    values = np.asarray(matrix, dtype=np.float64).ravel()
+    finite = np.isfinite(values)
+    out = np.full(values.shape, np.nan, dtype=np.float64)
+    if int(finite.sum()) >= 2:
+        v = values[finite]
+        if float(v.max() - v.min()) > _EPS:
+            if mode == "zscore":
+                mean = float(v.mean())
+                std = float(v.std())
+                if std > _EPS:
+                    out[finite] = (v - mean) / std
+            elif mode == "robust":
+                median = float(np.median(v))
+                q25, q75 = np.percentile(v, [25.0, 75.0])
+                iqr = float(q75 - q25)
+                if iqr > _EPS:
+                    out[finite] = (v - median) / iqr
+            elif mode == "quantile":
+                out[finite] = (rankdata(v) - 1.0) / float(v.size - 1)
+            else:
+                raise ValueError(
+                    f"normalize must be one of {NORMALIZE_MODES}, got {mode!r}"
+                )
+    return out.reshape(np.shape(matrix)).astype(np.float32)
+
+
+def demographic_maps(
+    cells_table: pa.Table | pl.DataFrame,
+    images: Mapping[str, np.ndarray],
+    labels_2d: np.ndarray,
+    n_l: int = 64,
+    n_d: int = 16,
+    *,
+    normalize: str = "none",
+) -> dict[int, np.ndarray]:
+    """Resample every channel into shared normalized per-cell coordinates.
+
+    One geometry pass per cell (:func:`_cell_grid`) is reused across all
+    channels; each channel is prefiltered once with a cubic spline and
+    sampled with :func:`scipy.ndimage.map_coordinates`. This is the
+    multi-channel form of :func:`demographic_projection`.
+
+    Parameters
+    ----------
+    cells_table : pyarrow.Table or polars.DataFrame
+        Cells table carrying ``cell_key``, ``frame``, ``label`` and the
+        ``midline``/``outline`` geometry columns.
+    images : mapping of str to numpy.ndarray
+        Channel name -> frame image ``(y, x)``. Every image must share
+        ``labels_2d.shape``; the mapping order defines the channel axis
+        of the returned matrices.
+    labels_2d : numpy.ndarray
+        Instance labels of the same frame; only cells whose label is
+        present are projected.
+    n_l, n_d : int
+        Grid size along the midline and across the cell width.
+    normalize : {"none", "zscore", "robust", "quantile"}
+        Per-cell, per-channel matrix normalization; see
+        :func:`_normalize_map`.
+
+    Returns
+    -------
+    dict of int to numpy.ndarray
+        ``cell_key -> (C, n_l, n_d) float32`` matrices with ``C =
+        len(images)`` in mapping order. Rows are midline positions
+        ``l = 0 .. 1``, columns lateral positions ``d = -1 .. 1``. Cells
+        lacking midline/outline geometry or absent from ``labels_2d`` are
+        skipped.
+    """
+    if normalize not in NORMALIZE_MODES:
+        raise ValueError(
+            f"normalize must be one of {NORMALIZE_MODES}, got {normalize!r}"
+        )
+    if n_l < 2 or n_d < 2:
+        raise ValueError("n_l and n_d must be >= 2")
+    table = _to_pa(cells_table)
+    channel_names = tuple(images)
+    if not channel_names:
+        raise ValueError("images must contain at least one channel")
+    labels = np.asarray(labels_2d)
+    splines: list[np.ndarray] = []
+    for name in channel_names:
+        image = np.asarray(images[name], dtype=np.float64)
+        if image.shape != labels.shape:
+            raise ValueError(
+                f"labels shape {labels.shape} does not match channel {name!r} "
+                f"image shape {image.shape}"
+            )
+        # Cubic spline prefiltering is global; do it once per channel
+        # instead of once per cell.
+        splines.append(ndimage.spline_filter(image, order=3))
+    present = set(np.unique(labels).tolist()) - {0}
+    frames = _int_column(table, "frame")
+    unique_frames = np.unique(frames)
+    target_frame = int(unique_frames[0]) if unique_frames.size else 0
+    out: dict[int, np.ndarray] = {}
+
+    for row in table.select(["cell_key", "frame", "label", "midline", "outline"]).to_pylist():
+        if unique_frames.size > 1 and int(row["frame"]) != target_frame:
+            continue
+        if int(row["label"]) not in present:
+            continue
+        branch = _main_branch_xy(row)
+        ring = _outline_to_closed_xy(row)
+        if branch is None or ring is None:
+            continue
+        grid = _cell_grid(branch, ring, n_l, n_d)
+        if grid is None:
+            continue
+        grid_y, grid_x, _half_width = grid
+        coords = [grid_y.ravel(), grid_x.ravel()]
+        maps = np.empty((len(channel_names), n_l, n_d), dtype=np.float32)
+        for c, spline in enumerate(splines):
+            values = ndimage.map_coordinates(
+                spline,
+                coords,
+                order=3,
+                mode="nearest",
+                prefilter=False,
+            )
+            maps[c] = values.reshape(n_l, n_d).astype(np.float32)
+        if normalize != "none":
+            for c in range(maps.shape[0]):
+                maps[c] = _normalize_map(maps[c], normalize)
+        out[int(row["cell_key"])] = maps
+
+    logger.debug("demographic_maps: %d cells projected", len(out))
+    return out
+
+
+def demographic_projection(
+    cells_table: pa.Table | pl.DataFrame,
+    image_2d: np.ndarray,
+    labels_2d: np.ndarray,
+    n_l: int = 64,
+    n_d: int = 16,
+) -> dict[int, np.ndarray]:
+    """Resample channel intensities into normalized per-cell coordinates.
+
+    For every cell in ``cells_table`` (restricted to rows whose ``frame``
+    matches the frame of ``labels_2d`` when several frames are present),
+    sample ``image_2d`` on a regular grid of ``n_l × n_d`` points: ``l``
+    runs along the main midline branch (arc-length parameterized,
+    ``l ∈ [0, 1]``) and ``d`` runs laterally between the two outline
+    boundaries (``d ∈ [-1, 1]``, nearest outline point at ``|d| = 1``).
+    Sampling uses :func:`scipy.ndimage.map_coordinates` with cubic spline
+    interpolation.
+
+    Parameters
+    ----------
+    cells_table : pyarrow.Table or polars.DataFrame
+        Cells table carrying ``cell_key``, ``frame``, ``label`` and the
+        ``midline``/``outline`` geometry columns.
+    image_2d : numpy.ndarray
+        Single channel frame ``(y, x)`` to resample.
+    labels_2d : numpy.ndarray
+        Instance labels of the same frame; only cells whose label is
+        present are projected.
+    n_l : int
+        Number of samples along the midline.
+    n_d : int
+        Number of samples across the cell width.
+
+    Returns
+    -------
+    dict of int to numpy.ndarray
+        ``cell_key -> (n_l, n_d) float32`` intensity map. Rows are
+        midline positions ``l = 0 .. 1``, columns lateral positions
+        ``d = -1 .. 1``. Cells lacking midline/outline geometry or absent
+        from ``labels_2d`` are skipped.
+    """
+    maps = demographic_maps(
+        cells_table, {"channel": image_2d}, labels_2d, n_l=n_l, n_d=n_d
+    )
+    return {int(key): values[0] for key, values in maps.items()}
+
+
+def demograph_matrix(
+    demograph_table: pa.Table | pl.DataFrame,
+    channels: Sequence[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stack a demographic sidecar into an ``(N, C, n_l, n_d)`` array.
+
+    Parameters
+    ----------
+    demograph_table : pyarrow.Table or polars.DataFrame
+        Sidecar written by the ``characterize.demographic_maps`` step:
+        one row per cell with a ``{ch}_demograph`` fixed-size list column
+        per channel. Row order is preserved.
+    channels : sequence of str, optional
+        Channel subset/order; ``None`` uses every ``{ch}_demograph``
+        column in table order.
+
+    Returns
+    -------
+    cell_keys : numpy.ndarray
+        ``uint64`` keys in table row order.
+    matrices : numpy.ndarray
+        ``(N, C, n_l, n_d) float32``; rows whose ``{ch}_demograph`` entry
+        is null are NaN. ``n_l``/``n_d`` come from the column field
+        metadata written by :func:`momia3.schema.demograph_schema`.
+
+    Raises
+    ------
+    ValueError
+        If the table has no demographic columns or a column is not a
+        fixed-size list.
+    """
+    table = _to_pa(demograph_table)
+    if channels is None:
+        names = tuple(
+            c[: -len(DEMOGRAPH_SUFFIX)]
+            for c in table.column_names
+            if c.endswith(DEMOGRAPH_SUFFIX)
+        )
+    else:
+        names = tuple(str(c) for c in channels)
+    if not names:
+        raise ValueError("demograph table has no demographic columns")
+
+    parts: list[np.ndarray] = []
+    n_l = n_d = 0
+    for name in names:
+        column_name = f"{name}{DEMOGRAPH_SUFFIX}"
+        if column_name not in table.column_names:
+            raise ValueError(f"demograph table has no column {column_name!r}")
+        column = table.column(column_name).combine_chunks()
+        if not pa.types.is_fixed_size_list(column.type):
+            raise ValueError(f"column {column_name!r} is not a fixed-size list")
+        size = column.type.list_size
+        if not parts:
+            meta = table.schema.field(column_name).metadata or {}
+            n_l = int(meta.get(b"n_l", b"0"))
+            n_d = int(meta.get(b"n_d", b"0"))
+            if n_l * n_d != size:
+                raise ValueError(
+                    f"column {column_name!r} size {size} does not match its "
+                    f"n_l*n_d metadata ({n_l}*{n_d}); was it written by "
+                    "momia3.schema.demograph_schema?"
+                )
+        elif size != n_l * n_d:
+            raise ValueError(
+                f"column {column_name!r} size {size} differs from the first "
+                f"channel ({n_l}*{n_d})"
+            )
+        valid = np.asarray(column.is_valid().to_numpy(zero_copy_only=False), dtype=bool)
+        values = np.asarray(column.values.to_numpy(zero_copy_only=False), dtype=np.float32)
+        matrix = values.reshape(table.num_rows, size).copy()
+        matrix[~valid] = np.nan
+        parts.append(matrix.reshape(table.num_rows, n_l, n_d))
+
+    keys = np.asarray(
+        table.column("cell_key").to_numpy(zero_copy_only=False), dtype=np.uint64
+    )
+    return keys, np.stack(parts, axis=1)
+
+
+def _demograph_correlations(
+    maps: Mapping[int, np.ndarray],
+    channels: Sequence[str],
+    cell_keys: Sequence[int],
+) -> dict[str, np.ndarray]:
+    """Per-cell channel correlations over the demographic grid points.
+
+    For each cell the flattened ``n_l × n_d`` matrices of two channels are
+    correlated over the points where both are finite. These are matrix
+    correlations of the resampled (and possibly normalized) intensity
+    fields, distinct from the raw pixel-pair correlations of
+    :func:`momia3.ops.measure.colocalization`.
+
+    Parameters
+    ----------
+    maps : mapping of int to numpy.ndarray
+        ``cell_key -> (C, n_l, n_d)`` matrices such as returned by
+        :func:`demographic_maps`.
+    channels : sequence of str
+        Channel names in the order of the matrix channel axis.
+    cell_keys : sequence of int
+        Output row order of ``cell_key``.
+
+    Returns
+    -------
+    dict of str to numpy.ndarray
+        ``{a}_{b}_demograph_pearson`` / ``{a}_{b}_demograph_spearman``
+        float32 arrays of length ``len(cell_keys)``; NaN for missing
+        cells, too few shared finite points, or a constant channel.
+    """
+    names = tuple(str(c) for c in channels)
+    keys = np.asarray(list(cell_keys), dtype=np.uint64)
+    n = keys.size
+    out: dict[str, np.ndarray] = {}
+    for i, j in combinations(range(len(names)), 2):
+        pearson = np.full(n, np.nan, dtype=np.float32)
+        spearman = np.full(n, np.nan, dtype=np.float32)
+        for r, key in enumerate(keys):
+            matrix = maps.get(int(key))
+            if matrix is None:
+                continue
+            va = np.asarray(matrix[i], dtype=np.float64).ravel()
+            vb = np.asarray(matrix[j], dtype=np.float64).ravel()
+            shared = np.isfinite(va) & np.isfinite(vb)
+            va, vb = va[shared], vb[shared]
+            if va.size < 2:
+                continue
+            if float(va.max() - va.min()) <= _EPS:
+                continue
+            if float(vb.max() - vb.min()) <= _EPS:
+                continue
+            pearson[r] = float(np.corrcoef(va, vb)[0, 1])
+            spearman[r] = float(np.corrcoef(rankdata(va), rankdata(vb))[0, 1])
+        a, b = names[i], names[j]
+        out[f"{a}_{b}_demograph_pearson"] = pearson
+        out[f"{a}_{b}_demograph_spearman"] = spearman
+    return out
+
+
+# ---------------------------------------------------------------------------
+# midline fluorescence profile
+# ---------------------------------------------------------------------------
+
+def midline_profile(cells_table, image_2d, labels_2d, n_points=64, mode="mean", n_lateral=5, pixel_microns=1.0):
+    """Sample one channel along each cell midline into a 1-D profile.
+
+    This is the 1-D counterpart of demographic_projection and replaces the
+    legacy measure_along_strip for pulse-chase workflows. The main midline
+    branch is resampled to n_points arc-length positions; at each position
+    the image is sampled across the local width (width_profile, or nearest
+    outline distance as fallback). mode mean averages the lateral samples;
+    mode max takes their maximum.
+    """
+    if mode not in {"mean", "max"}:
+        raise ValueError(f"mode must be 'mean' or 'max', got {mode!r}")
+    if n_points < 2:
+        raise ValueError("n_points must be >= 2")
+    if n_lateral < 1:
+        raise ValueError("n_lateral must be >= 1")
+    if pixel_microns <= 0:
+        raise ValueError("pixel_microns must be positive")
+
+    table = _to_pa(cells_table)
+    image = np.asarray(image_2d, dtype=np.float64)
+    labels = np.asarray(labels_2d)
+    if image.shape != labels.shape:
+        raise ValueError(f"image shape {image.shape} does not match labels shape {labels.shape}")
+    spline_image = ndimage.spline_filter(image, order=3)
+    present = set(np.unique(labels).tolist()) - {0}
+
+    out = {}
+    frames = rod_frames(table, n_points=n_points, pixel_microns=pixel_microns)
+    for key, frame in frames.items():
+        if frame.label not in present:
+            continue
+        half = np.maximum(frame.width_px * 0.5, 0.0)
+        profile = _line_profile_samples(
+            spline_image, frame.x, frame.y, half, mode, n_lateral, closed=False
+        )
+        out[int(key)] = profile.astype(np.float32)
+    logger.debug("midline_profile: %d cells profiled", len(out))
+    return out
+
+
+def outline_profile(
+    cells_table,
+    image_2d,
+    labels_2d,
+    n_points=128,
+    mode="mean",
+    band_px=1.0,
+    n_lateral=5,
+    align_to="pole1",
+):
+    '''Sample a channel along the closed membrane outline.
+
+    The outline is resampled uniformly in arc length, then the image is
+    sampled across the local normal over a symmetric band of +/- band_px.
+    mode mean averages the band, mode max takes its maximum. This is the
+    closed-ring counterpart of midline_profile and the raw-profile input to
+    boundary_fourier. By default the ring is rolled so profile index 0 is
+    the outline point closest to a midline endpoint (align_to pole1 or
+    pole2); this makes profiles comparable across cells. align_to none
+    keeps the native outline start.
+    '''
+    if align_to not in {"pole1", "pole2", "none"}:
+        raise ValueError(f"align_to must be 'pole1', 'pole2' or 'none', got {align_to!r}")
+    if n_points < 8:
+        raise ValueError("n_points must be >= 8")
+    if mode not in {"mean", "max"}:
+        raise ValueError(f"mode must be 'mean' or 'max', got {mode!r}")
+    if band_px < 0:
+        raise ValueError("band_px must be >= 0")
+    if n_lateral < 1:
+        raise ValueError("n_lateral must be >= 1")
+
+    table = _to_pa(cells_table)
+    image = np.asarray(image_2d, dtype=np.float64)
+    labels = np.asarray(labels_2d)
+    if image.shape != labels.shape:
+        raise ValueError(f"image shape {image.shape} does not match labels shape {labels.shape}")
+    spline_image = ndimage.spline_filter(image, order=3)
+    present = set(np.unique(labels).tolist()) - {0}
+    frames = _int_column(table, "frame")
+    unique_frames = np.unique(frames)
+    target_frame = int(unique_frames[0]) if unique_frames.size else 0
+    columns = [
+        c
+        for c in (
+            "cell_key", "frame", "label", "outline", "midline",
+            "pole1_x", "pole1_y", "pole2_x", "pole2_y",
+        )
+        if c in table.column_names
+    ]
+    out = {}
+    for row in table.select(columns).to_pylist():
+        if unique_frames.size > 1 and int(row["frame"]) != target_frame:
+            continue
+        if int(row["label"]) not in present:
+            continue
+        ring = _outline_to_closed_xy(row)
+        if ring is None:
+            continue
+        ox, oy = ring
+        s_arc = _polyline_arclength(ox, oy)
+        total = float(s_arc[-1])
+        if total <= _EPS:
+            continue
+        s0 = 0.0
+        if align_to != "none":
+            pole = None
+            if align_to == "pole1":
+                px, py = row.get("pole1_x"), row.get("pole1_y")
+                if px is not None and py is not None and np.isfinite(px) and np.isfinite(py):
+                    pole = (float(px), float(py))
+            else:
+                px, py = row.get("pole2_x"), row.get("pole2_y")
+                if px is not None and py is not None and np.isfinite(px) and np.isfinite(py):
+                    pole = (float(px), float(py))
+            if pole is None:
+                branch = _main_branch_xy(row)
+                if branch is not None:
+                    bx, by = branch
+                    index = 0 if align_to == "pole1" else -1
+                    pole = (float(bx[index]), float(by[index]))
+            if pole is not None:
+                nearest = int(np.argmin((ox - pole[0]) ** 2 + (oy - pole[1]) ** 2))
+                s0 = float(s_arc[nearest]) % total
+        targets = (s0 + np.linspace(0.0, total, n_points, endpoint=False)) % total
+        xs = np.interp(targets, s_arc, ox)
+        ys = np.interp(targets, s_arc, oy)
+        half = np.full(n_points, float(band_px), dtype=np.float64)
+        profile = _line_profile_samples(
+            spline_image, xs, ys, half, mode, n_lateral, closed=True
+        )
+        out[int(row["cell_key"])] = profile.astype(np.float32)
+    logger.debug("outline_profile: %d cells profiled", len(out))
     return out
 
 
