@@ -337,7 +337,13 @@ def to_json() -> dict[str, Any]:
 
 def _register_builtins() -> None:
     """Import the built-in op modules so their ``@register`` hooks run."""
-    from momia3.pipeline import features, io_ops, steps  # noqa: F401
+    from momia3.pipeline import (  # noqa: F401
+        features,
+        io_nd2,
+        io_ops,
+        localization_steps,
+        steps,
+    )
 
 
 _register_builtins()

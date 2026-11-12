@@ -16,6 +16,7 @@ the canonical pipeline chain.
 from momia3.ops import (
     characterize,
     features,
+    localization,
     measure,
     midline,
     outline,
@@ -26,6 +27,7 @@ from momia3.ops import (
 )
 from momia3.ops.characterize import *
 from momia3.ops.features import *
+from momia3.ops.localization import *
 from momia3.ops.measure import *
 from momia3.ops.midline import *
 from momia3.ops.outline import *
@@ -37,7 +39,7 @@ from momia3.ops.track import *
 __all__ = sorted(
     {
         name
-        for module in (preprocess, segment, measure, outline, midline, characterize, features, track, polygon)
+        for module in (preprocess, segment, measure, outline, midline, characterize, features, localization, track, polygon)
         for name in module.__all__
     }
 )

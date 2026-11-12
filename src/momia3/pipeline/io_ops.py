@@ -8,12 +8,16 @@
   truth (edges / per-cell records / label stack) as side artifacts for
   demos and benchmarks.
 
+- io.import_mask_dir — import a directory of pre-segmented 2-D masks
+  (one TIFF/NPY per frame) into one FOV of an existing store.
+
 Both are registry-only operations: they take no pipeline inputs.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,7 +30,12 @@ from momia3.storage.zarr_store import ExperimentStore
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ImportTiffParams", "ImportSynthParams", "ImportLabelsParams"]
+__all__ = [
+    "ImportTiffParams",
+    "ImportSynthParams",
+    "ImportLabelsParams",
+    "ImportMaskDirParams",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +119,160 @@ def run_import_labels(
         params.fov_id,
         labels.shape,
     )
+    return {"experiment": store_path}
+
+
+# ---------------------------------------------------------------------------
+# mask-directory import (one file per frame)
+# ---------------------------------------------------------------------------
+
+
+class ImportMaskDirParams(BaseModel):
+    """Parameters of the io.import_mask_dir operation."""
+
+    path: str = Field(description="Directory containing one mask per frame")
+    pattern: str = Field("*.tif*", description="Glob pattern inside the directory")
+    fov_id: int = Field(0, ge=0, description="FOV id used when filename_regex is None")
+    filename_regex: str | None = Field(
+        None,
+        description=(
+            "Optional regex with named groups fov and frame; when set, files "
+            "are grouped into multiple FOVs instead of natural-sorted into one FOV"
+        ),
+    )
+
+
+def _natural_key(path: Path) -> tuple:
+    """Natural sort key so frame_2 precedes frame_10."""
+    parts = re.split(r"(\d+)", path.name.lower())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
+def _parse_mask_filename(path: Path, regex: str) -> tuple[int, int]:
+    """Parse one mask filename into (fov_id, frame) using named groups."""
+    match = re.search(regex, path.name)
+    if match is None:
+        raise ValueError(
+            f"mask filename {path.name!r} does not match filename_regex {regex!r}"
+        )
+    values = match.groupdict()
+    if "fov" not in values or "frame" not in values:
+        raise ValueError("filename_regex must define named groups 'fov' and 'frame'")
+    try:
+        return int(values["fov"]), int(values["frame"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"mask {path.name!r} fov/frame groups are not integers"
+        ) from exc
+
+
+def _group_mask_files(files, regex: str) -> dict[int, dict[int, Path]]:
+    """Group files as fov -> frame -> path, rejecting duplicates."""
+    grouped: dict[int, dict[int, Path]] = {}
+    for file in files:
+        fov, frame = _parse_mask_filename(file, regex)
+        frames = grouped.setdefault(fov, {})
+        if frame in frames:
+            raise ValueError(
+                f"duplicate frame {frame} for fov {fov}: {frames[frame].name} and {file.name}"
+            )
+        frames[frame] = file
+    return grouped
+
+
+def _write_mask_group(store, fov_id: int, frames: dict[int, Path]) -> int:
+    """Validate and write one FOV mask group; return number of frames."""
+    n_frames = store.n_frames(fov_id)
+    expected_frames = set(range(n_frames))
+    if set(frames) != expected_frames:
+        raise ValueError(
+            f"fov {fov_id}: mask frames {sorted(frames)} do not cover 0..{n_frames - 1}"
+        )
+    expected_shape = store.shape(fov_id)[1:]
+    masks = []
+    for frame in range(n_frames):
+        file = frames[frame]
+        mask = _read_label_file(file)
+        if mask.shape != expected_shape:
+            raise ValueError(
+                f"mask {file.name} shape {mask.shape} does not match image shape {expected_shape}"
+            )
+        masks.append(mask)
+    store.write_labels(fov_id, np.stack(masks, axis=0).astype(np.uint32, copy=False))
+    return n_frames
+
+
+def _read_label_file(path: Path) -> np.ndarray:
+    """Read a single 2-D label mask from a TIFF or NPY file."""
+    if path.suffix.lower() == ".npy":
+        data = np.asarray(np.load(path))
+    else:
+        import tifffile
+
+        data = np.asarray(tifffile.imread(str(path)))
+    while data.ndim > 2 and data.shape[0] == 1:
+        data = data[0]
+    if data.ndim != 2:
+        raise ValueError(
+            f"mask {path.name} must be 2-D (or a singleton leading axis), "
+            f"got shape {data.shape}"
+        )
+    if np.any(data < 0):
+        raise ValueError(f"mask {path.name} contains negative values")
+    return data.astype(np.uint32)
+
+
+@register(
+    "io.import_mask_dir",
+    params_model=ImportMaskDirParams,
+    inputs={"experiment": "store"},
+    outputs={"experiment": "store"},
+    shard=None,
+    verify=("fov_*/labels",),
+    description=(
+        "Import a directory of pre-segmented 2-D masks. Without filename_regex "
+        "the files are natural-sorted into one FOV; with named groups fov and "
+        "frame they populate multiple FOVs with strict frame coverage."
+    ),
+)
+def run_import_mask_dir(
+    inputs: dict[str, Any], params: ImportMaskDirParams, ctx: StepContext
+) -> dict[str, Any]:
+    """Runner of io.import_mask_dir."""
+    del ctx
+    root = Path(params.path).expanduser()
+    if not root.is_dir():
+        raise FileNotFoundError(f"mask directory not found: {root}")
+    files = sorted(root.glob(params.pattern), key=_natural_key)
+    if not files:
+        raise FileNotFoundError(f"no masks matching {params.pattern!r} in {root}")
+    store_path = Path(inputs["experiment"])
+    store = ExperimentStore.open(store_path, mode="a")
+    if params.filename_regex:
+        grouped = _group_mask_files(files, params.filename_regex)
+        for fov_id in sorted(grouped):
+            _write_mask_group(store, fov_id, grouped[fov_id])
+        logger.info(
+            "io.import_mask_dir: %d masks -> %s fovs=%s",
+            len(files),
+            store_path,
+            sorted(grouped),
+        )
+    else:
+        n_frames = store.n_frames(params.fov_id)
+        if len(files) != n_frames:
+            raise ValueError(
+                f"found {len(files)} mask file(s) but fov {params.fov_id} has "
+                f"{n_frames} frame(s); one mask per frame is required"
+            )
+        frames = {i: file for i, file in enumerate(files)}
+        _write_mask_group(store, params.fov_id, frames)
+        logger.info(
+            "io.import_mask_dir: %d masks -> %s fov=%d",
+            len(files),
+            store_path,
+            params.fov_id,
+        )
     return {"experiment": store_path}
 
 

@@ -15,6 +15,8 @@ Probability-map convention: ``prob`` has shape ``(c, y, x)`` with channel
 
 from __future__ import annotations
 
+from .maskqc import mask_qc
+
 import logging
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Protocol, Union, runtime_checkable
@@ -112,7 +114,7 @@ __all__ = [
     "get_segmenter",
     "build_patch_grid",
     "patchify",
-    "unpatchify",
+    "unpatchify",    "mask_qc",
 ]
 
 

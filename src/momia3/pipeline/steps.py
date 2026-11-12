@@ -2310,3 +2310,69 @@ def _raw_demographic_maps(
         normalize=params.normalize,
     )
     return {"maps": _jsonable(maps)}
+
+
+class MaskQCParams(BaseModel):
+    """Parameters of segment.mask_qc and segment.mask_qc_store."""
+
+    min_area: float = Field(10.0, ge=0.0, description="Minimum object area (px)")
+    max_area: float | None = Field(None, gt=0.0, description="Maximum object area (px); None disables")
+    border_width: int = Field(1, ge=1, description="Border band width for edge-touching detection")
+    max_listed: int = Field(20, ge=1, description="Maximum ids listed per issue")
+
+
+@register(
+    "segment.mask_qc",
+    params_model=MaskQCParams,
+    inputs={"labels": "array"},
+    outputs={"report": "json"},
+    shard=None,
+    description="Quality-control report for an instance-label image or stack.",
+    func=segment_ops.mask_qc,
+    provenance={
+        "algorithm": "label-mask quality control",
+        "sources": "momia3 mask-ingress plan; CellProfiler/ImageJ mask QA conventions",
+        "retrieved_at": "2026-10-23T23:59:00+08:00",
+        "implementation": "momia3 vectorized NumPy",
+        "notes": "Checks empty frames, label-id continuity, small/large objects and border touching.",
+    },
+)
+def _raw_mask_qc(inputs: dict[str, Any], params: MaskQCParams, ctx: StepContext) -> dict[str, Any]:
+    del ctx
+    report = segment_ops.mask_qc(
+        inputs["labels"],
+        min_area=params.min_area,
+        max_area=params.max_area,
+        border_width=params.border_width,
+        max_listed=params.max_listed,
+    )
+    return {"report": report}
+
+
+@register(
+    "segment.mask_qc_store",
+    params_model=MaskQCParams,
+    inputs={"experiment": "store"},
+    outputs={"report": "json"},
+    shard=None,
+    description="Run segment.mask_qc on every FOV labels stack of an experiment store.",
+    func=segment_ops.mask_qc,
+)
+def run_mask_qc_store(
+    inputs: dict[str, Any], params: MaskQCParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    store = ExperimentStore.open(Path(inputs["experiment"]), mode="r")
+    report = {}
+    for fov_id in store.fov_ids:
+        labels = np.asarray(store.labels(fov_id)[:])
+        report[str(fov_id)] = segment_ops.mask_qc(
+            labels,
+            min_area=params.min_area,
+            max_area=params.max_area,
+            border_width=params.border_width,
+            max_listed=params.max_listed,
+        )
+    return {"report": report}
+
+
