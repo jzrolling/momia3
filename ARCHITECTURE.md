@@ -169,6 +169,8 @@ class Ops:                               # 需 GPU 的算子统一入口
 ## 4. 算法层规格（ops/）
 
 ### 4.1 preprocess.py
+- illumination_basicpy（内置 momia3.vendor.basicpy_torch，原版 BaSiC 的 PyTorch 适配；参考 Peng et al., Nat Commun 2017 和 https://github.com/peng-lab/BaSiCPy，MIT）；旧 illumination_correct 保留为无 torch 的简化快速路径。
+
 - `illumination.basic`（BaSiC 平场/暗场校正）、`background.rolling_ball_fft / background_correct (rolling-ball, black top-hat, block percentile/median)`（torch FFT 近似，替代 momia2 逐像素版）、`denoise.n2v?`（可选 extras）、`drift.phase_corr`（**参考通道算一次 shift，全通道应用**；时序累积漂移 + 单次 Fourier-shift）、`bleach.exp_fit`、`normalize`（统一入口，显式 dtype 策略）。；dual_bandpass（FFT 双通带）
 
 ### 4.2 segment.py

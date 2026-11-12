@@ -32,6 +32,7 @@ from skimage import measure as ski_measure
 
 from momia3 import keys as _keys
 from momia3 import schema as _schema
+from momia3.ops import basic_correction as basic_ops
 from momia3.ops import characterize as characterize_ops
 from momia3.ops import measure as measure_ops
 from momia3.ops import midline as midline_ops
@@ -2376,3 +2377,24 @@ def run_mask_qc_store(
     return {"report": report}
 
 
+@register(
+    "preprocess.illumination_basicpy",
+    params_model=basic_ops.BasicPyParams,
+    inputs={"stack": "array"},
+    outputs={"stack": "array"},
+    shard="frame",
+    description="BaSiC background/shading correction with the vendored PyTorch implementation.",
+    func=basic_ops.basicpy_correct,
+    provenance={
+        "algorithm": "BaSiC background and shading correction",
+        "sources": "Peng et al., Nature Communications 8, 14836 (2017); BaSiCPy https://github.com/peng-lab/BaSiCPy",
+        "retrieved_at": "2026-11-13T00:00:00+08:00",
+        "implementation": "vendored BaSiCpy_torch under momia3.vendor.basicpy_torch; lazy torch import",
+        "notes": "Fits per stack; requires >=2 frames and torch. The simplified fast path remains preprocess.illumination_correct.",
+    },
+)
+def _raw_illumination_basicpy(
+    inputs: dict[str, Any], params: basic_ops.BasicPyParams, ctx: StepContext
+) -> dict[str, Any]:
+    del ctx
+    return {"stack": basic_ops.basicpy_correct(inputs["stack"], params)}

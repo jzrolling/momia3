@@ -14,6 +14,7 @@ the canonical pipeline chain.
 """
 
 from momia3.ops import (
+    basic_correction,
     characterize,
     features,
     localization,
@@ -25,6 +26,7 @@ from momia3.ops import (
     segment,
     track,
 )
+from momia3.ops.basic_correction import *
 from momia3.ops.characterize import *
 from momia3.ops.features import *
 from momia3.ops.localization import *
