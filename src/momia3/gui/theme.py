@@ -102,7 +102,7 @@ def initialize_application(app: QApplication | None = None) -> None:
 _QSS = Template(
     """
 * { font-size: ${base_size}px; font-family: "${family}"; }
-QWidget#ShellRoot, QWidget#ROIManagerWindow, QWidget#PluginManagerDialog { background-color: $bg; color: $text; }
+QWidget#ShellRoot, QWidget#ROIManagerWindow, QWidget#PluginManagerDialog, QWidget#HyperViewPanel { background-color: $bg; color: $text; }
 QDialog { background-color: $bg; color: $text; }
 QFrame#TopBar { background-color: $surface; border: 1px solid $border; border-radius: ${radius}px; }
 QLabel#BrandMark { background-color: $accent; color: white; border-radius: ${radius}px; font-weight: bold; }
@@ -134,8 +134,24 @@ QPushButton:hover { background-color: $alt_hover; }
 QPushButton[variant="primary"] { background-color: $accent; border-color: $accent; color: white; font-weight: bold; }
 QPushButton[variant="ghost"] { background-color: transparent; }
 QPushButton[variant="primary"]:disabled, QPushButton:disabled { color: $disabled; background-color: $surface; border-color: $border; }
-QLineEdit, QComboBox, QSpinBox { background-color: #2b2b2b; color: $text; border: 1px solid $border; border-radius: ${radius}px; padding: ${input_v}px ${input_h}px; selection-background-color: $accent; }
-QLineEdit:focus, QComboBox:focus { border-color: $accent; }
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background-color: #2b2b2b; color: $text; border: 1px solid $border; border-radius: ${radius}px; padding: ${input_v}px ${input_h}px; selection-background-color: $accent; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: $accent; }
+QToolButton { background: transparent; border: none; padding: 1px; }
+QToolButton:hover { background-color: $alt; border-radius: ${radius}px; }
+QToolButton::menu-indicator { image: none; }
+QToolButton[role="auto"] { color: $dim; border: 1px solid $border; border-radius: ${radius}px; padding: 1px 4px; font-size: 9px; background: transparent; }
+QToolButton[role="auto"]:hover { color: $text; border-color: $strong; }
+QToolButton[role="auto"][autoOn="true"] { color: $accent; border-color: $accent; background: #24384d; }
+QSlider { min-height: 18px; }
+QSlider::groove:horizontal { height: 4px; background: $border; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #4c7896; border-radius: 2px; }
+QSlider::add-page:horizontal { background: $border; border-radius: 2px; }
+QSlider::handle:horizontal { width: 10px; margin: -4px 0; border-radius: 5px; background: #cfcfcf; border: 1px solid #6b6b6b; }
+QSlider::handle:horizontal:hover { background: $text; border-color: $accent; }
+QMenu { background-color: $surface; color: $text; border: 1px solid $border; padding: 4px; }
+QMenu::item { padding: 4px 18px; border-radius: ${radius}px; }
+QMenu::item:selected { background-color: $accent; color: #ffffff; }
+QScrollArea { background: transparent; border: none; }
 QTreeWidget, QListWidget { background-color: $surface; color: $text; border: none; outline: none; }
 QTreeWidget::item, QListWidget::item { color: $text; padding: ${item_v}px ${item_h}px; border-radius: 2px; }
 QTreeWidget::item:selected, QListWidget::item:selected { background-color: ${accent_soft}; color: $text; }

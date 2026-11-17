@@ -8,9 +8,14 @@ frame that the real Dataset / Pipeline / Results panels will be placed into.
 
 from __future__ import annotations
 
-from qtpy.QtCore import Qt, Signal
+from pathlib import Path
+
+from qtpy.QtCore import QTimer, Qt, Signal
 from qtpy.QtWidgets import (
+    QApplication,
+    QDialog,
     QFrame,
+    QMessageBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -127,54 +132,25 @@ class _WorkflowStrip(QFrame):
 class _DatasetPanel(_Panel):
     def __init__(self, tokens: Tokens, parent: QWidget | None = None) -> None:
         super().__init__(tokens, parent)
+        from pathlib import Path
+        from .project import ProjectSidebar
+
         self.setObjectName("DatasetPanel")
-        self.setMinimumWidth(tokens.px(220))
-        self._layout.addWidget(_section("Dataset"))
-        self._layout.addWidget(_dim("2.8 GB · 6 tiles · 4 channels"))
-        search = QLineEdit()
-        search.setPlaceholderText("Filter datasets...")
-        search.setReadOnly(True)
-        self._layout.addWidget(search)
-        tree = QTreeWidget()
-        tree.setHeaderHidden(True)
-        tree.setRootIsDecorated(True)
-        root = QTreeWidgetItem(["exemplar-001"])
-        cycle = QTreeWidgetItem(["cycle-06"])
-        raw = QTreeWidgetItem(["raw"])
-        for name in ("#761", "#762", "#802", "#803", "#843", "#844"):
-            raw.addChild(QTreeWidgetItem([name]))
-        cycle.addChild(raw)
-        cycle.addChild(QTreeWidgetItem(["illumination"]))
-        cycle.addChild(QTreeWidgetItem(["stitched.zarr"]))
-        root.addChild(cycle)
-        root.addChild(QTreeWidgetItem(["cycle-07"]))
-        root.addChild(QTreeWidgetItem(["cycle-08"]))
-        tree.addTopLevelItem(root)
-        tree.expandAll()
-        self._layout.addWidget(tree, 1)
-        self._layout.addWidget(_section("Channels"))
-        for name, color, enabled in (("DAPI", "#4c8dff", True), ("CD3", "#65d68b", True), ("PanCK", "#f0788d", True), ("Ki67", "#b59cff", False)):
-            row = QHBoxLayout()
-            swatch = QFrame()
-            swatch.setFixedSize(tokens.px(8), tokens.px(8))
-            swatch.setStyleSheet(f"background-color: {color}; border-radius: 4px;")
-            row.addWidget(swatch)
-            row.addWidget(QLabel(name))
-            row.addStretch(1)
-            state = QLabel("on" if enabled else "off")
-            state.setProperty("role", "ok" if enabled else "dim")
-            row.addWidget(state)
-            self._layout.addLayout(row)
-        self._layout.addWidget(_section("Tiles"))
-        thumbs = QGridLayout()
-        thumbs.setSpacing(tokens.space(0.6))
-        for index in range(4):
-            cell = QLabel(f"tile {index + 1}")
-            cell.setAlignment(Qt.AlignCenter)
-            cell.setFixedHeight(tokens.px(38))
-            cell.setStyleSheet("background-color: #2b2b2b; color: #6b6b6b; border: 1px solid #4a4a4a;")
-            thumbs.addWidget(cell, index // 2, index % 2)
-        self._layout.addLayout(thumbs)
+        self.project = ProjectSidebar(Path.cwd() / "data", tokens, self)
+        self._layout.addWidget(self.project, 1)
+        self._layout.addWidget(_section("HyperView"))
+        self.hyperview_host = QWidget()
+        self._hyperview_layout = QVBoxLayout(self.hyperview_host)
+        self._hyperview_layout.setContentsMargins(0, 0, 0, 0)
+        self._hyperview_layout.setSpacing(tokens.space(0.4))
+        self._layout.addWidget(self.hyperview_host)
+
+    def set_hyperview_controls(self, widget: QWidget) -> None:
+        while self._hyperview_layout.count():
+            item = self._hyperview_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._hyperview_layout.addWidget(widget)
 
 
 class _ViewerPanel(_Panel):
@@ -182,54 +158,46 @@ class _ViewerPanel(_Panel):
         super().__init__(tokens, parent)
         self.setObjectName("ViewerPanel")
         self._layout.setContentsMargins(0, 0, 0, 0)
+        self._hyperview = None
         toolbar = QFrame()
         toolbar.setProperty("role", "strip")
         tb = QHBoxLayout(toolbar)
         tb.setContentsMargins(tokens.space(1.0), tokens.space(0.6), tokens.space(1.0), tokens.space(0.6))
-        tb.addWidget(QLabel("cycle-06 · stitched mosaic"))
-        tb.addWidget(_dim("3138 × 2511 px"))
+        self._source_label = QLabel("HyperView · native viewer")
+        tb.addWidget(self._source_label)
+        tb.addWidget(_dim("T · C · Z · Y · X"))
         tb.addStretch(1)
-        for name in ("DAPI", "CD3", "PanCK", "+1"):
-            button = QPushButton(name)
-            button.setProperty("variant", "ghost")
-            button.setEnabled(False)
-            tb.addWidget(button)
+        tb.addWidget(_chip("demo 5D"))
         self._layout.addWidget(toolbar)
-        viewer = QFrame()
-        viewer.setProperty("role", "viewer")
-        vl = QVBoxLayout(viewer)
-        vl.setAlignment(Qt.AlignCenter)
-        title = QLabel("napari canvas")
-        title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet("font-size: 18px; color: #9e9e9e;")
-        vl.addWidget(title)
-        subtitle = QLabel("OME-Zarr multiscale mosaic · image layer goes here")
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setProperty("role", "dim")
-        vl.addWidget(subtitle)
-        self._layout.addWidget(viewer, 1)
-        timeline = QFrame()
-        timeline.setProperty("role", "strip")
-        tl = QVBoxLayout(timeline)
-        tl.setContentsMargins(tokens.space(1.0), tokens.space(0.7), tokens.space(1.0), tokens.space(0.7))
-        head = QHBoxLayout()
-        head.addWidget(QLabel("Timeline"))
-        head.addWidget(_dim("frame 12 / 24 · 0.20 s / frame"))
-        head.addStretch(1)
-        head.addWidget(_dim("filmstrip placeholder"))
-        tl.addLayout(head)
-        strip = QHBoxLayout()
-        strip.setSpacing(tokens.space(0.6))
-        for index in range(6):
-            frame = QLabel(str(index + 1))
-            frame.setAlignment(Qt.AlignCenter)
-            frame.setFixedHeight(tokens.px(34))
-            frame.setStyleSheet("background-color: #2b2b2b; color: #6b6b6b; border: 1px solid #4a4a4a;")
-            if index == 2:
-                frame.setStyleSheet("background-color: #24384d; color: #e8e8e8; border: 1px solid #2196f3;")
-            strip.addWidget(frame, 1)
-        tl.addLayout(strip)
-        self._layout.addWidget(timeline)
+        self._placeholder = QLabel("HyperView loads on first show")
+        self._placeholder.setAlignment(Qt.AlignCenter)
+        self._placeholder.setStyleSheet("color: #9e9e9e;")
+        self._layout.addWidget(self._placeholder, 1)
+        self._dimension_host = QWidget()
+        self._dimension_layout = QVBoxLayout(self._dimension_host)
+        self._dimension_layout.setContentsMargins(0, 0, 0, 0)
+        self._dimension_layout.setSpacing(0)
+        self._layout.addWidget(self._dimension_host)
+
+    def ensure_hyperview(self):
+        if self._hyperview is not None:
+            return self._hyperview
+        from .hyperview import HyperViewWidget
+
+        self._placeholder.hide()
+        self._hyperview = HyperViewWidget(self.tokens, self)
+        self._layout.insertWidget(1, self._hyperview, 1)
+        return self._hyperview
+
+    def set_dimension_controls(self, widget: QWidget) -> None:
+        while self._dimension_layout.count():
+            item = self._dimension_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._dimension_layout.addWidget(widget)
+
+    def set_source_label(self, text: str) -> None:
+        self._source_label.setText(text)
 
 
 class _InspectorPanel(_Panel):
@@ -322,6 +290,9 @@ class MainShell(QWidget):
         self._plugin_dialog = None
         self._plugins = None
         self._plugin_context = None
+        self._hyperview_controls = None
+        self._hyperview_dimensions = None
+        self._hyperview_popout = None
         root = QVBoxLayout(self)
         root.setContentsMargins(self.tokens.space(1.0), self.tokens.space(1.0), self.tokens.space(1.0), self.tokens.space(1.0))
         root.setSpacing(self.tokens.space(0.8))
@@ -334,7 +305,10 @@ class MainShell(QWidget):
         splitter.setObjectName("MainSplitter")
         splitter.setChildrenCollapsible(False)
         dataset = _DatasetPanel(self.tokens)
+        dataset.project.image_selected.connect(self._load_project_image)
+        self._dataset_panel = dataset
         viewer = _ViewerPanel(self.tokens)
+        self._viewer_panel = viewer
         inspector = _InspectorPanel(self.tokens)
         self._inspector = inspector
         splitter.addWidget(dataset)
@@ -398,6 +372,73 @@ class MainShell(QWidget):
                         self._plugins.errors.append(f"{spec.id}: inspector tab failed: {exc}")
         if self._plugins.errors:
             self._notify(f"plugin error: {self._plugins.errors[-1]}")
+
+    def _ensure_hyperview(self) -> None:
+        widget = self._viewer_panel.ensure_hyperview()
+        if widget is None or self._hyperview_controls is not None:
+            return
+        from .hyperview import HyperViewChannelPanel, HyperViewDimensionBar
+
+        panel = HyperViewChannelPanel(widget.viewer, self.tokens, compact=True)
+        panel.bind_layers(widget.layers)
+        panel.popout_requested.connect(self._popout_hyperview_controls)
+        self._dataset_panel.set_hyperview_controls(panel)
+        dimensions = HyperViewDimensionBar(widget.viewer, self.tokens)
+        dimensions.bind_layers(widget.layers)
+        self._viewer_panel.set_dimension_controls(dimensions)
+        self._hyperview_controls = panel
+        self._hyperview_dimensions = dimensions
+
+    def _load_project_image(self, path_text: str) -> None:
+        from ..io import open_image
+
+        path = Path(path_text)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._ensure_hyperview()
+            loaded = open_image(path)
+            widget = self._viewer_panel._hyperview
+            widget.load_image(loaded)
+            if self._hyperview_controls is not None:
+                self._hyperview_controls.bind_layers(widget.layers)
+            if self._hyperview_dimensions is not None:
+                self._hyperview_dimensions.bind_layers(widget.layers)
+            if self._hyperview_popout is not None:
+                self._hyperview_popout.close()
+                self._hyperview_popout = None
+            axes = "".join(loaded.axes)
+            self._viewer_panel.set_source_label(f"{path.name} · {loaded.source}")
+            self._notify(f"loaded {path.name} · {len(loaded.channels)} channels · axes {axes}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Load failed", f"{path}\n\n{exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _popout_hyperview_controls(self) -> None:
+        widget = self._viewer_panel._hyperview
+        if widget is None:
+            return
+        from .hyperview import HyperViewChannelPanel
+
+        if self._hyperview_popout is None:
+            dialog = QDialog(self)
+            dialog.setObjectName("HyperViewPopout")
+            dialog.setWindowTitle("momia3 · HyperView channels")
+            dialog.resize(self.tokens.px(760), self.tokens.px(300))
+            dialog.setStyleSheet(build_stylesheet(self.tokens))
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(self.tokens.space(1.0), self.tokens.space(1.0), self.tokens.space(1.0), self.tokens.space(1.0))
+            panel = HyperViewChannelPanel(widget.viewer, self.tokens, compact=False)
+            panel.bind_layers(widget.layers)
+            layout.addWidget(panel)
+            self._hyperview_popout = dialog
+        self._hyperview_popout.show()
+        self._hyperview_popout.raise_()
+        self._hyperview_popout.activateWindow()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._ensure_hyperview)
 
     def open_plugins(self) -> None:
         from .plugins import PluginManagerDialog

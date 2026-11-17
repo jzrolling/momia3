@@ -31,6 +31,7 @@ dev = ["pytest>=8.0", "pyinstrument>=4.6"]
 bench = ["pandas>=2.0", "matplotlib>=3.7", "pyinstrument>=4.6"]
 gui = [
     "napari[all]>=0.5",
+    "dask>=2024.1",
     "magicgui>=0.8",
     "superqt>=0.6",
     "qtpy>=2.4",
