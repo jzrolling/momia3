@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>momia3 layout C</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app-c">
+  <header class="topbar" style="height:54px;min-height:54px">
+    <div class="brand"><div class="mark">m</div><div><div class="brand-name">momia3</div><div class="brand-sub">canvas first</div></div></div>
+    <div class="rule"></div>
+    <div class="project"><span>exemplar-001</span><span class="dot">/</span><b>cycle-06</b><span class="dot">/</span><span>mosaic</span></div>
+    <div class="chips"><span class="chip live">4 CH</span><span class="chip">OME-Zarr</span><span class="chip">LOD 0</span></div>
+    <div class="top-actions"><span class="chip">64%</span><button class="icon-btn" title="Search">⌕</button><button class="btn ghost">Export</button><button class="btn primary">Run</button></div>
+  </header>
+  <main class="main-c">
+    <nav class="iconrail">
+      <div class="rail-brand">m</div>
+      <div class="rail-icon on">DS</div>
+      <div class="rail-icon">PL</div>
+      <div class="rail-icon">RS</div>
+      <div class="rail-icon">QC</div>
+      <div class="rail-spacer"></div>
+      <div class="rail-bottom">v0.1<br>local</div>
+    </nav>
+    <section class="canvas-c">
+      <img class="specimen" src="assets/mosaic.jpg" alt="mosaic preview">
+      <div class="vignette"></div>
+      <div class="layout-tag"><b>CANVAS-FIRST</b> data drawer · floating inspector · filmstrip</div>
+      <div class="canvas-toolbar"><span class="tool on">pan</span><span class="tool">zoom</span><span class="tool">roi</span><span class="tool-sep"></span><span class="tool">DAPI</span><span class="tool">CD3</span><span class="tool">PanCK</span><span class="tool-sep"></span><span class="tool">fit</span><span class="tool">1:1</span><span class="tool">⛶</span></div>
+      <aside class="drawer">
+        <div class="drawer-head"><b>Data</b><span>6 tiles · 2 cycles</span></div>
+        <div class="tree">
+          <div class="tree-row active"><span class="caret">▾</span><span class="folder"></span>cycle-06 <span class="tag">active</span></div>
+          <div class="tree-row tree-indent"><span class="caret">▾</span><span class="folder"></span>raw</div>
+          <div class="tree-row" style="padding-left:38px"><span class="file"></span>#761 <span class="tag">DAPI</span></div>
+          <div class="tree-row" style="padding-left:38px"><span class="file"></span>#762 <span class="tag">CD3</span></div>
+          <div class="tree-row" style="padding-left:38px"><span class="file"></span>#802 <span class="tag">PanCK</span></div>
+          <div class="tree-row tree-indent"><span class="caret">▸</span><span class="folder"></span>stitched.zarr <span class="tag">v0.5</span></div>
+          <div class="tree-row tree-indent"><span class="caret">▸</span><span class="folder"></span>masks.zarr</div>
+          <div class="tree-row"><span class="caret">▸</span><span class="folder"></span>cycle-07</div>
+          <div class="tree-row"><span class="caret">▸</span><span class="folder"></span>cycle-08</div>
+        </div>
+        <div class="section-label">Channels</div>
+        <div class="channel-row"><span class="swatch blue"></span>DAPI <span class="switch on"></span></div>
+        <div class="channel-row"><span class="swatch green"></span>CD3 <span class="switch on"></span></div>
+        <div class="channel-row"><span class="swatch rose"></span>PanCK <span class="switch on"></span></div>
+        <div class="section-label">Selection</div>
+        <div style="padding:0 14px 12px;color:var(--muted);font-size:10px;line-height:1.7">3138 × 2511 px<br><span style="color:var(--dim);font-family:var(--mono)">view 64% · level 1</span></div>
+      </aside>
+      <aside class="floating-inspector">
+        <div class="tabs"><div class="tab on">Stitch</div><div class="tab">Results</div><div class="tab">Info</div></div>
+        <div class="float-body">
+          <div class="ops-head"><span>context inspector</span><span class="chip" style="padding:3px 6px">ready</span></div>
+          <div class="op-form" style="border-top:0;padding-top:0">
+            <div class="form-title"><b>stitch.torch</b><span>reference: DAPI</span></div>
+            <div class="field"><label>Reference channel</label><div class="input select">DAPI · channel 0</div></div>
+            <div class="field-row"><div class="field"><label>Max shift</label><div class="input">100 µm</div></div><div class="field"><label>Window</label><div class="input">2</div></div></div>
+            <div class="field"><label>Edge graph</label><div class="input">7 edges · 0.49 median</div></div>
+            <div class="hint" style="margin-bottom:9px">Canvas stays full-bleed. Drawers can be collapsed.</div>
+            <div class="run-row"><button class="btn ghost">Preview</button><button class="btn primary">Apply</button></div>
+          </div>
+          <div class="mini-preview"><div class="mini-preview-head"><span>current preview</span><span>t=12</span></div><div class="mini-preview-img"></div></div>
+        </div>
+      </aside>
+      <div class="canvas-caption"><span>cycle-06 · DAPI / CD3 / PanCK</span><span class="sep"></span><span>200 µm</span><span class="sep"></span><span>ROI 2 selected</span></div>
+      <div class="filmstrip-c">
+        <div class="label"><b>time series</b>t = 12 / 24<br><span style="color:var(--dim)">0.20 s / frame</span></div>
+        <div class="frames"><div class="frame"></div><div class="frame"></div><div class="frame on"></div><div class="frame"></div><div class="frame"></div><div class="frame"></div><div class="frame"></div></div>
+      </div>
+    </section>
+  </main>
+  <footer class="statusbar"><span class="ok">● connected</span><span>canvas first · 1,284 × 942</span><span>7 edges</span><span>cache 72%</span><span class="right"><span>GPU · MPS</span><span>OME-Zarr</span><span>64%</span></span></footer>
+</div>
+</body>
+</html>

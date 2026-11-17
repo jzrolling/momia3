@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>momia3 layout B</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><div class="mark">m</div><div><div class="brand-name">momia3</div><div class="brand-sub">guided workflow</div></div></div>
+    <div class="rule"></div>
+    <div class="project"><span>exemplar-001</span><span class="dot">/</span><b>cycle-06</b><span class="dot">/</span><span>stitch</span></div>
+    <div class="chips"><span class="chip live">STAGE 03 / 06</span><span class="chip">4 channels</span><span class="chip">23 px overlap</span></div>
+    <div class="top-actions"><button class="icon-btn" title="Previous">‹</button><button class="icon-btn" title="Next">›</button><button class="btn ghost">Save draft</button><button class="btn primary">Continue to segment</button></div>
+  </header>
+  <main class="workspace-b">
+    <aside class="step-rail">
+      <div class="step-rail-head">Workflow</div>
+      <div class="stage done"><div class="stage-title">01 · Import</div><div class="stage-sub">6 series · OME-TIFF</div></div>
+      <div class="stage done"><div class="stage-title">02 · Preprocess</div><div class="stage-sub">DFP / FFP applied</div></div>
+      <div class="stage current"><div class="stage-title">03 · Stitch</div><div class="stage-sub">reference positions solved</div></div>
+      <div class="stage future"><div class="stage-title">04 · Segment</div><div class="stage-sub">omnipose · 4 channels</div></div>
+      <div class="stage future"><div class="stage-title">05 · Track</div><div class="stage-sub">lineage graph</div></div>
+      <div class="stage future"><div class="stage-title">06 · Results</div><div class="stage-sub">tables + QC</div></div>
+      <div class="step-summary"><b>Input</b><br>6 tiles · 3 × 2<br><b>Alignment</b><br>DAPI · 7 edges<br><b>Output</b><br>3138 × 2511 OME-Zarr</div>
+    </aside>
+    <section class="viewer-col">
+      <div class="viewer-top">
+        <div class="viewer-title"><b>Stitch preview</b> <span style="color:var(--dim)">— before / after registration</span></div>
+        <div class="seg"><span>raw</span><span class="on">stitched</span><span>residual</span></div>
+        <button class="icon-btn" title="Zoom">⌕</button>
+      </div>
+      <div class="viewport">
+        <img class="specimen" src="assets/mosaic.jpg" alt="mosaic preview">
+        <div class="vignette"></div>
+        <div class="viewer-overlay">
+          <div class="overlay-chips"><span class="overlay-chip">alpha 0.9</span><span class="overlay-chip">DAPI · CD3 · PanCK</span></div>
+          <div class="overlay-chips"><span class="overlay-chip">seam overlay on</span></div>
+        </div>
+        <div class="roi" data-label="edge 0–1 · Δ 30.3 px" style="left:38%;top:8%;width:24%;height:80%"></div>
+        <div class="scalebar"><i></i>200 µm</div>
+        <div class="coords">tile 0 · edge 0–1 · err 0.49</div>
+      </div>
+      <div class="timeline" style="height:116px;min-height:116px">
+        <div class="timeline-head"><span>Cycle / frame</span><span class="mono">cycle-06 · t=12</span><span class="right"><span class="mono">tile grid 3 × 2</span></span></div>
+        <div class="filmstrip" style="margin-top:4px"><div class="frame"></div><div class="frame"></div><div class="frame on"></div><div class="frame"></div><div class="frame"></div><div class="frame"></div></div>
+      </div>
+    </section>
+    <aside class="panel inspector">
+      <div class="stage-head"><div class="stage-num">03</div><div><h2>Stitch reference channel</h2><p>Solve tile positions on DAPI</p></div></div>
+      <div class="stage-body">
+        <div class="stage-banner"><b>Good alignment.</b> 7/7 edges pass NCC gate. Median edge error 0.49; max residual 0.08 px vs ASHLAR reference.</div>
+        <div class="tabs" style="padding:0;margin:0 -14px 12px;border-top:1px solid var(--line-soft)"><div class="tab on">Parameters</div><div class="tab">Diagnostics</div></div>
+        <div class="field"><label>Reference channel</label><div class="input select">DAPI · channel 0</div></div>
+        <div class="field-row"><div class="field"><label>Max shift</label><div class="input">100 µm</div></div><div class="field"><label>Window limit</label><div class="input">2</div></div></div>
+        <div class="field"><label>Output store</label><div class="input">stitched.zarr / cycle-06</div></div>
+        <div class="field"><label>Channel handling</label><div class="input select">global translation + mask</div></div>
+        <div class="run-row"><button class="btn ghost">Rerun</button><button class="btn primary">Approve & continue</button></div>
+      </div>
+    </aside>
+  </main>
+  <section class="console">
+    <div class="console-head"><span>Run log</span><span class="right">stage 03 · 0.70 s · 14 windows</span></div>
+    <div class="console-body">
+      <div><span class="dim">09:42:11</span> <span class="ok">PASS</span> io.read_ome_tiff <span class="dim">→</span> 6 series, 4 channels</div>
+      <div><span class="dim">09:42:11</span> <span class="ok">PASS</span> preprocess.illumination <span class="dim">→</span> dfp/ffp applied</div>
+      <div><span class="dim">09:42:12</span> <span class="ok">PASS</span> stitch.torch <span class="dim">→</span> 7 edges, tree solved, 0.08 px residual</div>
+      <div><span class="dim">09:42:12</span> <span class="hl">NEXT</span> segment.omnipose <span class="dim">→</span> waiting for approval</div>
+    </div>
+  </section>
+  <footer class="statusbar"><span class="ok">● connected</span><span>workspace: exemplar-001</span><span>stage 03 / 06</span><span class="right"><span>GPU · MPS</span><span>16.1 MB output</span><span>saved 09:42:12</span></span></footer>
+</div>
+</body>
+</html>

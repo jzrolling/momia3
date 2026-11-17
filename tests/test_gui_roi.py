@@ -1,0 +1,62 @@
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from qtpy.QtWidgets import QApplication
+
+from momia3.gui.roi_manager import ROI, ROIManagerWindow, ROISession, ROISet, demo_roi_session
+
+
+def _roi(name: str, x: int) -> ROI:
+    return ROI(
+        roi_id=name,
+        name=name,
+        kind="box",
+        geometry={"x": x, "y": 4, "w": 8, "h": 6},
+        cell_key=1,
+        track_id=1,
+        frame=0,
+    )
+
+
+def test_action_undo_is_limited_to_fifty_and_has_no_redo():
+    session = ROISession()
+    for index in range(60):
+        session.add_roi(_roi(f"r{index}", index))
+    assert len(session.actions) == 50
+    assert len(session.current) == 60
+    for _ in range(50):
+        assert session.undo()
+    assert not session.undo()
+    assert len(session.current) == 10
+
+
+def test_update_keeps_one_previous_set_and_rollback():
+    session = ROISession(ROISet({"a": _roi("a", 1)}))
+    session.add_roi(_roi("b", 2))
+    assert session.update()
+    assert session.previous_roi_set is not None
+    assert len(session.base) == 2
+    assert session.undo() is False
+    assert session.rollback_update()
+    assert len(session.current) == 1
+    assert session.previous_roi_set is None
+    assert session.rollback_update() is False
+
+
+def test_record_toggle_captures_actions():
+    session = ROISession()
+    session.set_record(True)
+    session.add_roi(_roi("r", 1))
+    assert len(session.record) == 1
+    assert session.record[0].kind == "add"
+
+
+def test_roi_manager_window_renders_demo_set():
+    app = QApplication.instance() or QApplication([])
+    window = ROIManagerWindow(demo_roi_session())
+    assert window.table.rowCount() == 4
+    assert window.record_table.rowCount() == 0
+    window.delete_button.click()
+    assert window.undo_button.isEnabled() is False
+    window.close()
