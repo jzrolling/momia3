@@ -47,3 +47,11 @@ logic. Keep C as a focus mode rather than the default shell.
 In napari terms: left dock for Dataset/Experiment, center viewer, right dock for
 stage-aware Pipeline/Results, bottom dock for Run log. The current single
 right-side QTabWidget should be split into those regions.
+
+## Button visual language
+
+- Default text/icon buttons are borderless tonal controls: use the surface-alt fill, no outline, and a brighter fill on hover.
+- Primary actions use the accent fill; destructive hover states may tint toward danger, but do not add a permanent red border.
+- Ghost/transparent buttons are reserved for low-emphasis toolbar text.
+- Focus is the only state that may draw an accent outline, for keyboard accessibility.
+- Do not introduce embossed or beveled dropdown/drop-down controls.

@@ -129,25 +129,53 @@ QLabel[role="stage"][state="current"] { color: $accent; background-color: ${acce
 QLabel[role="stage"][state="future"] { color: $disabled; }
 QLabel[role="badge"] { color: $accent; background-color: ${accent_soft}; border: 1px solid ${accent_border}; border-radius: ${radius}px; padding: ${badge_v}px ${badge_h}px; font-size: ${badge_size}px; }
 QLabel[role="ok"] { color: $success; }
-QPushButton { background-color: $alt; color: $text; border: 1px solid $strong; border-radius: ${radius}px; padding: ${btn_v}px ${btn_h}px; }
+QPushButton { background-color: $alt; color: $text; border: none; border-radius: 6px; padding: ${btn_v}px ${btn_h}px; }
 QPushButton:hover { background-color: $alt_hover; }
-QPushButton[variant="primary"] { background-color: $accent; border-color: $accent; color: white; font-weight: bold; }
+QPushButton:pressed { background-color: ${accent_soft}; }
+QPushButton:focus { border: 1px solid $accent; }
+QPushButton[variant="primary"] { background-color: $accent; color: white; font-weight: bold; }
+QPushButton[variant="primary"]:hover { background-color: #2aa7ff; }
 QPushButton[variant="ghost"] { background-color: transparent; }
-QPushButton[variant="primary"]:disabled, QPushButton:disabled { color: $disabled; background-color: $surface; border-color: $border; }
+QPushButton[variant="ghost"]:hover { background-color: $alt; }
+QPushButton[variant="primary"]:disabled, QPushButton:disabled { color: $disabled; background-color: $surface; border: none; }
+QPushButton[variant="ghost"]:disabled { background-color: transparent; color: $disabled; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background-color: #2b2b2b; color: $text; border: 1px solid $border; border-radius: ${radius}px; padding: ${input_v}px ${input_h}px; selection-background-color: $accent; }
+QComboBox { padding-right: 22px; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 20px; border: none; background: transparent; }
+QComboBox::down-arrow { image: url("${chevron}"); width: 10px; height: 6px; }
+QComboBox QAbstractItemView { background-color: $surface; color: $text; border: 1px solid $border; outline: 0; selection-background-color: $accent; selection-color: #ffffff; }
+QComboBox QAbstractItemView::item { min-height: 22px; padding: 3px 8px; }
+QComboBox:disabled { color: $disabled; }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: $accent; }
 QToolButton { background: transparent; border: none; padding: 1px; }
 QToolButton:hover { background-color: $alt; border-radius: ${radius}px; }
 QToolButton::menu-indicator { image: none; }
-QToolButton[role="auto"] { color: $dim; border: 1px solid $border; border-radius: ${radius}px; padding: 1px 4px; font-size: 9px; background: transparent; }
-QToolButton[role="auto"]:hover { color: $text; border-color: $strong; }
-QToolButton[role="auto"][autoOn="true"] { color: $accent; border-color: $accent; background: #24384d; }
+QToolButton#ROIToolButton, QToolButton#ProjectToolButton { background: $alt; border: none; border-radius: 6px; padding: 0; }
+QToolButton#ProjectToolButton:hover { background: $alt_hover; }
+QToolButton#ProjectToolButton:pressed { background: ${accent_soft}; }
+QToolButton#ROIToolButton { background: $alt; border: none; border-radius: 6px; padding: 0; }
+QToolButton#ROIToolButton:hover { background: $alt_hover; }
+QToolButton#ROIToolButton:pressed { background: ${accent_soft}; }
+QToolButton#ROIToolButton:checked { background: ${accent_soft}; }
+QToolButton#ROIToolButton:disabled { background: $surface; color: $disabled; }
+QPushButton#ROISecondaryButton { background: transparent; border: none; color: $dim; padding: ${btn_v}px ${btn_h}px; }
+QPushButton#ROISecondaryButton:hover { background: $alt; color: $text; }
+QPushButton#ROISecondaryButton:disabled { background: transparent; color: $disabled; }
+QPushButton#ROIPrimaryButton { background: $accent; border: none; color: white; font-weight: bold; padding: ${btn_v}px ${btn_h}px; }
+QPushButton#ROIPrimaryButton:hover { background: #2aa7ff; }
+QPushButton#ROIPrimaryButton:disabled { background: $surface; color: $disabled; }
+QPushButton#ROICloseButton { background: transparent; border: none; color: $text; padding: 4px 10px; }
+QPushButton#ROICloseButton:hover { background: $alt; }
+QToolButton[role="auto"] { color: $dim; border: none; border-radius: 6px; padding: 2px 5px; font-size: 9px; background: $alt; }
+QToolButton[role="auto"]:hover { color: $text; background: $alt_hover; }
+QToolButton[role="auto"][autoOn="true"] { color: $accent; background: ${accent_soft}; }
 QSlider { min-height: 18px; }
 QSlider::groove:horizontal { height: 4px; background: $border; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #4c7896; border-radius: 2px; }
 QSlider::add-page:horizontal { background: $border; border-radius: 2px; }
 QSlider::handle:horizontal { width: 10px; margin: -4px 0; border-radius: 5px; background: #cfcfcf; border: 1px solid #6b6b6b; }
 QSlider::handle:horizontal:hover { background: $text; border-color: $accent; }
+QToolTip { background-color: $surface; color: $text; border: 1px solid $border; padding: 4px 6px; }
 QMenu { background-color: $surface; color: $text; border: 1px solid $border; padding: 4px; }
 QMenu::item { padding: 4px 18px; border-radius: ${radius}px; }
 QMenu::item:selected { background-color: $accent; color: #ffffff; }
@@ -215,4 +243,5 @@ def build_stylesheet(tokens: Tokens = Tokens()) -> str:
         scroll=tokens.px(10),
         scroll_radius=tokens.px(3),
         scroll_handle=tokens.px(24),
+        chevron=(Path(__file__).resolve().parent / "assets" / "chevron-down.svg").as_posix(),
     )

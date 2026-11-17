@@ -454,8 +454,12 @@ class MainShell(QWidget):
     def open_roi_manager(self) -> None:
         from .roi_manager import ROIManagerWindow
 
+        self._ensure_hyperview()
+        viewer = self._viewer_panel._hyperview.viewer
         if self._roi_window is None:
-            self._roi_window = ROIManagerWindow(self._ensure_roi_session(), self.tokens, parent=self)
+            self._roi_window = ROIManagerWindow(self._ensure_roi_session(), self.tokens, parent=self, viewer=viewer)
+        else:
+            self._roi_window.attach_viewer(viewer)
         self._roi_window.show()
         self._roi_window.raise_()
         self._roi_window.activateWindow()

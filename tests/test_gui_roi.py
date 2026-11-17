@@ -44,19 +44,25 @@ def test_update_keeps_one_previous_set_and_rollback():
     assert session.rollback_update() is False
 
 
-def test_record_toggle_captures_actions():
-    session = ROISession()
-    session.set_record(True)
-    session.add_roi(_roi("r", 1))
-    assert len(session.record) == 1
-    assert session.record[0].kind == "add"
-
-
 def test_roi_manager_window_renders_demo_set():
     app = QApplication.instance() or QApplication([])
     window = ROIManagerWindow(demo_roi_session())
-    assert window.table.rowCount() == 4
-    assert window.record_table.rowCount() == 0
+    assert window.table.rowCount() == 5
+    assert not hasattr(window, "record_table")
     window.delete_button.click()
     assert window.undo_button.isEnabled() is False
+    window.close()
+
+
+def test_label_edits_selected_roi_and_defaults():
+    app = QApplication.instance() or QApplication([])
+    session = demo_roi_session()
+    window = ROIManagerWindow(session)
+    assert window.label_combo.currentText() == "default"
+    window.table.selectRow(0)
+    window.label_combo.setEditText("T cell")
+    window._apply_current_label()
+    first = next(iter(session.current.rois.values()))
+    assert first.label == "T cell"
+    assert "T cell" in [window.label_combo.itemText(i) for i in range(window.label_combo.count())]
     window.close()
